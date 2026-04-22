@@ -1,0 +1,7 @@
+{
+  "name": "s02-cli-probe",
+  "scripts": {
+    "test": "echo ok",
+    "build": "echo build"
+  }
+}

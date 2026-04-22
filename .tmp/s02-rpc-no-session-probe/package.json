@@ -1,0 +1,6 @@
+{
+  "name": "probe",
+  "scripts": {
+    "test": "echo ok"
+  }
+}

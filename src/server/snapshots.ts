@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { access, constants, opendir, readFile, realpath, stat } from 'node:fs/promises';
+import { access, constants, opendir, readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { TextDecoder } from 'node:util';
 
 import type {
@@ -27,6 +27,21 @@ export interface CanonicalProjectPath {
   requestedPath: string;
   normalizedPath: string;
   canonicalPath: string;
+}
+
+export const BOOTSTRAP_REQUIRED_ENTRIES = ['STATE.md', 'PREFERENCES.md', 'gsd.db', 'milestones'] as const;
+
+export type BootstrapRequiredEntry = (typeof BOOTSTRAP_REQUIRED_ENTRIES)[number];
+export type BootstrapCompletenessState = 'absent' | 'partial' | 'complete' | 'ancestor_conflict';
+
+export interface BootstrapCompleteness {
+  state: BootstrapCompletenessState;
+  projectRoot: string;
+  gsdRootPath: string | null;
+  detail: string;
+  presentEntries: string[];
+  missingEntries: BootstrapRequiredEntry[];
+  requiredEntries: BootstrapRequiredEntry[];
 }
 
 interface SourceReadResult<T> {
@@ -373,6 +388,155 @@ async function isDirectory(candidatePath: string) {
 
     throw error;
   }
+}
+
+function isPathWithin(parentPath: string, candidatePath: string) {
+  const relativePath = path.relative(parentPath, candidatePath);
+
+  return relativePath.length === 0 || (!relativePath.startsWith('..') && !path.isAbsolute(relativePath));
+}
+
+async function findAncestorGsdRoot(projectRoot: string): Promise<string | null> {
+  let currentPath = path.dirname(projectRoot);
+
+  while (currentPath !== path.dirname(currentPath)) {
+    const candidatePath = path.join(currentPath, '.gsd');
+
+    if (await isDirectory(candidatePath)) {
+      return candidatePath;
+    }
+
+    currentPath = path.dirname(currentPath);
+  }
+
+  const filesystemRootCandidate = path.join(currentPath, '.gsd');
+
+  return (await isDirectory(filesystemRootCandidate)) ? filesystemRootCandidate : null;
+}
+
+async function hasRequiredBootstrapEntry(gsdRootPath: string, entry: BootstrapRequiredEntry) {
+  try {
+    const entryStats = await stat(path.join(gsdRootPath, entry));
+    return entry === 'milestones' ? entryStats.isDirectory() : entryStats.isFile();
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error) {
+      const code = String(error.code);
+
+      if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'EACCES' || code === 'EPERM') {
+        return false;
+      }
+    }
+
+    throw error;
+  }
+}
+
+export async function classifyBootstrapCompleteness(projectRoot: string): Promise<BootstrapCompleteness> {
+  const canonicalProjectRoot = await realpath(projectRoot);
+  const projectOwnedGsdPath = path.join(canonicalProjectRoot, '.gsd');
+  const ancestorGsdRoot = await findAncestorGsdRoot(canonicalProjectRoot);
+  let resolvedGsdRoot: string | null = null;
+
+  if (!(await isDirectory(projectOwnedGsdPath))) {
+    if (ancestorGsdRoot !== null) {
+      return {
+        state: 'ancestor_conflict',
+        projectRoot: canonicalProjectRoot,
+        gsdRootPath: ancestorGsdRoot,
+        detail: `Found ancestor-owned .gsd at ${ancestorGsdRoot}; refusing to treat ${canonicalProjectRoot} as initialized.`,
+        presentEntries: [],
+        missingEntries: [...BOOTSTRAP_REQUIRED_ENTRIES],
+        requiredEntries: [...BOOTSTRAP_REQUIRED_ENTRIES],
+      };
+    }
+
+    return {
+      state: 'absent',
+      projectRoot: canonicalProjectRoot,
+      gsdRootPath: null,
+      detail: 'No project-owned .gsd directory exists yet.',
+      presentEntries: [],
+      missingEntries: [...BOOTSTRAP_REQUIRED_ENTRIES],
+      requiredEntries: [...BOOTSTRAP_REQUIRED_ENTRIES],
+    };
+  }
+
+  try {
+    resolvedGsdRoot = await realpath(projectOwnedGsdPath);
+  } catch {
+    resolvedGsdRoot = projectOwnedGsdPath;
+  }
+
+  if (!isPathWithin(canonicalProjectRoot, resolvedGsdRoot)) {
+    return {
+      state: 'ancestor_conflict',
+      projectRoot: canonicalProjectRoot,
+      gsdRootPath: resolvedGsdRoot,
+      detail: `Project .gsd resolves outside the project root (${resolvedGsdRoot}); refusing to trust ancestor-owned bootstrap state.`,
+      presentEntries: [],
+      missingEntries: [...BOOTSTRAP_REQUIRED_ENTRIES],
+      requiredEntries: [...BOOTSTRAP_REQUIRED_ENTRIES],
+    };
+  }
+
+  let presentEntries: string[];
+
+  try {
+    presentEntries = (await readdir(projectOwnedGsdPath)).sort((left, right) => left.localeCompare(right));
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error) {
+      const code = String(error.code);
+
+      if (code === 'EACCES' || code === 'EPERM') {
+        return {
+          state: 'partial',
+          projectRoot: canonicalProjectRoot,
+          gsdRootPath: resolvedGsdRoot,
+          detail: 'Project-owned .gsd exists but could not be read.',
+          presentEntries: [],
+          missingEntries: [...BOOTSTRAP_REQUIRED_ENTRIES],
+          requiredEntries: [...BOOTSTRAP_REQUIRED_ENTRIES],
+        };
+      }
+    }
+
+    throw error;
+  }
+
+  const missingEntries: BootstrapRequiredEntry[] = [];
+
+  for (const requiredEntry of BOOTSTRAP_REQUIRED_ENTRIES) {
+    if (!(await hasRequiredBootstrapEntry(projectOwnedGsdPath, requiredEntry))) {
+      missingEntries.push(requiredEntry);
+    }
+  }
+
+  if (missingEntries.length > 0) {
+    const detail =
+      presentEntries.length === 1 && presentEntries[0] === 'notifications.jsonl'
+        ? 'Only notifications.jsonl is present; bootstrap is incomplete and must not be treated as initialized.'
+        : `Missing bootstrap entries: ${missingEntries.join(', ')}.`;
+
+    return {
+      state: 'partial',
+      projectRoot: canonicalProjectRoot,
+      gsdRootPath: resolvedGsdRoot,
+      detail,
+      presentEntries,
+      missingEntries,
+      requiredEntries: [...BOOTSTRAP_REQUIRED_ENTRIES],
+    };
+  }
+
+  return {
+    state: 'complete',
+    projectRoot: canonicalProjectRoot,
+    gsdRootPath: resolvedGsdRoot,
+    detail: 'Project-owned .gsd contains the required bootstrap surfaces.',
+    presentEntries,
+    missingEntries: [],
+    requiredEntries: [...BOOTSTRAP_REQUIRED_ENTRIES],
+  };
 }
 
 async function summarizeDirectory(projectRoot: string): Promise<DirectorySummary> {

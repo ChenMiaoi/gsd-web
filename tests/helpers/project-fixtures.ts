@@ -91,6 +91,50 @@ export async function createEmptyProject(workspaceRoot: string, projectName: str
   return projectRoot;
 }
 
+export async function createExternalInitProject(projectName: string) {
+  const workspace = await createTempWorkspace('gsd-web-init-');
+  const projectRoot = await createEmptyProject(workspace.root, projectName);
+
+  return {
+    workspace,
+    projectRoot,
+  };
+}
+
+export async function createPartialBootstrapProject(
+  workspaceRoot: string,
+  projectName: string,
+  options: {
+    notificationLines?: string[];
+  } = {},
+) {
+  const projectRoot = await createEmptyProject(workspaceRoot, projectName);
+  const gsdRoot = path.join(projectRoot, '.gsd');
+  const notificationLines = options.notificationLines ?? [];
+
+  await mkdir(gsdRoot, { recursive: true });
+  await writeFile(
+    path.join(gsdRoot, 'notifications.jsonl'),
+    notificationLines.map((line) => `${line.trimEnd()}\n`).join(''),
+  );
+
+  return projectRoot;
+}
+
+export async function createBootstrapCompleteGsdDirectory(projectRoot: string) {
+  const gsdRoot = path.join(projectRoot, '.gsd');
+
+  await mkdir(path.join(gsdRoot, 'milestones'), { recursive: true });
+  await mkdir(path.join(gsdRoot, 'runtime'), { recursive: true });
+  await writeFile(path.join(gsdRoot, 'STATE.md'), '# State\n\nBootstrap complete fixture.\n');
+  await writeFile(path.join(gsdRoot, 'PREFERENCES.md'), '# Preferences\n\nUsing fixture defaults.\n');
+  await writeFile(path.join(gsdRoot, 'CODEBASE.md'), '# Codebase\n\nIndexed fixture.\n');
+  await writeFile(path.join(gsdRoot, 'notifications.jsonl'), '');
+  await createValidGsdDb(path.join(gsdRoot, 'gsd.db'));
+
+  return gsdRoot;
+}
+
 export async function createInitializedProject(
   workspaceRoot: string,
   projectName: string,
