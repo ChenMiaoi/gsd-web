@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 
 import { SERVICE_NAME, type HealthResponse, type ProjectEventEnvelope } from '../shared/contracts.js';
 import { REGISTRY_SCHEMA_VERSION, RegistryDatabase } from './db.js';
+import { DEFAULT_MONITOR_INTERVAL_MS, ProjectMonitorManager } from './monitor.js';
+import { ProjectReconciler } from './project-reconcile.js';
 import { EventHub, registerEventsRoute } from './routes/events.js';
 import { registerProjectRoutes, type ProjectInitRunner } from './routes/projects.js';
 
@@ -25,8 +27,11 @@ export type RuntimeSignal =
       eventId: string;
       eventType: string;
       projectId: string | null;
+      trigger?: string;
       snapshotStatus?: string;
       warningCount?: number;
+      monitorHealth?: string;
+      previousHealth?: string;
       initStage?: string;
       initJobId?: string;
       refreshStatus?: string;
@@ -44,6 +49,7 @@ export interface CreateAppOptions {
   logger?: boolean;
   logSink?: (signal: RuntimeSignal) => void;
   snapshotTimeoutMs?: number;
+  monitorIntervalMs?: number;
   initRunner?: ProjectInitRunner;
 }
 
@@ -124,12 +130,24 @@ function emitProjectEvent(
     projectId: event.projectId,
   };
 
+  if ('trigger' in event.payload) {
+    signal.trigger = event.payload.trigger;
+  }
+
   if ('snapshotStatus' in event.payload) {
     signal.snapshotStatus = event.payload.snapshotStatus;
   }
 
   if ('warningCount' in event.payload) {
     signal.warningCount = event.payload.warningCount;
+  }
+
+  if ('monitor' in event.payload) {
+    signal.monitorHealth = event.payload.monitor.health;
+  }
+
+  if ('previousHealth' in event.payload && event.payload.previousHealth !== null) {
+    signal.previousHealth = event.payload.previousHealth;
   }
 
   if ('job' in event.payload) {
@@ -214,12 +232,22 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   });
   let registry: RegistryDatabase | undefined;
   let eventHub: EventHub | undefined;
+  let monitorManager: ProjectMonitorManager | undefined;
 
   try {
     const registryInstance = new RegistryDatabase(databasePath);
     const eventHubInstance = new EventHub(registryInstance);
+    const reconciler = new ProjectReconciler(registryInstance, eventHubInstance, {
+      ...(options.snapshotTimeoutMs === undefined ? {} : { snapshotTimeoutMs: options.snapshotTimeoutMs }),
+      log: app.log,
+    });
+    const monitorManagerInstance = new ProjectMonitorManager(registryInstance, reconciler, {
+      intervalMs: options.monitorIntervalMs ?? DEFAULT_MONITOR_INTERVAL_MS,
+      log: app.log,
+    });
     registry = registryInstance;
     eventHub = eventHubInstance;
+    monitorManager = monitorManagerInstance;
     const indexHtml = await readFile(indexHtmlPath, 'utf8');
 
     emitSignal(
@@ -232,7 +260,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       'Opened gsd-web SQLite database',
     );
 
+    eventHubInstance.subscribe((event) => {
+      emitProjectEvent(app, options.logSink, event);
+    });
+
     app.addHook('onClose', async () => {
+      await monitorManagerInstance.stop();
       eventHubInstance.close();
       registryInstance.close();
     });
@@ -259,6 +292,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     const projectRoutes = await registerProjectRoutes(app, {
       registry: registryInstance,
       eventHub: eventHubInstance,
+      reconciler,
       ...(options.snapshotTimeoutMs === undefined ? {} : { snapshotTimeoutMs: options.snapshotTimeoutMs }),
       ...(options.initRunner === undefined ? {} : { initRunner: options.initRunner }),
     });
@@ -350,12 +384,13 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       },
     });
     eventHubInstance.broadcast(serviceReadyEvent);
-    emitProjectEvent(app, options.logSink, serviceReadyEvent);
 
     await app.ready();
+    monitorManagerInstance.start();
 
     return app;
   } catch (error) {
+    await monitorManager?.stop().catch(() => undefined);
     eventHub?.close();
     registry?.close();
     throw error;

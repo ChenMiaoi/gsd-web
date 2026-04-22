@@ -73,6 +73,52 @@ export class SnapshotTimeoutError extends Error {
   }
 }
 
+export class ProjectSnapshotReadError extends Error {
+  readonly responseCode: 'snapshot_read_failed';
+  readonly statusCode: number;
+  readonly scope: 'projectRoot' | 'gsdDb';
+
+  constructor(scope: 'projectRoot' | 'gsdDb', message: string, statusCode: number = 503) {
+    super(message);
+    this.name = 'ProjectSnapshotReadError';
+    this.responseCode = 'snapshot_read_failed';
+    this.statusCode = statusCode;
+    this.scope = scope;
+  }
+}
+
+function isTransientSqliteReadError(error: unknown) {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return (
+    /SQLITE_(BUSY|LOCKED|CANTOPEN|IOERR|READONLY)/i.test(error.message)
+    || /database is locked/i.test(error.message)
+    || /unable to open database file/i.test(error.message)
+  );
+}
+
+function toProjectRootReadError(error: unknown): ProjectSnapshotReadError {
+  if (error && typeof error === 'object' && 'code' in error) {
+    const code = String(error.code);
+
+    if (code === 'ENOENT') {
+      return new ProjectSnapshotReadError('projectRoot', 'Project root is no longer available.');
+    }
+
+    if (code === 'EACCES' || code === 'EPERM') {
+      return new ProjectSnapshotReadError('projectRoot', 'Project root is not readable.');
+    }
+
+    if (code === 'ENOTDIR') {
+      return new ProjectSnapshotReadError('projectRoot', 'Project root no longer resolves to a directory.');
+    }
+  }
+
+  return new ProjectSnapshotReadError('projectRoot', 'Project root could not be read.');
+}
+
 function createSource<T>(state: SnapshotSourceState, value: T, detail?: string): SnapshotSource<T> {
   const source: SnapshotSource<T> = { state };
 
@@ -373,7 +419,11 @@ async function readGsdDbSummary(filePath: string, warnOnMissing: boolean): Promi
     } finally {
       database.close();
     }
-  } catch {
+  } catch (error) {
+    if (isTransientSqliteReadError(error)) {
+      throw new ProjectSnapshotReadError('gsdDb', '.gsd/gsd.db could not be read right now.');
+    }
+
     return toMalformedResult('gsdDb', '.gsd/gsd.db is not a readable SQLite database.');
   }
 }
@@ -573,6 +623,10 @@ export function isProjectPathValidationError(error: unknown): error is ProjectPa
   return error instanceof ProjectPathValidationError;
 }
 
+export function isProjectSnapshotReadError(error: unknown): error is ProjectSnapshotReadError {
+  return error instanceof ProjectSnapshotReadError;
+}
+
 export async function canonicalizeProjectPath(requestedPath: string): Promise<CanonicalProjectPath> {
   const trimmedPath = requestedPath.trim();
 
@@ -661,9 +715,33 @@ export async function withSnapshotTimeout<T>(operation: () => Promise<T>, timeou
 
 export async function buildProjectSnapshot(projectRoot: string): Promise<ProjectSnapshot> {
   const checkedAt = new Date().toISOString();
-  const directory = await summarizeDirectory(projectRoot);
+  let directory: DirectorySummary;
+
+  try {
+    await access(projectRoot, constants.R_OK | constants.X_OK);
+    const projectRootStats = await stat(projectRoot);
+
+    if (!projectRootStats.isDirectory()) {
+      throw new ProjectSnapshotReadError('projectRoot', 'Project root no longer resolves to a directory.');
+    }
+
+    directory = await summarizeDirectory(projectRoot);
+  } catch (error) {
+    if (error instanceof ProjectSnapshotReadError) {
+      throw error;
+    }
+
+    throw toProjectRootReadError(error);
+  }
+
   const gsdDirectoryPath = path.join(projectRoot, '.gsd');
-  const hasGsdDirectory = await isDirectory(gsdDirectoryPath);
+  let hasGsdDirectory: boolean;
+
+  try {
+    hasGsdDirectory = await isDirectory(gsdDirectoryPath);
+  } catch (error) {
+    throw toProjectRootReadError(error);
+  }
 
   const directorySource = createSource('ok', directory);
   const gsdDirectorySource = hasGsdDirectory

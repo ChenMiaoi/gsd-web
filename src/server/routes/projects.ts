@@ -2,16 +2,15 @@ import { randomUUID } from 'node:crypto';
 
 import type { FastifyInstance, FastifyReply } from 'fastify';
 
-import {
-  buildSourceStateMap,
-  isProjectInitJobTerminalStage,
-  type ProjectInitJobStage,
-  type ProjectInitRefreshResult,
-  type ProjectMutationResponse,
-  type ProjectSnapshot,
-  type ProjectSnapshotEventPayload,
-  type ProjectsResponse,
-  type RegisterProjectRequest,
+import type {
+  ProjectDetailResponse,
+  ProjectInitJobStage,
+  ProjectInitRefreshResult,
+  ProjectMutationResponse,
+  ProjectRecord,
+  ProjectTimelineResponse,
+  ProjectsResponse,
+  RegisterProjectRequest,
 } from '../../shared/contracts.js';
 import {
   ActiveInitJobError,
@@ -19,6 +18,10 @@ import {
   ProjectNotFoundError,
   type RegistryDatabase,
 } from '../db.js';
+import {
+  buildProjectRegistrationState,
+  ProjectReconciler,
+} from '../project-reconcile.js';
 import {
   runOfficialGsdInit,
   type InitRunResult,
@@ -31,6 +34,7 @@ import {
   buildProjectSnapshot,
   canonicalizeProjectPath,
   isProjectPathValidationError,
+  isProjectSnapshotReadError,
   withSnapshotTimeout,
 } from '../snapshots.js';
 import type { EventHub } from './events.js';
@@ -61,37 +65,6 @@ function parseRegisterBody(body: unknown): RegisterProjectRequest {
   }
 
   return { path };
-}
-
-function normalizeSnapshot(snapshot: ProjectSnapshot) {
-  const { checkedAt: _checkedAt, ...rest } = snapshot;
-  return rest;
-}
-
-function buildProjectEventPayload(
-  projectId: string,
-  canonicalPath: string,
-  snapshot: ProjectSnapshot,
-  changed: boolean,
-): ProjectSnapshotEventPayload {
-  return {
-    projectId,
-    canonicalPath,
-    snapshotStatus: snapshot.status,
-    warningCount: snapshot.warnings.length,
-    warnings: snapshot.warnings,
-    sourceStates: buildSourceStateMap(snapshot),
-    changed,
-    checkedAt: snapshot.checkedAt,
-  };
-}
-
-function isChangedSnapshot(previousSnapshot: ProjectSnapshot | null, nextSnapshot: ProjectSnapshot) {
-  if (previousSnapshot === null) {
-    return true;
-  }
-
-  return JSON.stringify(normalizeSnapshot(previousSnapshot)) !== JSON.stringify(normalizeSnapshot(nextSnapshot));
 }
 
 function isDuplicateRegistration(error: unknown): error is DuplicateProjectError {
@@ -153,7 +126,7 @@ function mapOfficialInitStage(stage: OfficialInitStage): ProjectInitJobStage | n
 function buildRefreshFailureResult(
   detail: string,
   checkedAt: string,
-  snapshotStatus: ProjectSnapshot['status'] | null,
+  snapshotStatus: ProjectRecord['snapshot']['status'] | null,
   warningCount: number | null,
 ): ProjectInitRefreshResult {
   return {
@@ -177,14 +150,40 @@ function persistInitUpdate(
   return result;
 }
 
+function buildProjectDetailResponse(
+  project: ProjectRecord,
+  timeline: ReturnType<RegistryDatabase['getProjectTimeline']>,
+): ProjectDetailResponse {
+  return {
+    ...project,
+    timeline: timeline.items,
+  };
+}
+
+function sendReconcileFailure(reply: FastifyReply, error: Error, fallbackCode: string) {
+  if (isTimeoutError(error)) {
+    return sendError(reply, error.statusCode, error.message, error.responseCode);
+  }
+
+  if (isProjectSnapshotReadError(error)) {
+    return sendError(reply, error.statusCode, error.message, error.responseCode);
+  }
+
+  if (isNotFoundError(error)) {
+    return sendError(reply, 404, error.message, 'project_not_found');
+  }
+
+  return sendError(reply, 500, error.message, fallbackCode);
+}
+
 async function executeInitJob(options: {
   registry: RegistryDatabase;
   eventHub: EventHub;
   initRunner: ProjectInitRunner;
+  reconciler: ProjectReconciler;
   projectId: string;
   jobId: string;
   canonicalPath: string;
-  snapshotTimeoutMs: number;
   log: FastifyInstance['log'];
 }) {
   let latestOutputExcerpt: string | null = null;
@@ -195,7 +194,7 @@ async function executeInitJob(options: {
         latestOutputExcerpt = update.excerpt;
         const mappedStage = mapOfficialInitStage(update.stage);
 
-        if (mappedStage === null || isProjectInitJobTerminalStage(mappedStage)) {
+        if (mappedStage === null) {
           return;
         }
 
@@ -236,18 +235,33 @@ async function executeInitJob(options: {
       emittedAt: new Date().toISOString(),
     });
 
-    const projectBeforeRefresh = options.registry.getProjectById(options.projectId);
+    const refreshResult = await options.reconciler.reconcileProject(options.projectId, {
+      trigger: 'init_refresh',
+      emitRefreshEventOnNoChange: true,
+    });
 
-    if (!projectBeforeRefresh) {
-      throw new ProjectNotFoundError(options.projectId);
+    if (refreshResult.status === 'failed') {
+      const detail = refreshResult.error.message;
+
+      persistInitUpdate(options.registry, options.eventHub, {
+        projectId: options.projectId,
+        jobId: options.jobId,
+        stage: 'failed',
+        detail,
+        outputExcerpt: initResult.outputExcerpt,
+        lastErrorDetail: detail,
+        refreshResult: buildRefreshFailureResult(
+          detail,
+          refreshResult.project.monitor.lastAttemptedAt ?? new Date().toISOString(),
+          refreshResult.project.snapshot.status,
+          refreshResult.project.snapshot.warnings.length,
+        ),
+        emittedAt: new Date().toISOString(),
+      });
+      return;
     }
 
-    const snapshot = await withSnapshotTimeout(
-      () => buildProjectSnapshot(options.canonicalPath),
-      options.snapshotTimeoutMs,
-    );
-
-    if (snapshot.status === 'uninitialized') {
+    if (refreshResult.project.snapshot.status === 'uninitialized') {
       const detail = 'Post-init refresh still reported the project as uninitialized.';
 
       persistInitUpdate(options.registry, options.eventHub, {
@@ -257,21 +271,18 @@ async function executeInitJob(options: {
         detail,
         outputExcerpt: initResult.outputExcerpt,
         lastErrorDetail: detail,
-        refreshResult: buildRefreshFailureResult(detail, snapshot.checkedAt, snapshot.status, snapshot.warnings.length),
+        refreshResult: buildRefreshFailureResult(
+          detail,
+          refreshResult.project.monitor.lastAttemptedAt ?? new Date().toISOString(),
+          refreshResult.project.snapshot.status,
+          refreshResult.project.snapshot.warnings.length,
+        ),
         emittedAt: new Date().toISOString(),
       });
       return;
     }
 
-    const changed = isChangedSnapshot(projectBeforeRefresh.snapshot, snapshot);
-    const refreshResult = options.registry.refreshProject({
-      projectId: options.projectId,
-      snapshot,
-      eventPayload: buildProjectEventPayload(options.projectId, options.canonicalPath, snapshot, changed),
-    });
-    options.eventHub.broadcast(refreshResult.event);
-
-    const detail = `Initialization completed and refresh observed a truthful ${snapshot.status} snapshot.`;
+    const detail = `Initialization completed and refresh observed a truthful ${refreshResult.project.snapshot.status} snapshot.`;
 
     persistInitUpdate(options.registry, options.eventHub, {
       projectId: options.projectId,
@@ -281,12 +292,12 @@ async function executeInitJob(options: {
       outputExcerpt: initResult.outputExcerpt,
       refreshResult: {
         status: 'succeeded',
-        checkedAt: snapshot.checkedAt,
+        checkedAt: refreshResult.project.snapshot.checkedAt,
         detail,
-        snapshotStatus: snapshot.status,
-        warningCount: snapshot.warnings.length,
-        changed,
-        eventId: refreshResult.event.id,
+        snapshotStatus: refreshResult.project.snapshot.status,
+        warningCount: refreshResult.project.snapshot.warnings.length,
+        changed: refreshResult.changed,
+        eventId: refreshResult.event?.id ?? null,
       },
       emittedAt: new Date().toISOString(),
     });
@@ -319,6 +330,7 @@ export async function registerProjectRoutes(
   options: {
     registry: RegistryDatabase;
     eventHub: EventHub;
+    reconciler: ProjectReconciler;
     snapshotTimeoutMs?: number;
     initRunner?: ProjectInitRunner;
   },
@@ -342,7 +354,22 @@ export async function registerProjectRoutes(
       return sendError(reply, 404, `Project ${request.params.id} was not found.`, 'project_not_found');
     }
 
-    return project;
+    return buildProjectDetailResponse(project, options.registry.getProjectTimeline(project.projectId));
+  });
+
+  app.get<{ Params: { id: string } }>('/api/projects/:id/timeline', async (request, reply) => {
+    const project = options.registry.getProjectById(request.params.id);
+
+    if (!project) {
+      return sendError(reply, 404, `Project ${request.params.id} was not found.`, 'project_not_found');
+    }
+
+    const timeline = options.registry.getProjectTimeline(project.projectId);
+
+    return {
+      items: timeline.items,
+      total: timeline.total,
+    } satisfies ProjectTimelineResponse;
   });
 
   app.post<{ Body: unknown }>('/api/projects/register', async (request, reply) => {
@@ -366,13 +393,15 @@ export async function registerProjectRoutes(
         snapshotTimeoutMs,
       );
       const projectId = `prj_${randomUUID()}`;
-      const payload = buildProjectEventPayload(projectId, canonicalPath.canonicalPath, snapshot, true);
+      const registrationState = buildProjectRegistrationState(projectId, canonicalPath.canonicalPath, snapshot);
       const result = options.registry.registerProject({
         projectId,
         registeredPath: canonicalPath.normalizedPath,
         canonicalPath: canonicalPath.canonicalPath,
         snapshot,
-        eventPayload: payload,
+        monitor: registrationState.monitor,
+        eventPayload: registrationState.eventPayload,
+        timelineEntry: registrationState.timelineEntry,
       });
       const response = toMutationResponse(result);
 
@@ -385,6 +414,10 @@ export async function registerProjectRoutes(
       }
 
       if (isTimeoutError(error)) {
+        return sendError(reply, error.statusCode, error.message, error.responseCode);
+      }
+
+      if (isProjectSnapshotReadError(error)) {
         return sendError(reply, error.statusCode, error.message, error.responseCode);
       }
 
@@ -405,38 +438,26 @@ export async function registerProjectRoutes(
     }
 
     try {
-      const snapshot = await withSnapshotTimeout(
-        () => buildProjectSnapshot(existingProject.canonicalPath),
-        snapshotTimeoutMs,
-      );
-      const changed = isChangedSnapshot(existingProject.snapshot, snapshot);
-      const payload = buildProjectEventPayload(
-        existingProject.projectId,
-        existingProject.canonicalPath,
-        snapshot,
-        changed,
-      );
-      const result = options.registry.refreshProject({
-        projectId: existingProject.projectId,
-        snapshot,
-        eventPayload: payload,
+      const result = await options.reconciler.reconcileProject(existingProject.projectId, {
+        trigger: 'manual_refresh',
+        emitRefreshEventOnNoChange: true,
       });
-      const response = toMutationResponse(result);
 
-      options.eventHub.broadcast(response.event);
+      if (result.status === 'failed') {
+        return sendReconcileFailure(reply, result.error, 'snapshot_refresh_failed');
+      }
 
-      return response;
+      if (!result.event || result.event.type === 'project.monitor.updated') {
+        throw new Error(`Expected a snapshot refresh event for project ${existingProject.projectId}.`);
+      }
+
+      return toMutationResponse({
+        project: result.project,
+        event: result.event,
+      });
     } catch (error) {
-      if (isProjectPathValidationError(error)) {
-        return sendError(reply, 409, error.message, error.responseCode);
-      }
-
-      if (isTimeoutError(error)) {
-        return sendError(reply, error.statusCode, error.message, error.responseCode);
-      }
-
-      if (isNotFoundError(error)) {
-        return sendError(reply, 404, error.message, 'project_not_found');
+      if (error instanceof Error) {
+        return sendReconcileFailure(reply, error, 'snapshot_refresh_failed');
       }
 
       request.log.error({ err: error, projectId: existingProject.projectId }, 'Failed to refresh project snapshot');
@@ -479,10 +500,10 @@ export async function registerProjectRoutes(
         registry: options.registry,
         eventHub: options.eventHub,
         initRunner,
+        reconciler: options.reconciler,
         projectId: existingProject.projectId,
         jobId,
         canonicalPath: existingProject.canonicalPath,
-        snapshotTimeoutMs,
         log: request.log,
       });
 
@@ -509,6 +530,10 @@ export async function registerProjectRoutes(
     {
       method: 'GET' as const,
       route: '/api/projects/:id',
+    },
+    {
+      method: 'GET' as const,
+      route: '/api/projects/:id/timeline',
     },
     {
       method: 'POST' as const,

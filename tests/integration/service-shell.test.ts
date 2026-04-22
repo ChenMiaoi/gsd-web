@@ -147,7 +147,7 @@ describe('service shell bootstrap', () => {
       database: {
         connected: true,
         fileName: 'gsd-web.sqlite',
-        schemaVersion: '3',
+        schemaVersion: '4',
       },
       assets: {
         available: true,
@@ -212,6 +212,7 @@ describe('service shell bootstrap', () => {
         expect.objectContaining({ method: 'GET', route: '/api/health' }),
         expect.objectContaining({ method: 'GET', route: '/api/projects' }),
         expect.objectContaining({ method: 'GET', route: '/api/projects/:id' }),
+        expect.objectContaining({ method: 'GET', route: '/api/projects/:id/timeline' }),
         expect.objectContaining({ method: 'POST', route: '/api/projects/register' }),
         expect.objectContaining({ method: 'POST', route: '/api/projects/:id/refresh' }),
         expect.objectContaining({ method: 'POST', route: '/api/projects/:id/init' }),

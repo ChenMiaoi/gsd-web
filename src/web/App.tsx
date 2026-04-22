@@ -3,6 +3,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   PROJECT_INIT_JOB_STAGES,
   PROJECT_INIT_REFRESH_RESULT_STATUSES,
+  PROJECT_MONITOR_HEALTHS,
+  PROJECT_RECONCILE_TRIGGERS,
   PROJECT_SNAPSHOT_STATUSES,
   SNAPSHOT_SOURCE_NAMES,
   SNAPSHOT_SOURCE_STATES,
@@ -14,19 +16,29 @@ import {
   type ProjectInitJobStage,
   type ProjectInitRefreshResult,
   type ProjectInitRefreshResultStatus,
+  type ProjectMonitorError,
+  type ProjectMonitorEventPayload,
+  type ProjectMonitorHealth,
+  type ProjectMonitorSummary,
   type ProjectMutationResponse,
   type ProjectRecord,
   type ProjectSnapshot,
   type ProjectSnapshotEventPayload,
   type ProjectSnapshotStatus,
   type ProjectsResponse,
+  type ProjectReconcileTrigger,
   type SnapshotSourceName,
   type SnapshotSourceState,
   type SnapshotWarning,
 } from '../shared/contracts.js';
 
 type StreamStatus = 'connecting' | 'connected' | 'stale' | 'disconnected';
-type KnownEventType = 'service.ready' | 'project.registered' | 'project.refreshed' | 'project.init.updated';
+type KnownEventType =
+  | 'service.ready'
+  | 'project.registered'
+  | 'project.refreshed'
+  | 'project.monitor.updated'
+  | 'project.init.updated';
 
 type StreamSummary = {
   id: string;
@@ -64,6 +76,7 @@ const KNOWN_EVENT_TYPES: ReadonlySet<KnownEventType> = new Set([
   'service.ready',
   'project.registered',
   'project.refreshed',
+  'project.monitor.updated',
   'project.init.updated',
 ]);
 
@@ -200,6 +213,26 @@ function parseSnapshotStatus(value: unknown, label: string): ProjectSnapshotStat
   }
 
   return candidate as ProjectSnapshotStatus;
+}
+
+function parseProjectMonitorHealth(value: unknown, label: string): ProjectMonitorHealth {
+  const candidate = expectString(value, label);
+
+  if (!PROJECT_MONITOR_HEALTHS.includes(candidate as ProjectMonitorHealth)) {
+    throw new ResponseShapeError(`${label} must be one of ${PROJECT_MONITOR_HEALTHS.join(', ')}.`);
+  }
+
+  return candidate as ProjectMonitorHealth;
+}
+
+function parseProjectReconcileTrigger(value: unknown, label: string): ProjectReconcileTrigger {
+  const candidate = expectString(value, label);
+
+  if (!PROJECT_RECONCILE_TRIGGERS.includes(candidate as ProjectReconcileTrigger)) {
+    throw new ResponseShapeError(`${label} must be one of ${PROJECT_RECONCILE_TRIGGERS.join(', ')}.`);
+  }
+
+  return candidate as ProjectReconcileTrigger;
 }
 
 function parseDirectorySummary(value: unknown, label: string): DirectorySummary {
@@ -463,6 +496,40 @@ function parseProjectInitJob(value: unknown, label: string): ProjectInitJob {
   };
 }
 
+function parseProjectMonitorError(value: unknown, label: string): ProjectMonitorError {
+  const record = expectRecord(value, label);
+
+  return {
+    scope: expectString(record.scope, `${label}.scope`) as ProjectMonitorError['scope'],
+    message: expectString(record.message, `${label}.message`),
+    at: expectString(record.at, `${label}.at`),
+  };
+}
+
+function parseProjectMonitorSummary(value: unknown, label: string): ProjectMonitorSummary {
+  const record = expectRecord(value, label);
+
+  return {
+    health: parseProjectMonitorHealth(record.health, `${label}.health`),
+    lastAttemptedAt:
+      record.lastAttemptedAt === null || record.lastAttemptedAt === undefined
+        ? null
+        : expectString(record.lastAttemptedAt, `${label}.lastAttemptedAt`),
+    lastSuccessfulAt:
+      record.lastSuccessfulAt === null || record.lastSuccessfulAt === undefined
+        ? null
+        : expectString(record.lastSuccessfulAt, `${label}.lastSuccessfulAt`),
+    lastTrigger:
+      record.lastTrigger === null || record.lastTrigger === undefined
+        ? null
+        : parseProjectReconcileTrigger(record.lastTrigger, `${label}.lastTrigger`),
+    lastError:
+      record.lastError === null || record.lastError === undefined
+        ? null
+        : parseProjectMonitorError(record.lastError, `${label}.lastError`),
+  };
+}
+
 function assertUiSafeInitJob(
   job: ProjectInitJob,
   snapshotStatus: ProjectSnapshotStatus,
@@ -534,6 +601,7 @@ function parseProjectRecord(value: unknown, label: string = 'project'): ProjectR
     lastEventId:
       record.lastEventId === undefined ? null : expectNullableString(record.lastEventId, `${label}.lastEventId`),
     snapshot,
+    monitor: parseProjectMonitorSummary(record.monitor, `${label}.monitor`),
     latestInitJob,
   };
 }
@@ -586,6 +654,25 @@ function parseProjectSnapshotEventPayload(value: unknown, label: string): Projec
     sourceStates: parseSourceStateMap(record.sourceStates, `${label}.sourceStates`),
     changed: expectBoolean(record.changed, `${label}.changed`),
     checkedAt: expectString(record.checkedAt, `${label}.checkedAt`),
+    trigger: parseProjectReconcileTrigger(record.trigger, `${label}.trigger`),
+    monitor: parseProjectMonitorSummary(record.monitor, `${label}.monitor`),
+  };
+}
+
+function parseProjectMonitorEventPayload(value: unknown, label: string): ProjectMonitorEventPayload {
+  const record = expectRecord(value, label);
+
+  return {
+    projectId: expectString(record.projectId, `${label}.projectId`),
+    canonicalPath: expectString(record.canonicalPath, `${label}.canonicalPath`),
+    snapshotStatus: parseSnapshotStatus(record.snapshotStatus, `${label}.snapshotStatus`),
+    warningCount: expectNumber(record.warningCount, `${label}.warningCount`),
+    trigger: parseProjectReconcileTrigger(record.trigger, `${label}.trigger`),
+    previousHealth:
+      record.previousHealth === null || record.previousHealth === undefined
+        ? null
+        : parseProjectMonitorHealth(record.previousHealth, `${label}.previousHealth`),
+    monitor: parseProjectMonitorSummary(record.monitor, `${label}.monitor`),
   };
 }
 
@@ -635,7 +722,9 @@ function parseProjectMutationResponse(value: unknown): ProjectMutationResponse {
       payload:
         eventType === 'project.init.updated'
           ? parseProjectInitEventPayload(eventRecord.payload, 'project mutation response.event.payload')
-          : parseProjectSnapshotEventPayload(eventRecord.payload, 'project mutation response.event.payload'),
+          : eventType === 'project.monitor.updated'
+            ? parseProjectMonitorEventPayload(eventRecord.payload, 'project mutation response.event.payload')
+            : parseProjectSnapshotEventPayload(eventRecord.payload, 'project mutation response.event.payload'),
     },
   };
 }
@@ -862,6 +951,7 @@ export default function App() {
   const selectedProjectIdRef = useRef<string | null>(null);
   const selectedProjectRef = useRef<ProjectRecord | null>(null);
   const projectsRef = useRef<ProjectRecord[]>([]);
+  const initDetailSyncProjectIdRef = useRef<string | null>(null);
   const staleTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -956,11 +1046,15 @@ export default function App() {
 
   const syncInitDetailAfterSuccess = useCallback(
     async (projectId: string, fallbackProject: ProjectRecord) => {
+      initDetailSyncProjectIdRef.current = projectId;
       setInitDetailSyncProjectId(projectId);
 
       try {
         await loadProjectDetail(projectId, fallbackProject);
       } finally {
+        initDetailSyncProjectIdRef.current =
+          initDetailSyncProjectIdRef.current === projectId ? null : initDetailSyncProjectIdRef.current;
+
         if (mountedRef.current) {
           setInitDetailSyncProjectId((current) => (current === projectId ? null : current));
         }
@@ -1088,7 +1182,11 @@ export default function App() {
           return;
         }
 
-        if (summary.type === 'project.registered' || summary.type === 'project.refreshed') {
+        if (
+          summary.type === 'project.registered'
+          || summary.type === 'project.refreshed'
+          || summary.type === 'project.monitor.updated'
+        ) {
           const shouldSyncDetail =
             summary.projectId !== null &&
             (selectedProjectIdRef.current === summary.projectId || selectedProjectIdRef.current === null);
@@ -1097,7 +1195,7 @@ export default function App() {
             summary.type === 'project.refreshed' &&
             summary.projectId !== null &&
             selectedProjectRef.current?.projectId === summary.projectId &&
-            (hasActiveInitJob(activeSelectedInitJob) || initDetailSyncProjectId === summary.projectId);
+            (hasActiveInitJob(activeSelectedInitJob) || initDetailSyncProjectIdRef.current === summary.projectId);
 
           void syncInventory(summary.projectId ?? selectedProjectIdRef.current, {
             preserveSelectedDetail,
@@ -1129,16 +1227,18 @@ export default function App() {
     eventSource.addEventListener('service.ready', handleEnvelope as EventListener);
     eventSource.addEventListener('project.registered', handleEnvelope as EventListener);
     eventSource.addEventListener('project.refreshed', handleEnvelope as EventListener);
+    eventSource.addEventListener('project.monitor.updated', handleEnvelope as EventListener);
     eventSource.addEventListener('project.init.updated', handleEnvelope as EventListener);
 
     return () => {
       eventSource.removeEventListener('service.ready', handleEnvelope as EventListener);
       eventSource.removeEventListener('project.registered', handleEnvelope as EventListener);
       eventSource.removeEventListener('project.refreshed', handleEnvelope as EventListener);
+      eventSource.removeEventListener('project.monitor.updated', handleEnvelope as EventListener);
       eventSource.removeEventListener('project.init.updated', handleEnvelope as EventListener);
       eventSource.close();
     };
-  }, [initDetailSyncProjectId, loadProjectDetail, markStreamActive, syncInitDetailAfterSuccess, syncInventory]);
+  }, [loadProjectDetail, markStreamActive, syncInitDetailAfterSuccess, syncInventory]);
 
   const selectProject = useCallback(
     (project: ProjectRecord) => {

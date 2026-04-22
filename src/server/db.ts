@@ -10,25 +10,48 @@ import type {
   ProjectInitJobHistoryEntry,
   ProjectInitJobStage,
   ProjectInitRefreshResult,
+  ProjectMonitorError,
+  ProjectMonitorEventPayload,
+  ProjectMonitorHealth,
+  ProjectMonitorSummary,
   ProjectRecord,
+  ProjectReconcileTrigger,
   ProjectSnapshot,
   ProjectSnapshotEventPayload,
+  ProjectSnapshotStatus,
+  ProjectTimelineEntry,
+  ProjectTimelineEntryType,
+  ProjectTimelineResponse,
   ServiceReadyEventPayload,
+  SnapshotSourceName,
 } from '../shared/contracts.js';
-import { PROJECT_INIT_JOB_STAGES, isProjectInitJobTerminalStage } from '../shared/contracts.js';
+import {
+  PROJECT_INIT_JOB_STAGES,
+  PROJECT_MONITOR_HEALTHS,
+  PROJECT_RECONCILE_TRIGGERS,
+  PROJECT_TIMELINE_ENTRY_TYPES,
+  SNAPSHOT_SOURCE_NAMES,
+  createStaleProjectMonitorSummary,
+  isProjectInitJobTerminalStage,
+} from '../shared/contracts.js';
 
-export const REGISTRY_SCHEMA_VERSION = '3';
+export const REGISTRY_SCHEMA_VERSION = '4';
 
 const MAX_INIT_JOB_HISTORY_ENTRIES = 32;
+const MAX_PROJECT_TIMELINE_ENTRIES = 32;
+const MAX_TIMELINE_DETAIL_LENGTH = 320;
 const MAX_INIT_DETAIL_LENGTH = 320;
 const MAX_INIT_OUTPUT_EXCERPT_LENGTH = 1_200;
 const MAX_INIT_ERROR_DETAIL_LENGTH = 640;
+const MAX_MONITOR_ERROR_DETAIL_LENGTH = 320;
+const DEFAULT_MONITOR_JSON = JSON.stringify(createStaleProjectMonitorSummary()).replace(/'/g, "''");
 
 interface ProjectRow {
   project_id: string;
   registered_path: string;
   canonical_path: string;
   snapshot_json: string;
+  monitor_json: string;
   created_at: string;
   updated_at: string;
   last_event_sequence: number | null;
@@ -40,6 +63,21 @@ interface EventRow {
   project_id: string | null;
   emitted_at: string;
   payload_json: string;
+}
+
+interface TimelineRow {
+  timeline_sequence: number;
+  project_id: string;
+  timeline_type: string;
+  emitted_at: string;
+  trigger: string;
+  snapshot_status: string;
+  monitor_health: string;
+  warning_count: number;
+  changed: number;
+  detail: string;
+  error_json: string | null;
+  event_sequence: number | null;
 }
 
 interface InitJobRow {
@@ -64,18 +102,42 @@ interface InitJobHistoryRow {
   output_excerpt: string | null;
 }
 
+export interface TimelineEntryInput {
+  type: ProjectTimelineEntryType;
+  emittedAt: string;
+  trigger: ProjectReconcileTrigger;
+  snapshotStatus: ProjectSnapshotStatus;
+  monitorHealth: ProjectMonitorHealth;
+  warningCount: number;
+  changed: boolean;
+  detail: string;
+  error?: ProjectMonitorError | null;
+}
+
 export interface RegisterProjectInput {
   projectId?: string;
   registeredPath: string;
   canonicalPath: string;
   snapshot: ProjectSnapshot;
+  monitor: ProjectMonitorSummary;
   eventPayload: ProjectSnapshotEventPayload;
+  timelineEntry?: TimelineEntryInput | null;
 }
 
 export interface RefreshProjectInput {
   projectId: string;
   snapshot: ProjectSnapshot;
+  monitor: ProjectMonitorSummary;
   eventPayload: ProjectSnapshotEventPayload;
+  timelineEntry?: TimelineEntryInput | null;
+}
+
+export interface UpdateProjectMonitorInput {
+  projectId: string;
+  monitor: ProjectMonitorSummary;
+  emittedAt: string;
+  eventPayload?: ProjectMonitorEventPayload;
+  timelineEntry?: TimelineEntryInput | null;
 }
 
 export interface StartInitJobInput {
@@ -178,6 +240,93 @@ function parseProjectInitJobStage(stage: string): ProjectInitJobStage {
   return stage as ProjectInitJobStage;
 }
 
+function parseProjectMonitorHealth(health: string): ProjectMonitorHealth {
+  if (!PROJECT_MONITOR_HEALTHS.includes(health as ProjectMonitorHealth)) {
+    throw new Error(`Invalid persisted monitor health: ${health}`);
+  }
+
+  return health as ProjectMonitorHealth;
+}
+
+function parseProjectReconcileTrigger(trigger: string): ProjectReconcileTrigger {
+  if (!PROJECT_RECONCILE_TRIGGERS.includes(trigger as ProjectReconcileTrigger)) {
+    throw new Error(`Invalid persisted reconcile trigger: ${trigger}`);
+  }
+
+  return trigger as ProjectReconcileTrigger;
+}
+
+function parseProjectTimelineEntryType(type: string): ProjectTimelineEntryType {
+  if (!PROJECT_TIMELINE_ENTRY_TYPES.includes(type as ProjectTimelineEntryType)) {
+    throw new Error(`Invalid persisted timeline entry type: ${type}`);
+  }
+
+  return type as ProjectTimelineEntryType;
+}
+
+function parseSnapshotSourceName(scope: string): ProjectMonitorError['scope'] {
+  if (scope === 'projectRoot' || scope === 'registry') {
+    return scope;
+  }
+
+  if (SNAPSHOT_SOURCE_NAMES.includes(scope as SnapshotSourceName)) {
+    return scope as SnapshotSourceName;
+  }
+
+  throw new Error(`Invalid persisted monitor error scope: ${scope}`);
+}
+
+function expectNullableString(value: unknown, label: string) {
+  if (value === null) {
+    return null;
+  }
+
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  throw new Error(`Invalid persisted ${label}.`);
+}
+
+function parseProjectMonitorError(value: unknown): ProjectMonitorError {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Invalid persisted project monitor error payload.');
+  }
+
+  const record = value as Record<string, unknown>;
+
+  return {
+    scope: parseSnapshotSourceName(String(record.scope ?? '')),
+    message: clampText(typeof record.message === 'string' ? record.message : null, MAX_MONITOR_ERROR_DETAIL_LENGTH)
+      ?? 'Unknown monitor error.',
+    at: typeof record.at === 'string' ? record.at : new Date(0).toISOString(),
+  };
+}
+
+function parseProjectMonitorSummary(raw: string): ProjectMonitorSummary {
+  const parsed = JSON.parse(raw) as unknown;
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Invalid persisted project monitor summary.');
+  }
+
+  const record = parsed as Record<string, unknown>;
+
+  return {
+    health: parseProjectMonitorHealth(String(record.health ?? '')),
+    lastAttemptedAt: expectNullableString(record.lastAttemptedAt ?? null, 'project monitor lastAttemptedAt'),
+    lastSuccessfulAt: expectNullableString(record.lastSuccessfulAt ?? null, 'project monitor lastSuccessfulAt'),
+    lastTrigger:
+      record.lastTrigger === null || record.lastTrigger === undefined
+        ? null
+        : parseProjectReconcileTrigger(String(record.lastTrigger)),
+    lastError:
+      record.lastError === null || record.lastError === undefined
+        ? null
+        : parseProjectMonitorError(record.lastError),
+  };
+}
+
 function parseEventRow<TPayload extends ProjectEventPayload>(row: EventRow): ProjectEventEnvelope<TPayload> {
   return {
     id: `evt_${row.sequence}`,
@@ -197,6 +346,24 @@ function parseInitJobHistoryRow(row: InitJobHistoryRow): ProjectInitJobHistoryEn
     detail: row.detail,
     outputExcerpt: row.output_excerpt,
     emittedAt: row.emitted_at,
+  };
+}
+
+function parseTimelineRow(row: TimelineRow): ProjectTimelineEntry {
+  return {
+    id: `tle_${row.timeline_sequence}`,
+    sequence: row.timeline_sequence,
+    type: parseProjectTimelineEntryType(row.timeline_type),
+    projectId: row.project_id,
+    emittedAt: row.emitted_at,
+    trigger: parseProjectReconcileTrigger(row.trigger),
+    snapshotStatus: row.snapshot_status as ProjectSnapshotStatus,
+    monitorHealth: parseProjectMonitorHealth(row.monitor_health),
+    warningCount: row.warning_count,
+    changed: Boolean(row.changed),
+    detail: row.detail,
+    eventId: row.event_sequence === null ? null : `evt_${row.event_sequence}`,
+    error: row.error_json === null ? null : parseProjectMonitorError(JSON.parse(row.error_json) as unknown),
   };
 }
 
@@ -232,6 +399,7 @@ export class RegistryDatabase {
           registered_path,
           canonical_path,
           snapshot_json,
+          monitor_json,
           created_at,
           updated_at,
           last_event_sequence
@@ -251,6 +419,7 @@ export class RegistryDatabase {
           registered_path,
           canonical_path,
           snapshot_json,
+          monitor_json,
           created_at,
           updated_at,
           last_event_sequence
@@ -270,6 +439,7 @@ export class RegistryDatabase {
           registered_path,
           canonical_path,
           snapshot_json,
+          monitor_json,
           created_at,
           updated_at,
           last_event_sequence
@@ -281,6 +451,39 @@ export class RegistryDatabase {
     return row ? this.parseProjectRow(row) : null;
   }
 
+  getProjectTimeline(projectId: string, limit: number = 20): ProjectTimelineResponse {
+    const normalizedLimit = Number.isInteger(limit) && limit > 0 ? limit : 20;
+    const totalRow = this.database
+      .prepare('SELECT COUNT(*) AS total FROM project_timeline WHERE project_id = ?')
+      .get(projectId) as { total: number };
+    const rows = this.database
+      .prepare(
+        `SELECT
+          timeline_sequence,
+          project_id,
+          timeline_type,
+          emitted_at,
+          trigger,
+          snapshot_status,
+          monitor_health,
+          warning_count,
+          changed,
+          detail,
+          error_json,
+          event_sequence
+        FROM project_timeline
+        WHERE project_id = ?
+        ORDER BY timeline_sequence DESC
+        LIMIT ?`,
+      )
+      .all(projectId, normalizedLimit) as unknown as TimelineRow[];
+
+    return {
+      items: rows.map((row) => parseTimelineRow(row)),
+      total: totalRow.total,
+    };
+  }
+
   registerProject(input: RegisterProjectInput): {
     project: ProjectRecord;
     event: ProjectEventEnvelope<ProjectSnapshotEventPayload>;
@@ -288,6 +491,7 @@ export class RegistryDatabase {
     const now = input.snapshot.checkedAt;
     const projectId = input.projectId ?? createProjectId();
     const snapshotJson = JSON.stringify(input.snapshot);
+    const monitorJson = JSON.stringify(input.monitor);
 
     this.begin();
 
@@ -299,14 +503,19 @@ export class RegistryDatabase {
             registered_path,
             canonical_path,
             snapshot_json,
+            monitor_json,
             created_at,
             updated_at,
             last_event_sequence
-          ) VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
         )
-        .run(projectId, input.registeredPath, input.canonicalPath, snapshotJson, now, now);
+        .run(projectId, input.registeredPath, input.canonicalPath, snapshotJson, monitorJson, now, now);
 
       const event = this.insertEvent('project.registered', projectId, now, input.eventPayload);
+
+      if (input.timelineEntry) {
+        this.insertTimelineEntry(projectId, input.timelineEntry, event.sequence);
+      }
 
       this.database
         .prepare('UPDATE projects SET last_event_sequence = ? WHERE project_id = ?')
@@ -341,6 +550,7 @@ export class RegistryDatabase {
 
     const now = input.snapshot.checkedAt;
     const snapshotJson = JSON.stringify(input.snapshot);
+    const monitorJson = JSON.stringify(input.monitor);
 
     this.begin();
 
@@ -348,16 +558,20 @@ export class RegistryDatabase {
       const updateResult = this.database
         .prepare(
           `UPDATE projects
-          SET snapshot_json = ?, updated_at = ?
+          SET snapshot_json = ?, monitor_json = ?, updated_at = ?
           WHERE project_id = ?`,
         )
-        .run(snapshotJson, now, input.projectId);
+        .run(snapshotJson, monitorJson, now, input.projectId);
 
       if (Number(updateResult.changes) !== 1) {
         throw new ProjectNotFoundError(input.projectId);
       }
 
       const event = this.insertEvent('project.refreshed', input.projectId, now, input.eventPayload);
+
+      if (input.timelineEntry) {
+        this.insertTimelineEntry(input.projectId, input.timelineEntry, event.sequence);
+      }
 
       this.database
         .prepare('UPDATE projects SET last_event_sequence = ? WHERE project_id = ?')
@@ -368,6 +582,54 @@ export class RegistryDatabase {
       return {
         project: this.requireProject(input.projectId),
         event,
+      };
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
+  updateProjectMonitor(input: UpdateProjectMonitorInput): {
+    project: ProjectRecord;
+    event: ProjectEventEnvelope<ProjectMonitorEventPayload> | null;
+    timeline: ProjectTimelineEntry | null;
+  } {
+    this.begin();
+
+    try {
+      this.requireProject(input.projectId);
+
+      const updateResult = this.database
+        .prepare(
+          `UPDATE projects
+          SET monitor_json = ?, updated_at = ?
+          WHERE project_id = ?`,
+        )
+        .run(JSON.stringify(input.monitor), input.emittedAt, input.projectId);
+
+      if (Number(updateResult.changes) !== 1) {
+        throw new ProjectNotFoundError(input.projectId);
+      }
+
+      let event: ProjectEventEnvelope<ProjectMonitorEventPayload> | null = null;
+
+      if (input.eventPayload) {
+        event = this.insertEvent('project.monitor.updated', input.projectId, input.emittedAt, input.eventPayload);
+        this.database
+          .prepare('UPDATE projects SET last_event_sequence = ? WHERE project_id = ?')
+          .run(event.sequence, input.projectId);
+      }
+
+      const timeline = input.timelineEntry
+        ? this.insertTimelineEntry(input.projectId, input.timelineEntry, event?.sequence ?? null)
+        : null;
+
+      this.commit();
+
+      return {
+        project: this.requireProject(input.projectId),
+        event,
+        timeline,
       };
     } catch (error) {
       this.rollback();
@@ -568,6 +830,7 @@ export class RegistryDatabase {
         registered_path TEXT NOT NULL,
         canonical_path TEXT NOT NULL UNIQUE,
         snapshot_json TEXT NOT NULL,
+        monitor_json TEXT NOT NULL DEFAULT '${DEFAULT_MONITOR_JSON}',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         last_event_sequence INTEGER,
@@ -581,6 +844,23 @@ export class RegistryDatabase {
         emitted_at TEXT NOT NULL,
         payload_json TEXT NOT NULL,
         FOREIGN KEY(project_id) REFERENCES projects(project_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS project_timeline (
+        timeline_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        timeline_type TEXT NOT NULL,
+        emitted_at TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        snapshot_status TEXT NOT NULL,
+        monitor_health TEXT NOT NULL,
+        warning_count INTEGER NOT NULL,
+        changed INTEGER NOT NULL,
+        detail TEXT NOT NULL,
+        error_json TEXT,
+        event_sequence INTEGER,
+        FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE,
+        FOREIGN KEY(event_sequence) REFERENCES project_events(sequence)
       );
 
       CREATE TABLE IF NOT EXISTS init_jobs (
@@ -613,9 +893,13 @@ export class RegistryDatabase {
       CREATE INDEX IF NOT EXISTS idx_projects_updated_at ON projects(updated_at);
       CREATE INDEX IF NOT EXISTS idx_project_events_project_id ON project_events(project_id);
       CREATE INDEX IF NOT EXISTS idx_project_events_emitted_at ON project_events(emitted_at);
+      CREATE INDEX IF NOT EXISTS idx_project_timeline_project_sequence ON project_timeline(project_id, timeline_sequence DESC);
+      CREATE INDEX IF NOT EXISTS idx_project_timeline_emitted_at ON project_timeline(emitted_at);
       CREATE INDEX IF NOT EXISTS idx_init_jobs_project_updated_at ON init_jobs(project_id, updated_at DESC, job_sequence DESC);
       CREATE INDEX IF NOT EXISTS idx_init_job_history_job_sequence ON init_job_history(job_id, history_sequence ASC);
     `);
+
+    this.ensureProjectMonitorColumn();
 
     const upsertMetadata = this.database.prepare(`
       INSERT INTO service_metadata (key, value)
@@ -627,6 +911,22 @@ export class RegistryDatabase {
     upsertMetadata.run('lastBootedAt', new Date().toISOString());
   }
 
+  private ensureProjectMonitorColumn() {
+    const columns = this.database.prepare('PRAGMA table_info(projects)').all() as Array<{ name: string }>;
+
+    if (!columns.some((column) => column.name === 'monitor_json')) {
+      this.database.exec(
+        `ALTER TABLE projects ADD COLUMN monitor_json TEXT NOT NULL DEFAULT '${DEFAULT_MONITOR_JSON}'`,
+      );
+    }
+
+    this.database.exec(
+      `UPDATE projects
+       SET monitor_json = '${DEFAULT_MONITOR_JSON}'
+       WHERE monitor_json IS NULL OR TRIM(monitor_json) = ''`,
+    );
+  }
+
   private parseProjectRow(row: ProjectRow): ProjectRecord {
     return {
       projectId: row.project_id,
@@ -636,6 +936,7 @@ export class RegistryDatabase {
       updatedAt: row.updated_at,
       lastEventId: row.last_event_sequence === null ? null : `evt_${row.last_event_sequence}`,
       snapshot: JSON.parse(row.snapshot_json) as ProjectSnapshot,
+      monitor: parseProjectMonitorSummary(row.monitor_json),
       latestInitJob: this.getLatestInitJob(row.project_id),
     };
   }
@@ -770,6 +1071,77 @@ export class RegistryDatabase {
       .get(Number(result.lastInsertRowid)) as unknown as InitJobHistoryRow;
 
     return parseInitJobHistoryRow(row);
+  }
+
+  private insertTimelineEntry(
+    projectId: string,
+    input: TimelineEntryInput,
+    eventSequence: number | null,
+  ): ProjectTimelineEntry {
+    const result = this.database
+      .prepare(
+        `INSERT INTO project_timeline (
+          project_id,
+          timeline_type,
+          emitted_at,
+          trigger,
+          snapshot_status,
+          monitor_health,
+          warning_count,
+          changed,
+          detail,
+          error_json,
+          event_sequence
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        projectId,
+        input.type,
+        input.emittedAt,
+        input.trigger,
+        input.snapshotStatus,
+        input.monitorHealth,
+        input.warningCount,
+        input.changed ? 1 : 0,
+        clampText(input.detail, MAX_TIMELINE_DETAIL_LENGTH) ?? 'Project timeline updated.',
+        input.error ? JSON.stringify(input.error) : null,
+        eventSequence,
+      );
+
+    this.database
+      .prepare(
+        `DELETE FROM project_timeline
+         WHERE timeline_sequence IN (
+           SELECT timeline_sequence
+           FROM project_timeline
+           WHERE project_id = ?
+           ORDER BY timeline_sequence DESC
+           LIMIT -1 OFFSET ?
+         )`,
+      )
+      .run(projectId, MAX_PROJECT_TIMELINE_ENTRIES);
+
+    const row = this.database
+      .prepare(
+        `SELECT
+          timeline_sequence,
+          project_id,
+          timeline_type,
+          emitted_at,
+          trigger,
+          snapshot_status,
+          monitor_health,
+          warning_count,
+          changed,
+          detail,
+          error_json,
+          event_sequence
+        FROM project_timeline
+        WHERE timeline_sequence = ?`,
+      )
+      .get(Number(result.lastInsertRowid)) as unknown as TimelineRow;
+
+    return parseTimelineRow(row);
   }
 
   private buildProjectInitEventPayload(

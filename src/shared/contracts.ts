@@ -38,6 +38,30 @@ export const PROJECT_SNAPSHOT_STATUSES = ['uninitialized', 'initialized', 'degra
 
 export type ProjectSnapshotStatus = (typeof PROJECT_SNAPSHOT_STATUSES)[number];
 
+export const PROJECT_MONITOR_HEALTHS = ['healthy', 'degraded', 'read_failed', 'stale'] as const;
+
+export type ProjectMonitorHealth = (typeof PROJECT_MONITOR_HEALTHS)[number];
+
+export const PROJECT_RECONCILE_TRIGGERS = [
+  'register',
+  'manual_refresh',
+  'init_refresh',
+  'monitor_boot',
+  'monitor_interval',
+  'watcher',
+] as const;
+
+export type ProjectReconcileTrigger = (typeof PROJECT_RECONCILE_TRIGGERS)[number];
+
+export const PROJECT_TIMELINE_ENTRY_TYPES = [
+  'registered',
+  'refreshed',
+  'monitor_degraded',
+  'monitor_recovered',
+] as const;
+
+export type ProjectTimelineEntryType = (typeof PROJECT_TIMELINE_ENTRY_TYPES)[number];
+
 export const PROJECT_INIT_JOB_STAGES = [
   'queued',
   'starting',
@@ -130,6 +154,36 @@ export interface ProjectSnapshot {
   warnings: SnapshotWarning[];
 }
 
+export interface ProjectMonitorError {
+  scope: 'projectRoot' | SnapshotSourceName | 'registry';
+  message: string;
+  at: string;
+}
+
+export interface ProjectMonitorSummary {
+  health: ProjectMonitorHealth;
+  lastAttemptedAt: string | null;
+  lastSuccessfulAt: string | null;
+  lastTrigger: ProjectReconcileTrigger | null;
+  lastError: ProjectMonitorError | null;
+}
+
+export interface ProjectTimelineEntry {
+  id: string;
+  sequence: number;
+  type: ProjectTimelineEntryType;
+  projectId: string;
+  emittedAt: string;
+  trigger: ProjectReconcileTrigger;
+  snapshotStatus: ProjectSnapshotStatus;
+  monitorHealth: ProjectMonitorHealth;
+  warningCount: number;
+  changed: boolean;
+  detail: string;
+  eventId: string | null;
+  error: ProjectMonitorError | null;
+}
+
 export interface ProjectInitRefreshResult {
   status: ProjectInitRefreshResultStatus;
   checkedAt: string;
@@ -169,7 +223,17 @@ export interface ProjectRecord {
   updatedAt: string;
   lastEventId: string | null;
   snapshot: ProjectSnapshot;
+  monitor: ProjectMonitorSummary;
   latestInitJob: ProjectInitJob | null;
+}
+
+export interface ProjectDetailResponse extends ProjectRecord {
+  timeline: ProjectTimelineEntry[];
+}
+
+export interface ProjectTimelineResponse {
+  items: ProjectTimelineEntry[];
+  total: number;
 }
 
 export interface HealthResponse {
@@ -203,6 +267,7 @@ export type ProjectEventType =
   | 'service.ready'
   | 'project.registered'
   | 'project.refreshed'
+  | 'project.monitor.updated'
   | 'project.init.updated';
 
 export interface ServiceReadyEventPayload {
@@ -221,6 +286,18 @@ export interface ProjectSnapshotEventPayload {
   sourceStates: Record<SnapshotSourceName, SnapshotSourceState>;
   changed: boolean;
   checkedAt: string;
+  trigger: ProjectReconcileTrigger;
+  monitor: ProjectMonitorSummary;
+}
+
+export interface ProjectMonitorEventPayload {
+  projectId: string;
+  canonicalPath: string;
+  snapshotStatus: ProjectSnapshotStatus;
+  warningCount: number;
+  trigger: ProjectReconcileTrigger;
+  previousHealth: ProjectMonitorHealth | null;
+  monitor: ProjectMonitorSummary;
 }
 
 export interface ProjectInitEventPayload {
@@ -234,6 +311,7 @@ export interface ProjectInitEventPayload {
 export type ProjectEventPayload =
   | ServiceReadyEventPayload
   | ProjectSnapshotEventPayload
+  | ProjectMonitorEventPayload
   | ProjectInitEventPayload;
 
 export interface ProjectEventEnvelope<TPayload = ProjectEventPayload> {
@@ -262,6 +340,20 @@ export function buildSourceStateMap(
     autoLock: snapshot.sources.autoLock.state,
     stateMd: snapshot.sources.stateMd.state,
     gsdDb: snapshot.sources.gsdDb.state,
+  };
+}
+
+export function deriveMonitorHealthFromSnapshot(snapshotStatus: ProjectSnapshotStatus): ProjectMonitorHealth {
+  return snapshotStatus === 'degraded' ? 'degraded' : 'healthy';
+}
+
+export function createStaleProjectMonitorSummary(): ProjectMonitorSummary {
+  return {
+    health: 'stale',
+    lastAttemptedAt: null,
+    lastSuccessfulAt: null,
+    lastTrigger: null,
+    lastError: null,
   };
 }
 
