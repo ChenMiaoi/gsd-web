@@ -6,6 +6,7 @@ import {
   PROJECT_SNAPSHOT_STATUSES,
   SNAPSHOT_SOURCE_NAMES,
   SNAPSHOT_SOURCE_STATES,
+  isProjectInitJobTerminalStage,
   type DirectorySummary,
   type ProjectInitEventPayload,
   type ProjectInitJob,
@@ -34,7 +35,29 @@ type StreamSummary = {
   projectId: string | null;
 };
 
+type ProjectInitEnvelope = {
+  id: string;
+  emittedAt: string;
+  projectId: string;
+  payload: ProjectInitEventPayload;
+};
+
 const REQUEST_TIMEOUT_MS = 8_000;
+const INIT_TERMINAL_FAILURE_STAGES: ReadonlySet<ProjectInitJobStage> = new Set([
+  'failed',
+  'timed_out',
+  'cancelled',
+]);
+const INIT_STAGE_LABELS: Record<ProjectInitJobStage, string> = {
+  queued: 'Queued',
+  starting: 'Starting',
+  initializing: 'Initializing',
+  refreshing: 'Refreshing',
+  succeeded: 'Succeeded',
+  failed: 'Failed',
+  timed_out: 'Timed out',
+  cancelled: 'Cancelled',
+};
 const STREAM_STALE_MS = 30_000;
 const WARNING_TEXT_LIMIT = 240;
 const KNOWN_EVENT_TYPES: ReadonlySet<KnownEventType> = new Set([
@@ -440,8 +463,67 @@ function parseProjectInitJob(value: unknown, label: string): ProjectInitJob {
   };
 }
 
+function assertUiSafeInitJob(
+  job: ProjectInitJob,
+  snapshotStatus: ProjectSnapshotStatus,
+  label: string,
+): ProjectInitJob {
+  if (INIT_TERMINAL_FAILURE_STAGES.has(job.stage)) {
+    if (!job.lastErrorDetail || job.lastErrorDetail.trim().length === 0) {
+      throw new ResponseShapeError(`${label}.lastErrorDetail is required for ${job.stage} jobs.`);
+    }
+  }
+
+  if (job.stage === 'succeeded') {
+    if (job.refreshResult?.status !== 'succeeded') {
+      throw new ResponseShapeError(`${label}.refreshResult must prove success before a job can succeed.`);
+    }
+
+    if (
+      snapshotStatus === 'uninitialized' ||
+      job.refreshResult.snapshotStatus === null ||
+      job.refreshResult.snapshotStatus === 'uninitialized'
+    ) {
+      throw new ResponseShapeError(`${label} cannot report success before refreshed detail proves initialization.`);
+    }
+  }
+
+  return job;
+}
+
+function parseProjectInitEventEnvelope(value: unknown): ProjectInitEnvelope {
+  const record = expectRecord(value, 'project init event envelope');
+  const type = parseKnownEventType(record.type, 'project init event envelope.type');
+
+  if (type !== 'project.init.updated') {
+    throw new ResponseShapeError(`Expected project.init.updated, received ${type}.`);
+  }
+
+  const projectId = expectString(record.projectId, 'project init event envelope.projectId');
+  const payload = parseProjectInitEventPayload(record.payload, 'project init event envelope.payload');
+
+  if (payload.projectId !== projectId) {
+    throw new ResponseShapeError('project init event envelope.projectId must match payload.projectId.');
+  }
+
+  return {
+    id: expectString(record.id, 'project init event envelope.id'),
+    emittedAt: expectString(record.emittedAt, 'project init event envelope.emittedAt'),
+    projectId,
+    payload: {
+      ...payload,
+      job: assertUiSafeInitJob(payload.job, payload.snapshotStatus, 'project init event envelope.payload.job'),
+    },
+  };
+}
+
 function parseProjectRecord(value: unknown, label: string = 'project'): ProjectRecord {
   const record = expectRecord(value, label);
+  const snapshot = parseProjectSnapshot(record.snapshot, `${label}.snapshot`);
+  const latestInitJob =
+    record.latestInitJob === null || record.latestInitJob === undefined
+      ? null
+      : assertUiSafeInitJob(parseProjectInitJob(record.latestInitJob, `${label}.latestInitJob`), snapshot.status, `${label}.latestInitJob`);
 
   return {
     projectId: expectString(record.projectId, `${label}.projectId`),
@@ -451,11 +533,8 @@ function parseProjectRecord(value: unknown, label: string = 'project'): ProjectR
     updatedAt: expectString(record.updatedAt, `${label}.updatedAt`),
     lastEventId:
       record.lastEventId === undefined ? null : expectNullableString(record.lastEventId, `${label}.lastEventId`),
-    snapshot: parseProjectSnapshot(record.snapshot, `${label}.snapshot`),
-    latestInitJob:
-      record.latestInitJob === null || record.latestInitJob === undefined
-        ? null
-        : parseProjectInitJob(record.latestInitJob, `${label}.latestInitJob`),
+    snapshot,
+    latestInitJob,
   };
 }
 
@@ -699,6 +778,66 @@ function upsertProject(projects: ProjectRecord[], nextProject: ProjectRecord) {
   return projects.map((project) => (project.projectId === nextProject.projectId ? nextProject : project));
 }
 
+function mergeProjectInitJob(project: ProjectRecord, envelope: ProjectInitEnvelope): ProjectRecord {
+  return {
+    ...project,
+    updatedAt: envelope.payload.job.updatedAt,
+    lastEventId: envelope.id,
+    latestInitJob: envelope.payload.job,
+  };
+}
+
+function getLatestInitHistoryEntry(job: ProjectInitJob | null) {
+  return job?.history.at(-1) ?? null;
+}
+
+function hasActiveInitJob(job: ProjectInitJob | null) {
+  return job !== null && !isProjectInitJobTerminalStage(job.stage);
+}
+
+function canRetryInitJob(job: ProjectInitJob | null) {
+  return job !== null && INIT_TERMINAL_FAILURE_STAGES.has(job.stage);
+}
+
+function shouldShowInitAction(project: ProjectRecord | null) {
+  if (!project || project.snapshot.status !== 'uninitialized') {
+    return false;
+  }
+
+  return project.latestInitJob?.stage !== 'succeeded';
+}
+
+function summarizeInitJob(job: ProjectInitJob | null) {
+  if (!job) {
+    return null;
+  }
+
+  return job.refreshResult?.detail ?? getLatestInitHistoryEntry(job)?.detail ?? 'Waiting for initialization updates.';
+}
+
+function initButtonLabel(
+  project: ProjectRecord,
+  options: { requestPending: boolean; syncingDetail: boolean },
+) {
+  if (options.requestPending) {
+    return 'Starting initialization…';
+  }
+
+  if (options.syncingDetail) {
+    return 'Refreshing monitored detail…';
+  }
+
+  if (hasActiveInitJob(project.latestInitJob)) {
+    return `Initialization ${INIT_STAGE_LABELS[project.latestInitJob!.stage]}…`;
+  }
+
+  if (canRetryInitJob(project.latestInitJob)) {
+    return 'Retry initialization';
+  }
+
+  return 'Initialize project';
+}
+
 export default function App() {
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
@@ -713,6 +852,9 @@ export default function App() {
   const [registerSuccess, setRegisterSuccess] = useState<string | null>(null);
   const [refreshPending, setRefreshPending] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [initPendingProjectId, setInitPendingProjectId] = useState<string | null>(null);
+  const [initError, setInitError] = useState<string | null>(null);
+  const [initDetailSyncProjectId, setInitDetailSyncProjectId] = useState<string | null>(null);
   const [streamStatus, setStreamStatus] = useState<StreamStatus>('connecting');
   const [streamSummary, setStreamSummary] = useState<StreamSummary | null>(null);
 
@@ -812,8 +954,28 @@ export default function App() {
     }
   }, []);
 
+  const syncInitDetailAfterSuccess = useCallback(
+    async (projectId: string, fallbackProject: ProjectRecord) => {
+      setInitDetailSyncProjectId(projectId);
+
+      try {
+        await loadProjectDetail(projectId, fallbackProject);
+      } finally {
+        if (mountedRef.current) {
+          setInitDetailSyncProjectId((current) => (current === projectId ? null : current));
+        }
+      }
+    },
+    [loadProjectDetail],
+  );
+
   const syncInventory = useCallback(
-    async (selectionHint?: string | null) => {
+    async (
+      selectionHint?: string | null,
+      options: {
+        preserveSelectedDetail?: boolean;
+      } = {},
+    ) => {
       setInventoryLoading(true);
 
       try {
@@ -850,7 +1012,18 @@ export default function App() {
           return;
         }
 
+        const shouldPreserveSelectedDetail =
+          options.preserveSelectedDetail === true &&
+          selectedProjectRef.current !== null &&
+          selectedProjectRef.current.projectId === nextProject.projectId &&
+          selectedProjectIdRef.current === nextProject.projectId;
+
         setSelectedProjectId(nextProject.projectId);
+
+        if (shouldPreserveSelectedDetail) {
+          return;
+        }
+
         setSelectedProject(nextProject);
 
         void loadProjectDetail(nextProject.projectId, nextProject);
@@ -883,21 +1056,60 @@ export default function App() {
 
     const handleEnvelope = (event: MessageEvent<string>) => {
       try {
-        const summary = parseEventEnvelope(JSON.parse(event.data) as unknown);
+        const raw = JSON.parse(event.data) as unknown;
+        const summary = parseEventEnvelope(raw);
         markStreamActive(summary);
 
-        const shouldSyncDetail =
-          summary.projectId !== null &&
-          (selectedProjectIdRef.current === summary.projectId || selectedProjectIdRef.current === null);
+        if (summary.type === 'project.init.updated') {
+          const initEnvelope = parseProjectInitEventEnvelope(raw);
 
-        void syncInventory(summary.projectId ?? selectedProjectIdRef.current);
+          setProjects((current) =>
+            current.map((project) =>
+              project.projectId === initEnvelope.projectId ? mergeProjectInitJob(project, initEnvelope) : project,
+            ),
+          );
 
-        if (shouldSyncDetail && summary.projectId) {
-          const fallbackProject =
-            projectsRef.current.find((project) => project.projectId === summary.projectId) ??
-            selectedProjectRef.current;
+          const selectedProject = selectedProjectRef.current;
 
-          void loadProjectDetail(summary.projectId, fallbackProject);
+          if (selectedProject && selectedProject.projectId === initEnvelope.projectId) {
+            const mergedProject = mergeProjectInitJob(selectedProject, initEnvelope);
+            const alreadySucceeded =
+              selectedProject.latestInitJob?.jobId === initEnvelope.payload.job.jobId &&
+              selectedProject.latestInitJob.stage === 'succeeded';
+
+            setSelectedProject(mergedProject);
+            setInitError(null);
+
+            if (initEnvelope.payload.job.stage === 'succeeded' && !alreadySucceeded) {
+              void syncInitDetailAfterSuccess(initEnvelope.projectId, mergedProject);
+            }
+          }
+
+          return;
+        }
+
+        if (summary.type === 'project.registered' || summary.type === 'project.refreshed') {
+          const shouldSyncDetail =
+            summary.projectId !== null &&
+            (selectedProjectIdRef.current === summary.projectId || selectedProjectIdRef.current === null);
+          const activeSelectedInitJob = selectedProjectRef.current?.latestInitJob ?? null;
+          const preserveSelectedDetail =
+            summary.type === 'project.refreshed' &&
+            summary.projectId !== null &&
+            selectedProjectRef.current?.projectId === summary.projectId &&
+            (hasActiveInitJob(activeSelectedInitJob) || initDetailSyncProjectId === summary.projectId);
+
+          void syncInventory(summary.projectId ?? selectedProjectIdRef.current, {
+            preserveSelectedDetail,
+          });
+
+          if (!preserveSelectedDetail && shouldSyncDetail && summary.projectId) {
+            const fallbackProject =
+              projectsRef.current.find((project) => project.projectId === summary.projectId) ??
+              selectedProjectRef.current;
+
+            void loadProjectDetail(summary.projectId, fallbackProject);
+          }
         }
       } catch {
         // Ignore unknown or malformed SSE payloads and keep the dashboard usable.
@@ -926,7 +1138,7 @@ export default function App() {
       eventSource.removeEventListener('project.init.updated', handleEnvelope as EventListener);
       eventSource.close();
     };
-  }, [loadProjectDetail, markStreamActive, syncInventory]);
+  }, [initDetailSyncProjectId, loadProjectDetail, markStreamActive, syncInitDetailAfterSuccess, syncInventory]);
 
   const selectProject = useCallback(
     (project: ProjectRecord) => {
@@ -934,6 +1146,7 @@ export default function App() {
       setSelectedProject(project);
       setDetailError(null);
       setRefreshError(null);
+      setInitError(null);
       setRegisterSuccess(null);
       void loadProjectDetail(project.projectId, project);
     },
@@ -996,6 +1209,7 @@ export default function App() {
         setRegisterSuccess(`Registered ${describeProject(response.project)}.`);
         setDetailError(null);
         setRefreshError(null);
+        setInitError(null);
         void loadProjectDetail(response.project.projectId, response.project);
       } catch (error) {
         if (!mountedRef.current) {
@@ -1016,6 +1230,57 @@ export default function App() {
     },
     [loadProjectDetail, projects, registerPath],
   );
+
+  const handleInitializeSelected = useCallback(async () => {
+    const selected = selectedProjectRef.current;
+
+    if (!selected || !shouldShowInitAction(selected)) {
+      return;
+    }
+
+    setInitPendingProjectId(selected.projectId);
+    setInitError(null);
+    setDetailError(null);
+
+    try {
+      const response = await requestJson(
+        `/api/projects/${selected.projectId}/init`,
+        {
+          method: 'POST',
+          headers: {
+            accept: 'application/json',
+          },
+        },
+        parseProjectMutationResponse,
+        'Project initialization',
+      );
+
+      if (!mountedRef.current) {
+        return;
+      }
+
+      setProjects((current) => upsertProject(current, response.project));
+
+      if (selectedProjectIdRef.current === response.project.projectId) {
+        setSelectedProject(response.project);
+      }
+    } catch (error) {
+      if (!mountedRef.current) {
+        return;
+      }
+
+      setInitError(
+        formatRequestError(
+          error,
+          'Project initialization timed out. The current project detail stayed visible, and you can retry when the request resolves.',
+        ),
+      );
+    } finally {
+      if (mountedRef.current) {
+        setInitPendingProjectId((current) => (current === selected.projectId ? null : current));
+      }
+    }
+  }, []);
 
   const handleRefreshSelected = useCallback(async () => {
     if (!selectedProjectIdRef.current) {
@@ -1045,6 +1310,7 @@ export default function App() {
       setProjects((current) => upsertProject(current, response.project));
       setSelectedProject(response.project);
       setDetailError(null);
+      setInitError(null);
     } catch (error) {
       if (!mountedRef.current) {
         return;
@@ -1064,6 +1330,19 @@ export default function App() {
   }, []);
 
   const totalProjectsLabel = pluralize(projects.length, 'project');
+  const selectedInitJob = selectedProject?.latestInitJob ?? null;
+  const selectedInitRequestPending =
+    selectedProject !== null && initPendingProjectId === selectedProject.projectId;
+  const selectedInitSyncingDetail =
+    selectedProject !== null && initDetailSyncProjectId === selectedProject.projectId;
+  const selectedInitActionVisible = shouldShowInitAction(selectedProject);
+  const selectedInitActionDisabled =
+    selectedProject === null
+      ? true
+      : selectedInitRequestPending ||
+        selectedInitSyncingDetail ||
+        hasActiveInitJob(selectedInitJob);
+  const selectedInitSummary = summarizeInitJob(selectedInitJob);
 
   return (
     <main className="app-shell">
@@ -1205,6 +1484,8 @@ export default function App() {
               {projects.map((project) => {
                 const label = describeProject(project);
                 const warningCount = project.snapshot.warnings.length;
+                const initJob = project.latestInitJob;
+                const initSummary = summarizeInitJob(initJob);
 
                 return (
                   <li key={project.projectId}>
@@ -1227,6 +1508,14 @@ export default function App() {
                         </span>
                         <span>{pluralize(warningCount, 'warning')}</span>
                       </div>
+                      {initJob ? (
+                        <div className="project-card__job" data-testid={`project-init-stage-${project.projectId}`}>
+                          <span className="status-pill status-pill--job" data-status={initJob.stage}>
+                            {INIT_STAGE_LABELS[initJob.stage]}
+                          </span>
+                          <span>{initSummary}</span>
+                        </div>
+                      ) : null}
                       <time dateTime={project.snapshot.checkedAt}>{formatTimestamp(project.snapshot.checkedAt)}</time>
                     </button>
                   </li>
@@ -1276,6 +1565,11 @@ export default function App() {
           {refreshError ? (
             <p className="inline-alert inline-alert--error" role="alert" data-testid="refresh-error">
               {refreshError}
+            </p>
+          ) : null}
+          {initError ? (
+            <p className="inline-alert inline-alert--error" role="alert" data-testid="init-error">
+              {initError}
             </p>
           ) : null}
 
@@ -1331,6 +1625,123 @@ export default function App() {
                   <dd>{selectedProject.snapshot.identityHints.repoFingerprint ?? 'Not available yet.'}</dd>
                 </div>
               </dl>
+
+              <section className="subpanel init-panel" data-testid="init-panel">
+                <div className="subpanel__header subpanel__header--actions">
+                  <div>
+                    <h4>Initialization</h4>
+                    <p>Explicitly run the supported `/gsd init` flow without leaving this project detail.</p>
+                  </div>
+                  {selectedInitActionVisible ? (
+                    <button
+                      type="button"
+                      className="primary-button"
+                      data-testid="init-action"
+                      onClick={() => {
+                        void handleInitializeSelected();
+                      }}
+                      disabled={selectedInitActionDisabled}
+                    >
+                      {initButtonLabel(selectedProject, {
+                        requestPending: selectedInitRequestPending,
+                        syncingDetail: selectedInitSyncingDetail,
+                      })}
+                    </button>
+                  ) : selectedInitJob ? (
+                    <span className="status-pill status-pill--job" data-status={selectedInitJob.stage}>
+                      {INIT_STAGE_LABELS[selectedInitJob.stage]}
+                    </span>
+                  ) : null}
+                </div>
+
+                {selectedInitJob ? (
+                  <div
+                    className="init-banner"
+                    data-stage={selectedInitJob.stage}
+                    data-testid="init-stage-banner"
+                  >
+                    <div className="init-banner__meta">
+                      <span className="status-pill status-pill--job" data-status={selectedInitJob.stage}>
+                        {INIT_STAGE_LABELS[selectedInitJob.stage]}
+                      </span>
+                      <span className="meta-badge">
+                        Updated {formatTimestamp(selectedInitJob.updatedAt)}
+                      </span>
+                      {selectedInitSyncingDetail ? (
+                        <span className="meta-badge" data-testid="init-refresh-syncing">
+                          Refreshing monitored detail…
+                        </span>
+                      ) : null}
+                    </div>
+
+                    <p className="init-banner__copy" data-testid="init-stage-detail">
+                      {selectedInitSummary}
+                    </p>
+
+                    {hasActiveInitJob(selectedInitJob) && streamStatus !== 'connected' ? (
+                      <p className="init-banner__stream-note" data-testid="init-stream-note">
+                        Live init updates are {STREAM_STATUS_LABELS[streamStatus].toLowerCase()}. Reload detail to
+                        inspect persisted job truth while the stream recovers.
+                      </p>
+                    ) : null}
+
+                    {selectedInitJob.lastErrorDetail ? (
+                      <p className="inline-alert inline-alert--error" data-testid="init-failure-detail">
+                        {selectedInitJob.lastErrorDetail}
+                      </p>
+                    ) : null}
+
+                    {selectedInitJob.refreshResult ? (
+                      <dl className="detail-facts detail-facts--compact" data-testid="init-refresh-result">
+                        <div>
+                          <dt>Refresh result</dt>
+                          <dd>{selectedInitJob.refreshResult.detail}</dd>
+                        </div>
+                        <div>
+                          <dt>Snapshot status</dt>
+                          <dd>{selectedInitJob.refreshResult.snapshotStatus ?? 'Unavailable'}</dd>
+                        </div>
+                        <div>
+                          <dt>Warnings after refresh</dt>
+                          <dd>
+                            {selectedInitJob.refreshResult.warningCount === null
+                              ? 'Unavailable'
+                              : pluralize(selectedInitJob.refreshResult.warningCount, 'warning')}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Refresh event</dt>
+                          <dd>{selectedInitJob.refreshResult.eventId ?? 'Unavailable'}</dd>
+                        </div>
+                      </dl>
+                    ) : null}
+
+                    {selectedInitJob.outputExcerpt ? (
+                      <pre className="init-output" data-testid="init-output-excerpt">
+                        {selectedInitJob.outputExcerpt}
+                      </pre>
+                    ) : null}
+
+                    <ol className="init-history" data-testid="init-history">
+                      {selectedInitJob.history.map((entry) => (
+                        <li key={entry.id}>
+                          <div className="init-history__header">
+                            <span className="status-pill status-pill--job" data-status={entry.stage}>
+                              {INIT_STAGE_LABELS[entry.stage]}
+                            </span>
+                            <time dateTime={entry.emittedAt}>{formatTimestamp(entry.emittedAt)}</time>
+                          </div>
+                          <p>{entry.detail}</p>
+                        </li>
+                      ))}
+                    </ol>
+                  </div>
+                ) : (
+                  <p data-testid="init-empty-state">
+                    This project will stay uninitialized until you explicitly start the supported bootstrap flow.
+                  </p>
+                )}
+              </section>
 
               <section className="subpanel" data-testid="detail-directory">
                 <h4>Directory summary</h4>

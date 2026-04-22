@@ -43,6 +43,11 @@ button {
   cursor: pointer;
 }
 
+pre {
+  margin: 0;
+  font: inherit;
+}
+
 .app-shell {
   min-height: 100vh;
   padding: 2rem;
@@ -167,7 +172,10 @@ button {
 .panel-header__actions,
 .detail-header,
 .project-card__meta,
-.detail-header__meta {
+.detail-header__meta,
+.subpanel__header--actions,
+.init-banner__meta,
+.init-history__header {
   display: flex;
   gap: 0.75rem;
   align-items: center;
@@ -228,7 +236,8 @@ button {
 
 .project-list,
 .warning-list,
-.tag-list {
+.tag-list,
+.init-history {
   margin: 0;
   padding: 0;
   list-style: none;
@@ -254,6 +263,13 @@ button {
 .project-card[aria-pressed='true'] {
   border-color: rgba(96, 165, 250, 0.78);
   box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.22);
+}
+
+.project-card__job {
+  display: grid;
+  gap: 0.45rem;
+  color: #cbd5e1;
+  font-size: 0.94rem;
 }
 
 .project-card__eyebrow {
@@ -322,7 +338,8 @@ button {
 
 .status-pill[data-status='initialized'],
 .status-pill[data-status='ok'],
-.status-pill[data-status='connected'] {
+.status-pill[data-status='connected'],
+.status-pill[data-status='succeeded'] {
   background: rgba(16, 185, 129, 0.18);
   color: #a7f3d0;
 }
@@ -330,14 +347,21 @@ button {
 .status-pill[data-status='uninitialized'],
 .status-pill[data-status='neutral'],
 .status-pill[data-status='connecting'],
-.status-pill[data-status='stale'] {
+.status-pill[data-status='stale'],
+.status-pill[data-status='queued'],
+.status-pill[data-status='starting'],
+.status-pill[data-status='initializing'],
+.status-pill[data-status='refreshing'] {
   background: rgba(250, 204, 21, 0.16);
   color: #fde68a;
 }
 
 .status-pill[data-status='degraded'],
 .status-pill[data-status='warning'],
-.status-pill[data-status='disconnected'] {
+.status-pill[data-status='disconnected'],
+.status-pill[data-status='failed'],
+.status-pill[data-status='timed_out'],
+.status-pill[data-status='cancelled'] {
   background: rgba(248, 113, 113, 0.18);
   color: #fecaca;
 }
@@ -381,6 +405,75 @@ button {
   display: grid;
   gap: 0.85rem;
   padding: 1rem;
+}
+
+.init-panel {
+  gap: 1rem;
+}
+
+.init-banner {
+  display: grid;
+  gap: 0.85rem;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 1rem;
+  padding: 1rem;
+  background: rgba(15, 23, 42, 0.56);
+}
+
+.init-banner[data-stage='succeeded'] {
+  border-color: rgba(16, 185, 129, 0.28);
+}
+
+.init-banner[data-stage='queued'],
+.init-banner[data-stage='starting'],
+.init-banner[data-stage='initializing'],
+.init-banner[data-stage='refreshing'] {
+  border-color: rgba(250, 204, 21, 0.3);
+}
+
+.init-banner[data-stage='failed'],
+.init-banner[data-stage='timed_out'],
+.init-banner[data-stage='cancelled'] {
+  border-color: rgba(248, 113, 113, 0.32);
+}
+
+.init-banner__copy,
+.init-banner__stream-note,
+.init-history p {
+  margin: 0;
+  color: #e2e8f0;
+}
+
+.init-banner__stream-note {
+  color: #fcd34d;
+}
+
+.init-output {
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 0.9rem;
+  padding: 0.9rem 1rem;
+  background: rgba(2, 6, 23, 0.76);
+  color: #cbd5e1;
+  overflow-x: auto;
+  white-space: pre-wrap;
+}
+
+.init-history {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.init-history li {
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.85rem 0.9rem;
+  border-radius: 0.9rem;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  background: rgba(15, 23, 42, 0.52);
+}
+
+.init-history time {
+  color: #cbd5e1;
 }
 
 .tag-list {
