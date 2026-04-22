@@ -13,7 +13,8 @@
     "build:server": "tsc --project tsconfig.json",
     "dev": "tsx src/server/index.ts",
     "start": "node dist/server/server/index.js",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@fastify/static": "^8.3.0",
@@ -22,6 +23,7 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.59.1",
     "@types/node": "^24.0.0",
     "@types/react": "^19.1.2",
     "@types/react-dom": "^19.1.2",

@@ -194,7 +194,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   );
   await mkdir(path.dirname(databasePath), { recursive: true });
 
-  const app = Fastify({ logger: options.logger ?? true });
+  const app = Fastify({
+    logger: options.logger ?? true,
+    forceCloseConnections: true,
+  });
   let registry: RegistryDatabase | undefined;
   let eventHub: EventHub | undefined;
 
