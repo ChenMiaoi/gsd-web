@@ -7,8 +7,12 @@ import { fileURLToPath } from 'node:url';
 
 import { SERVICE_NAME, type HealthResponse, type ProjectEventEnvelope } from '../shared/contracts.js';
 import { REGISTRY_SCHEMA_VERSION, RegistryDatabase } from './db.js';
-import { DEFAULT_MONITOR_INTERVAL_MS, ProjectMonitorManager } from './monitor.js';
-import { ProjectReconciler } from './project-reconcile.js';
+import {
+  DEFAULT_MONITOR_INTERVAL_MS,
+  ProjectMonitorManager,
+  type ProjectMonitorSignal,
+} from './monitor.js';
+import { ProjectReconciler, type ProjectReconcileSignal } from './project-reconcile.js';
 import { EventHub, registerEventsRoute } from './routes/events.js';
 import { registerProjectRoutes, type ProjectInitRunner } from './routes/projects.js';
 
@@ -36,6 +40,8 @@ export type RuntimeSignal =
       initJobId?: string;
       refreshStatus?: string;
     }
+  | ProjectMonitorSignal
+  | ProjectReconcileSignal
   | {
       event: 'service_start';
       address: string;
@@ -50,6 +56,7 @@ export interface CreateAppOptions {
   logSink?: (signal: RuntimeSignal) => void;
   snapshotTimeoutMs?: number;
   monitorIntervalMs?: number;
+  watchersEnabled?: boolean;
   initRunner?: ProjectInitRunner;
 }
 
@@ -240,10 +247,13 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     const reconciler = new ProjectReconciler(registryInstance, eventHubInstance, {
       ...(options.snapshotTimeoutMs === undefined ? {} : { snapshotTimeoutMs: options.snapshotTimeoutMs }),
       log: app.log,
+      ...(options.logSink === undefined ? {} : { signalSink: options.logSink }),
     });
-    const monitorManagerInstance = new ProjectMonitorManager(registryInstance, reconciler, {
+    const monitorManagerInstance = new ProjectMonitorManager(registryInstance, reconciler, eventHubInstance, {
       intervalMs: options.monitorIntervalMs ?? DEFAULT_MONITOR_INTERVAL_MS,
+      ...(options.watchersEnabled === undefined ? {} : { watchersEnabled: options.watchersEnabled }),
       log: app.log,
+      ...(options.logSink === undefined ? {} : { signalSink: options.logSink }),
     });
     registry = registryInstance;
     eventHub = eventHubInstance;
@@ -262,6 +272,16 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
 
     eventHubInstance.subscribe((event) => {
       emitProjectEvent(app, options.logSink, event);
+    });
+    eventHubInstance.subscribe((event) => {
+      if (
+        event.projectId
+        && (event.type === 'project.registered'
+          || event.type === 'project.refreshed'
+          || event.type === 'project.monitor.updated')
+      ) {
+        void monitorManagerInstance.syncProject(event.projectId);
+      }
     });
 
     app.addHook('onClose', async () => {

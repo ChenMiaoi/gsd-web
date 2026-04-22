@@ -17,14 +17,14 @@ function serializeSseEvent(event: ProjectEventEnvelope) {
 }
 
 function parseEventId(candidate: string | undefined) {
-  if (!candidate) {
+  if (!candidate || candidate.trim().length === 0) {
     return 0;
   }
 
   const match = /^evt_(\d+)$/u.exec(candidate.trim());
   const sequence = match?.[1];
 
-  return sequence ? Number.parseInt(sequence, 10) : 0;
+  return sequence ? Number.parseInt(sequence, 10) : null;
 }
 
 export class EventHub {
@@ -46,8 +46,8 @@ export class EventHub {
     }
   }
 
-  listEventsAfter(eventId: string | undefined) {
-    return this.registry.listEventsAfter(parseEventId(eventId));
+  listEventsAfter(sequence: number) {
+    return this.registry.listEventsAfter(sequence);
   }
 
   close() {
@@ -70,6 +70,17 @@ export async function registerEventsRoute(
           ? request.headers['last-event-id']
           : undefined;
 
+    const parsedLastEventSequence = parseEventId(requestedLastEventId);
+
+    if (parsedLastEventSequence === null) {
+      return reply.code(400).send({
+        error: 'Bad Request',
+        message: 'lastEventId must use the evt_<number> format.',
+        statusCode: 400,
+        code: 'invalid_last_event_id',
+      });
+    }
+
     reply.hijack();
     reply.raw.writeHead(200, {
       'cache-control': 'no-cache, no-transform',
@@ -79,7 +90,7 @@ export async function registerEventsRoute(
     });
     reply.raw.flushHeaders?.();
 
-    for (const event of options.eventHub.listEventsAfter(requestedLastEventId)) {
+    for (const event of options.eventHub.listEventsAfter(parsedLastEventSequence)) {
       reply.raw.write(serializeSseEvent(event));
     }
 

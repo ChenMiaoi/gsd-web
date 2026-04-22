@@ -42,7 +42,7 @@ function getBaseUrl(app: FastifyInstance) {
   return `http://127.0.0.1:${address.port}`;
 }
 
-async function bootService(options: { monitorIntervalMs?: number } = {}) {
+async function bootService(options: { monitorIntervalMs?: number; watchersEnabled?: boolean } = {}) {
   const workspace = await createTempWorkspace('gsd-web-monitor-reconcile-');
   const clientDistDir = await writeClientShell(workspace.root, 'GSD Web Monitor Reconcile Test Shell');
   const databasePath = path.join(workspace.root, 'data', 'gsd-web.sqlite');
@@ -53,6 +53,7 @@ async function bootService(options: { monitorIntervalMs?: number } = {}) {
     clientDistDir,
     logger: false,
     ...(options.monitorIntervalMs === undefined ? {} : { monitorIntervalMs: options.monitorIntervalMs }),
+    ...(options.watchersEnabled === undefined ? {} : { watchersEnabled: options.watchersEnabled }),
   });
 
   cleanupTasks.push(async () => {
@@ -232,7 +233,7 @@ function lockDatabase(dbPath: string) {
 
 describe('project monitor reconcile loop', () => {
   test('shares manual and periodic reconcile truth, persists timeline, and preserves the last good snapshot on read failure', async () => {
-    const service = await bootService({ monitorIntervalMs: 50 });
+    const service = await bootService({ monitorIntervalMs: 50, watchersEnabled: false });
     const events = await openEventStream(`${service.baseUrl}/api/events`);
     const readyEvent = await events.next();
 

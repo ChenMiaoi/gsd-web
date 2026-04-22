@@ -27,6 +27,28 @@ import {
 } from './snapshots.js';
 import type { EventHub } from './routes/events.js';
 
+export const WATCHER_MONITOR_ERROR_PREFIX = '[watcher] ';
+
+export interface ReconcileHint {
+  source: 'watcher';
+  event: 'add' | 'addDir' | 'change' | 'unlink' | 'unlinkDir';
+  relativePath: string;
+}
+
+export interface ProjectReconcileSignal {
+  event: 'project_reconcile';
+  phase: 'started' | 'queued' | 'completed';
+  projectId: string;
+  trigger: ProjectReconcileTrigger;
+  activeTrigger?: ProjectReconcileTrigger | null;
+  queuedTrigger?: ProjectReconcileTrigger | null;
+  reason?: string | null;
+  status?: 'success' | 'failed';
+  changed?: boolean;
+  healthChanged?: boolean;
+  emittedEventType?: string | null;
+}
+
 export interface ProjectRegistrationState {
   monitor: ProjectMonitorSummary;
   eventPayload: ProjectSnapshotEventPayload;
@@ -36,6 +58,7 @@ export interface ProjectRegistrationState {
 export interface ReconcileProjectOptions {
   trigger: ProjectReconcileTrigger;
   emitRefreshEventOnNoChange?: boolean;
+  hint?: ReconcileHint;
 }
 
 export interface SuccessfulReconcileResult {
@@ -55,6 +78,22 @@ export interface FailedReconcileResult {
 }
 
 export type ReconcileProjectResult = SuccessfulReconcileResult | FailedReconcileResult;
+
+interface ReconcileWaiter {
+  resolve: (result: ReconcileProjectResult) => void;
+  reject: (error: unknown) => void;
+}
+
+interface ProjectReconcileQueueState {
+  active: {
+    options: ReconcileProjectOptions;
+    promise: Promise<ReconcileProjectResult>;
+  } | null;
+  queued: {
+    options: ReconcileProjectOptions;
+    waiters: ReconcileWaiter[];
+  } | null;
+}
 
 function normalizeSnapshot(snapshot: ProjectSnapshot) {
   const { checkedAt: _checkedAt, ...rest } = snapshot;
@@ -77,16 +116,70 @@ function summarizeWarningCount(snapshot: ProjectSnapshot) {
   return snapshot.warnings.length;
 }
 
+function triggerPriority(trigger: ProjectReconcileTrigger) {
+  switch (trigger) {
+    case 'init_refresh':
+      return 5;
+    case 'manual_refresh':
+      return 4;
+    case 'watcher':
+      return 3;
+    case 'monitor_boot':
+      return 2;
+    case 'monitor_interval':
+      return 1;
+    case 'register':
+      return 0;
+    default:
+      return 0;
+  }
+}
+
+function describeReconcileReason(options: ReconcileProjectOptions) {
+  if (options.hint?.source === 'watcher') {
+    return `${options.hint.event}:${options.hint.relativePath}`;
+  }
+
+  return null;
+}
+
+function mergeQueuedOptions(
+  current: ReconcileProjectOptions,
+  next: ReconcileProjectOptions,
+): ReconcileProjectOptions {
+  const preferred =
+    triggerPriority(next.trigger) >= triggerPriority(current.trigger)
+      ? next
+      : current;
+
+  return {
+    trigger: preferred.trigger,
+    emitRefreshEventOnNoChange:
+      Boolean(current.emitRefreshEventOnNoChange) || Boolean(next.emitRefreshEventOnNoChange),
+    ...(preferred.hint ?? current.hint ?? next.hint ? { hint: preferred.hint ?? next.hint ?? current.hint } : {}),
+  };
+}
+
+function isWatcherMonitorError(error: ProjectMonitorError | null | undefined) {
+  return error?.message.startsWith(WATCHER_MONITOR_ERROR_PREFIX) ?? false;
+}
+
 function buildSuccessfulMonitorSummary(
   snapshot: ProjectSnapshot,
   trigger: ProjectReconcileTrigger,
+  previousMonitor: ProjectMonitorSummary,
 ): ProjectMonitorSummary {
+  const carriedWatcherError =
+    trigger === 'watcher' || !isWatcherMonitorError(previousMonitor.lastError)
+      ? null
+      : previousMonitor.lastError;
+
   return {
     health: deriveMonitorHealthFromSnapshot(snapshot.status),
     lastAttemptedAt: snapshot.checkedAt,
     lastSuccessfulAt: snapshot.checkedAt,
     lastTrigger: trigger,
-    lastError: null,
+    lastError: carriedWatcherError,
   };
 }
 
@@ -257,12 +350,30 @@ function buildFailureTimelineEntry(options: {
   };
 }
 
+export function createWatcherMonitorError(message: string, attemptedAt: string): ProjectMonitorError {
+  const normalized = message.startsWith(WATCHER_MONITOR_ERROR_PREFIX)
+    ? message
+    : `${WATCHER_MONITOR_ERROR_PREFIX}${message}`;
+
+  return {
+    scope: 'projectRoot',
+    message: normalized,
+    at: attemptedAt,
+  };
+}
+
 export function buildProjectRegistrationState(
   projectId: string,
   canonicalPath: string,
   snapshot: ProjectSnapshot,
 ): ProjectRegistrationState {
-  const monitor = buildSuccessfulMonitorSummary(snapshot, 'register');
+  const monitor = buildSuccessfulMonitorSummary(snapshot, 'register', {
+    health: 'stale',
+    lastAttemptedAt: null,
+    lastSuccessfulAt: null,
+    lastTrigger: null,
+    lastError: null,
+  });
 
   return {
     monitor,
@@ -272,7 +383,7 @@ export function buildProjectRegistrationState(
 }
 
 export class ProjectReconciler {
-  private readonly inFlight = new Map<string, Promise<ReconcileProjectResult>>();
+  private readonly queues = new Map<string, ProjectReconcileQueueState>();
 
   constructor(
     private readonly registry: RegistryDatabase,
@@ -280,23 +391,175 @@ export class ProjectReconciler {
     private readonly options: {
       snapshotTimeoutMs?: number;
       log?: Pick<FastifyBaseLogger, 'error' | 'warn' | 'info'>;
+      signalSink?: (signal: ProjectReconcileSignal) => void;
     } = {},
   ) {}
 
   reconcileProject(projectId: string, options: ReconcileProjectOptions): Promise<ReconcileProjectResult> {
-    const existing = this.inFlight.get(projectId);
+    const state = this.getQueueState(projectId);
+
+    if (!state.active) {
+      return this.launchActive(projectId, state, options);
+    }
+
+    return new Promise<ReconcileProjectResult>((resolve, reject) => {
+      const queuedOptions = state.queued ? mergeQueuedOptions(state.queued.options, options) : options;
+      const previousQueuedTrigger = state.queued?.options.trigger ?? null;
+
+      if (state.queued) {
+        state.queued.options = queuedOptions;
+        state.queued.waiters.push({ resolve, reject });
+      } else {
+        state.queued = {
+          options: queuedOptions,
+          waiters: [{ resolve, reject }],
+        };
+      }
+
+      const reason = describeReconcileReason(options);
+
+      this.options.signalSink?.({
+        event: 'project_reconcile',
+        phase: 'queued',
+        projectId,
+        trigger: options.trigger,
+        activeTrigger: state.active?.options.trigger ?? null,
+        queuedTrigger: state.queued.options.trigger,
+        reason,
+      });
+      this.options.log?.info?.(
+        {
+          event: 'project-reconcile-queued',
+          projectId,
+          trigger: options.trigger,
+          activeTrigger: state.active?.options.trigger ?? null,
+          previousQueuedTrigger,
+          queuedTrigger: state.queued.options.trigger,
+          reason,
+        },
+        'Queued project reconcile follow-up',
+      );
+    });
+  }
+
+  private getQueueState(projectId: string): ProjectReconcileQueueState {
+    const existing = this.queues.get(projectId);
 
     if (existing) {
       return existing;
     }
 
-    const promise = this.performReconcile(projectId, options).finally(() => {
-      if (this.inFlight.get(projectId) === promise) {
-        this.inFlight.delete(projectId);
-      }
-    });
+    const created: ProjectReconcileQueueState = {
+      active: null,
+      queued: null,
+    };
 
-    this.inFlight.set(projectId, promise);
+    this.queues.set(projectId, created);
+
+    return created;
+  }
+
+  private launchActive(
+    projectId: string,
+    state: ProjectReconcileQueueState,
+    options: ReconcileProjectOptions,
+  ): Promise<ReconcileProjectResult> {
+    const reason = describeReconcileReason(options);
+
+    this.options.signalSink?.({
+      event: 'project_reconcile',
+      phase: 'started',
+      projectId,
+      trigger: options.trigger,
+      queuedTrigger: state.queued?.options.trigger ?? null,
+      reason,
+    });
+    this.options.log?.info?.(
+      {
+        event: 'project-reconcile-started',
+        projectId,
+        trigger: options.trigger,
+        reason,
+        emitRefreshEventOnNoChange: Boolean(options.emitRefreshEventOnNoChange),
+        queuedTrigger: state.queued?.options.trigger ?? null,
+      },
+      'Started project reconcile',
+    );
+
+    const promise = this.performReconcile(projectId, options);
+    state.active = {
+      options,
+      promise,
+    };
+
+    promise
+      .then((result) => {
+        this.options.signalSink?.({
+          event: 'project_reconcile',
+          phase: 'completed',
+          projectId,
+          trigger: options.trigger,
+          reason,
+          status: result.status,
+          changed: result.status === 'success' ? result.changed : false,
+          healthChanged: result.healthChanged,
+          emittedEventType: result.event?.type ?? null,
+        });
+        this.options.log?.info?.(
+          {
+            event: 'project-reconcile-completed',
+            projectId,
+            trigger: options.trigger,
+            reason,
+            status: result.status,
+            changed: result.status === 'success' ? result.changed : false,
+            healthChanged: result.healthChanged,
+            emittedEventType: result.event?.type ?? null,
+          },
+          'Completed project reconcile',
+        );
+      })
+      .catch((error) => {
+        this.options.log?.error?.(
+          {
+            err: error,
+            event: 'project-reconcile-crashed',
+            projectId,
+            trigger: options.trigger,
+            reason,
+          },
+          'Project reconcile crashed unexpectedly',
+        );
+      })
+      .finally(() => {
+        if (state.active?.promise === promise) {
+          state.active = null;
+        }
+
+        const queued = state.queued;
+
+        if (queued) {
+          state.queued = null;
+          const queuedPromise = this.launchActive(projectId, state, queued.options);
+          queuedPromise.then(
+            (result) => {
+              for (const waiter of queued.waiters) {
+                waiter.resolve(result);
+              }
+            },
+            (error) => {
+              for (const waiter of queued.waiters) {
+                waiter.reject(error);
+              }
+            },
+          );
+          return;
+        }
+
+        if (!state.active && !state.queued) {
+          this.queues.delete(projectId);
+        }
+      });
 
     return promise;
   }
@@ -316,13 +579,13 @@ export class ProjectReconciler {
         () => buildProjectSnapshot(project.canonicalPath),
         this.options.snapshotTimeoutMs ?? DEFAULT_SNAPSHOT_TIMEOUT_MS,
       );
-      const monitor = buildSuccessfulMonitorSummary(snapshot, options.trigger);
+      const monitor = buildSuccessfulMonitorSummary(snapshot, options.trigger, project.monitor);
       const changed = isChangedSnapshot(project.snapshot, snapshot);
       const healthChanged = monitor.health !== project.monitor.health;
       const timelineEntry = buildSuccessTimelineEntry({
         previousHealth: project.monitor.health,
         trigger: options.trigger,
-        snapshot,
+        snapshot: snapshot,
         monitor,
         changed,
       });

@@ -211,6 +211,51 @@ export async function createInitializedProject(
   return projectRoot;
 }
 
+export async function writeProjectFile(
+  projectRoot: string,
+  relativePath: string,
+  content: string | Uint8Array,
+) {
+  const filePath = path.join(projectRoot, relativePath);
+
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, content);
+
+  return filePath;
+}
+
+export async function writeRepoMeta(
+  projectRoot: string,
+  value: Record<string, unknown> | string | Uint8Array,
+) {
+  return writeProjectFile(
+    projectRoot,
+    '.gsd/repo-meta.json',
+    typeof value === 'string' || value instanceof Uint8Array ? value : toJsonString(value),
+  );
+}
+
+export async function applyProjectMutationsBurst(
+  projectRoot: string,
+  mutations: Array<{
+    relativePath: string;
+    content: string | Uint8Array;
+  }>,
+  options: {
+    delayMs?: number;
+  } = {},
+) {
+  const delayMs = options.delayMs ?? 0;
+
+  for (const mutation of mutations) {
+    await writeProjectFile(projectRoot, mutation.relativePath, mutation.content);
+
+    if (delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 export async function createUnreadableProject(workspaceRoot: string, projectName: string) {
   const projectRoot = path.join(workspaceRoot, projectName);
 
