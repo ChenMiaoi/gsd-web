@@ -242,6 +242,13 @@ test.describe('hosted dashboard inventory flow', () => {
     degradedProject.lastEventId = 'evt_999';
     degradedProject.snapshot.status = 'degraded';
     degradedProject.snapshot.checkedAt = degradedCheckedAt;
+    degradedProject.monitor = {
+      health: 'degraded',
+      lastAttemptedAt: degradedCheckedAt,
+      lastSuccessfulAt: degradedCheckedAt,
+      lastTrigger: 'manual_refresh',
+      lastError: null,
+    };
     degradedProject.snapshot.warnings = [
       {
         source: 'stateMd',

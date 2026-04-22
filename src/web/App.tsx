@@ -6,10 +6,12 @@ import {
   PROJECT_MONITOR_HEALTHS,
   PROJECT_RECONCILE_TRIGGERS,
   PROJECT_SNAPSHOT_STATUSES,
+  PROJECT_TIMELINE_ENTRY_TYPES,
   SNAPSHOT_SOURCE_NAMES,
   SNAPSHOT_SOURCE_STATES,
   isProjectInitJobTerminalStage,
   type DirectorySummary,
+  type ProjectDetailResponse,
   type ProjectInitEventPayload,
   type ProjectInitJob,
   type ProjectInitJobHistoryEntry,
@@ -25,14 +27,18 @@ import {
   type ProjectSnapshot,
   type ProjectSnapshotEventPayload,
   type ProjectSnapshotStatus,
-  type ProjectsResponse,
   type ProjectReconcileTrigger,
+  type ProjectsResponse,
+  type ProjectTimelineEntry,
+  type ProjectTimelineEntryType,
+  type ProjectTimelineResponse,
   type SnapshotSourceName,
   type SnapshotSourceState,
   type SnapshotWarning,
 } from '../shared/contracts.js';
 
-type StreamStatus = 'connecting' | 'connected' | 'stale' | 'disconnected';
+type StreamStatus = 'connecting' | 'connected' | 'disconnected';
+type StreamResyncStatus = 'idle' | 'syncing' | 'failed';
 type KnownEventType =
   | 'service.ready'
   | 'project.registered'
@@ -70,7 +76,6 @@ const INIT_STAGE_LABELS: Record<ProjectInitJobStage, string> = {
   timed_out: 'Timed out',
   cancelled: 'Cancelled',
 };
-const STREAM_STALE_MS = 30_000;
 const WARNING_TEXT_LIMIT = 240;
 const KNOWN_EVENT_TYPES: ReadonlySet<KnownEventType> = new Set([
   'service.ready',
@@ -97,18 +102,39 @@ const STATUS_LABELS: Record<ProjectSnapshotStatus, string> = {
   degraded: 'Degraded',
 };
 
+const MONITOR_HEALTH_LABELS: Record<ProjectMonitorHealth, string> = {
+  healthy: 'Healthy',
+  degraded: 'Degraded',
+  read_failed: 'Read failed',
+  stale: 'Stale',
+};
+
+const TIMELINE_TYPE_LABELS: Record<ProjectTimelineEntryType, string> = {
+  registered: 'Registered',
+  refreshed: 'Refreshed',
+  monitor_degraded: 'Degraded',
+  monitor_recovered: 'Recovered',
+};
+
+const RECONCILE_TRIGGER_LABELS: Record<ProjectReconcileTrigger, string> = {
+  register: 'Register',
+  manual_refresh: 'Manual refresh',
+  init_refresh: 'Init refresh',
+  monitor_boot: 'Monitor boot',
+  monitor_interval: 'Monitor interval',
+  watcher: 'Watcher',
+};
+
 const STREAM_STATUS_LABELS: Record<StreamStatus, string> = {
   connecting: 'Connecting',
   connected: 'Connected',
-  stale: 'Stale',
   disconnected: 'Disconnected',
 };
 
 const STREAM_STATUS_MESSAGES: Record<StreamStatus, string> = {
-  connecting: 'Opening the live snapshot stream…',
-  connected: 'Live snapshot events are flowing from /api/events.',
-  stale: 'No recent snapshot events arrived. Manual refresh still works.',
-  disconnected: 'Live events dropped. Use manual refresh while EventSource reconnects.',
+  connecting: 'Opening the live stream and waiting for the first server event.',
+  connected: 'Live events are connected. Snapshot truth still comes from project JSON and monitor metadata.',
+  disconnected: 'Live events dropped. The dashboard keeps the last good state and will resync JSON after reconnect.',
 };
 
 class HttpError extends Error {
@@ -530,6 +556,90 @@ function parseProjectMonitorSummary(value: unknown, label: string): ProjectMonit
   };
 }
 
+function parseProjectTimelineEntryType(value: unknown, label: string): ProjectTimelineEntryType {
+  const candidate = expectString(value, label);
+
+  if (!PROJECT_TIMELINE_ENTRY_TYPES.includes(candidate as ProjectTimelineEntryType)) {
+    throw new ResponseShapeError(
+      `${label} must be one of ${PROJECT_TIMELINE_ENTRY_TYPES.join(', ')}.`,
+    );
+  }
+
+  return candidate as ProjectTimelineEntryType;
+}
+
+function parseProjectTimelineEntry(
+  value: unknown,
+  label: string,
+  expectedProjectId?: string,
+): ProjectTimelineEntry {
+  const record = expectRecord(value, label);
+  const projectId = expectString(record.projectId, `${label}.projectId`);
+
+  if (expectedProjectId && projectId !== expectedProjectId) {
+    throw new ResponseShapeError(`${label}.projectId must match ${expectedProjectId}.`);
+  }
+
+  return {
+    id: expectString(record.id, `${label}.id`),
+    sequence: expectNumber(record.sequence, `${label}.sequence`),
+    type: parseProjectTimelineEntryType(record.type, `${label}.type`),
+    projectId,
+    emittedAt: expectString(record.emittedAt, `${label}.emittedAt`),
+    trigger: parseProjectReconcileTrigger(record.trigger, `${label}.trigger`),
+    snapshotStatus: parseSnapshotStatus(record.snapshotStatus, `${label}.snapshotStatus`),
+    monitorHealth: parseProjectMonitorHealth(record.monitorHealth, `${label}.monitorHealth`),
+    warningCount: expectNumber(record.warningCount, `${label}.warningCount`),
+    changed: expectBoolean(record.changed, `${label}.changed`),
+    detail: expectString(record.detail, `${label}.detail`),
+    eventId:
+      record.eventId === null || record.eventId === undefined
+        ? null
+        : expectString(record.eventId, `${label}.eventId`),
+    error:
+      record.error === null || record.error === undefined
+        ? null
+        : parseProjectMonitorError(record.error, `${label}.error`),
+  };
+}
+
+function parseProjectTimelineResponse(value: unknown, expectedProjectId?: string): ProjectTimelineResponse {
+  const record = expectRecord(value, 'project timeline response');
+  const items = Array.isArray(record.items)
+    ? record.items.map((entry, index) =>
+        parseProjectTimelineEntry(
+          entry,
+          `project timeline response.items[${index}]`,
+          expectedProjectId,
+        ),
+      )
+    : (() => {
+        throw new ResponseShapeError('project timeline response.items must be an array.');
+      })();
+
+  return {
+    items,
+    total: expectNumber(record.total, 'project timeline response.total'),
+  };
+}
+
+function parseProjectDetailResponse(value: unknown): ProjectDetailResponse {
+  const project = parseProjectRecord(value, 'project detail');
+  const record = expectRecord(value, 'project detail');
+  const timeline = Array.isArray(record.timeline)
+    ? record.timeline.map((entry, index) =>
+        parseProjectTimelineEntry(entry, `project detail.timeline[${index}]`, project.projectId),
+      )
+    : (() => {
+        throw new ResponseShapeError('project detail.timeline must be an array.');
+      })();
+
+  return {
+    ...project,
+    timeline,
+  };
+}
+
 function assertUiSafeInitJob(
   job: ProjectInitJob,
   snapshotStatus: ProjectSnapshotStatus,
@@ -857,6 +967,47 @@ function sourceTone(state: SnapshotSourceState) {
   return 'warning';
 }
 
+function formatProjectReconcileTrigger(trigger: ProjectReconcileTrigger | null) {
+  if (!trigger) {
+    return 'Not recorded yet.';
+  }
+
+  return RECONCILE_TRIGGER_LABELS[trigger];
+}
+
+function describeMonitorState(monitor: ProjectMonitorSummary, snapshotStatus: ProjectSnapshotStatus) {
+  switch (monitor.health) {
+    case 'healthy':
+      return `The monitor last confirmed a ${snapshotStatus} snapshot via ${formatProjectReconcileTrigger(
+        monitor.lastTrigger,
+      )}.`;
+    case 'degraded':
+      return `The monitor is seeing a degraded snapshot. Snapshot warnings remain inspectable below.`;
+    case 'read_failed':
+      return 'The latest monitor attempt could not read current project truth, so the last good snapshot remains visible.';
+    case 'stale':
+      return 'The monitor has not yet recorded a successful reconcile for this project.';
+    default:
+      return 'Monitor status is unavailable.';
+  }
+}
+
+function describeTimelineCount(total: number) {
+  return pluralize(total, 'entry', 'entries');
+}
+
+function timelineTone(type: ProjectTimelineEntryType) {
+  if (type === 'monitor_recovered') {
+    return 'ok';
+  }
+
+  if (type === 'monitor_degraded') {
+    return 'warning';
+  }
+
+  return 'neutral';
+}
+
 function upsertProject(projects: ProjectRecord[], nextProject: ProjectRecord) {
   const existingIndex = projects.findIndex((project) => project.projectId === nextProject.projectId);
 
@@ -931,10 +1082,16 @@ export default function App() {
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [selectedProject, setSelectedProject] = useState<ProjectRecord | null>(null);
+  const [projectTimeline, setProjectTimeline] = useState<ProjectTimelineResponse>({
+    items: [],
+    total: 0,
+  });
   const [inventoryLoading, setInventoryLoading] = useState(true);
   const [inventoryError, setInventoryError] = useState<string | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [timelineLoading, setTimelineLoading] = useState(false);
+  const [timelineError, setTimelineError] = useState<string | null>(null);
   const [registerPath, setRegisterPath] = useState('');
   const [registerPending, setRegisterPending] = useState(false);
   const [registerError, setRegisterError] = useState<string | null>(null);
@@ -946,23 +1103,23 @@ export default function App() {
   const [initDetailSyncProjectId, setInitDetailSyncProjectId] = useState<string | null>(null);
   const [streamStatus, setStreamStatus] = useState<StreamStatus>('connecting');
   const [streamSummary, setStreamSummary] = useState<StreamSummary | null>(null);
+  const [streamResyncStatus, setStreamResyncStatus] = useState<StreamResyncStatus>('idle');
+  const [streamResyncMessage, setStreamResyncMessage] = useState<string | null>(null);
 
   const mountedRef = useRef(true);
   const selectedProjectIdRef = useRef<string | null>(null);
   const selectedProjectRef = useRef<ProjectRecord | null>(null);
-  const projectsRef = useRef<ProjectRecord[]>([]);
   const initDetailSyncProjectIdRef = useRef<string | null>(null);
-  const staleTimerRef = useRef<number | null>(null);
+  const inventoryRequestIdRef = useRef(0);
+  const detailRequestIdRef = useRef(0);
+  const timelineRequestIdRef = useRef(0);
+  const shouldResyncOnOpenRef = useRef(false);
 
   useEffect(() => {
     mountedRef.current = true;
 
     return () => {
       mountedRef.current = false;
-
-      if (staleTimerRef.current !== null) {
-        window.clearTimeout(staleTimerRef.current);
-      }
     };
   }, []);
 
@@ -974,33 +1131,10 @@ export default function App() {
     selectedProjectRef.current = selectedProject;
   }, [selectedProject]);
 
-  useEffect(() => {
-    projectsRef.current = projects;
-  }, [projects]);
-
-  const markStreamActive = useCallback((summary?: StreamSummary) => {
-    if (!mountedRef.current) {
-      return;
-    }
-
-    setStreamStatus('connected');
-
-    if (summary) {
-      setStreamSummary(summary);
-    }
-
-    if (staleTimerRef.current !== null) {
-      window.clearTimeout(staleTimerRef.current);
-    }
-
-    staleTimerRef.current = window.setTimeout(() => {
-      if (mountedRef.current) {
-        setStreamStatus((current) => (current === 'connected' ? 'stale' : current));
-      }
-    }, STREAM_STALE_MS);
-  }, []);
-
   const loadProjectDetail = useCallback(async (projectId: string, fallbackProject?: ProjectRecord | null) => {
+    const requestId = detailRequestIdRef.current + 1;
+    detailRequestIdRef.current = requestId;
+
     if (fallbackProject && mountedRef.current) {
       setSelectedProject(fallbackProject);
     }
@@ -1015,20 +1149,39 @@ export default function App() {
             accept: 'application/json',
           },
         },
-        (value) => parseProjectRecord(value, 'project detail'),
+        parseProjectDetailResponse,
         'Project detail',
       );
 
-      if (!mountedRef.current || selectedProjectIdRef.current !== projectId) {
-        return;
+      if (
+        !mountedRef.current
+        || selectedProjectIdRef.current !== projectId
+        || detailRequestIdRef.current !== requestId
+      ) {
+        return true;
       }
 
       setSelectedProject(project);
       setProjects((current) => upsertProject(current, project));
+      setProjectTimeline((current) => {
+        if (current.items.length > 0) {
+          return current;
+        }
+
+        return {
+          items: project.timeline,
+          total: project.timeline.length,
+        };
+      });
       setDetailError(null);
+      return true;
     } catch (error) {
-      if (!mountedRef.current || selectedProjectIdRef.current !== projectId) {
-        return;
+      if (
+        !mountedRef.current
+        || selectedProjectIdRef.current !== projectId
+        || detailRequestIdRef.current !== requestId
+      ) {
+        return true;
       }
 
       setDetailError(
@@ -1037,12 +1190,85 @@ export default function App() {
           'Project detail timed out. The last visible snapshot is still shown while you retry.',
         ),
       );
+      return false;
     } finally {
-      if (mountedRef.current && selectedProjectIdRef.current === projectId) {
+      if (
+        mountedRef.current
+        && selectedProjectIdRef.current === projectId
+        && detailRequestIdRef.current === requestId
+      ) {
         setDetailLoading(false);
       }
     }
   }, []);
+
+  const loadProjectTimeline = useCallback(async (projectId: string) => {
+    const requestId = timelineRequestIdRef.current + 1;
+    timelineRequestIdRef.current = requestId;
+
+    setTimelineLoading(true);
+
+    try {
+      const timeline = await requestJson(
+        `/api/projects/${projectId}/timeline`,
+        {
+          headers: {
+            accept: 'application/json',
+          },
+        },
+        (value) => parseProjectTimelineResponse(value, projectId),
+        'Project timeline',
+      );
+
+      if (
+        !mountedRef.current
+        || selectedProjectIdRef.current !== projectId
+        || timelineRequestIdRef.current !== requestId
+      ) {
+        return true;
+      }
+
+      setProjectTimeline(timeline);
+      setTimelineError(null);
+      return true;
+    } catch (error) {
+      if (
+        !mountedRef.current
+        || selectedProjectIdRef.current !== projectId
+        || timelineRequestIdRef.current !== requestId
+      ) {
+        return true;
+      }
+
+      setTimelineError(
+        formatRequestError(
+          error,
+          'Project timeline timed out. The last visible timeline is still shown while you retry.',
+        ),
+      );
+      return false;
+    } finally {
+      if (
+        mountedRef.current
+        && selectedProjectIdRef.current === projectId
+        && timelineRequestIdRef.current === requestId
+      ) {
+        setTimelineLoading(false);
+      }
+    }
+  }, []);
+
+  const syncSelectedProjectPanels = useCallback(
+    async (projectId: string, fallbackProject?: ProjectRecord | null) => {
+      const [detailOk, timelineOk] = await Promise.all([
+        loadProjectDetail(projectId, fallbackProject),
+        loadProjectTimeline(projectId),
+      ]);
+
+      return detailOk && timelineOk;
+    },
+    [loadProjectDetail, loadProjectTimeline],
+  );
 
   const syncInitDetailAfterSuccess = useCallback(
     async (projectId: string, fallbackProject: ProjectRecord) => {
@@ -1050,7 +1276,7 @@ export default function App() {
       setInitDetailSyncProjectId(projectId);
 
       try {
-        await loadProjectDetail(projectId, fallbackProject);
+        await syncSelectedProjectPanels(projectId, fallbackProject);
       } finally {
         initDetailSyncProjectIdRef.current =
           initDetailSyncProjectIdRef.current === projectId ? null : initDetailSyncProjectIdRef.current;
@@ -1060,7 +1286,7 @@ export default function App() {
         }
       }
     },
-    [loadProjectDetail],
+    [syncSelectedProjectPanels],
   );
 
   const syncInventory = useCallback(
@@ -1070,6 +1296,8 @@ export default function App() {
         preserveSelectedDetail?: boolean;
       } = {},
     ) => {
+      const requestId = inventoryRequestIdRef.current + 1;
+      inventoryRequestIdRef.current = requestId;
       setInventoryLoading(true);
 
       try {
@@ -1084,18 +1312,21 @@ export default function App() {
           'Project inventory',
         );
 
-        if (!mountedRef.current) {
-          return;
+        if (!mountedRef.current || inventoryRequestIdRef.current !== requestId) {
+          return true;
         }
 
         setProjects(response.items);
         setInventoryError(null);
 
         if (response.items.length === 0) {
+          selectedProjectIdRef.current = null;
           setSelectedProjectId(null);
           setSelectedProject(null);
+          setProjectTimeline({ items: [], total: 0 });
           setDetailError(null);
-          return;
+          setTimelineError(null);
+          return true;
         }
 
         const preferredProjectId = selectionHint ?? selectedProjectIdRef.current;
@@ -1103,27 +1334,39 @@ export default function App() {
           response.items.find((project) => project.projectId === preferredProjectId) ?? response.items[0] ?? null;
 
         if (!nextProject) {
-          return;
+          return false;
         }
 
+        const selectionChanged = selectedProjectIdRef.current !== nextProject.projectId;
         const shouldPreserveSelectedDetail =
-          options.preserveSelectedDetail === true &&
-          selectedProjectRef.current !== null &&
-          selectedProjectRef.current.projectId === nextProject.projectId &&
-          selectedProjectIdRef.current === nextProject.projectId;
+          options.preserveSelectedDetail === true
+          && !selectionChanged
+          && selectedProjectRef.current !== null
+          && selectedProjectRef.current.projectId === nextProject.projectId;
 
+        selectedProjectIdRef.current = nextProject.projectId;
         setSelectedProjectId(nextProject.projectId);
 
         if (shouldPreserveSelectedDetail) {
-          return;
+          return true;
         }
 
-        setSelectedProject(nextProject);
+        const fallbackProject =
+          selectionChanged || selectedProjectRef.current === null || selectedProjectRef.current.projectId !== nextProject.projectId
+            ? nextProject
+            : undefined;
 
-        void loadProjectDetail(nextProject.projectId, nextProject);
+        if (fallbackProject) {
+          setSelectedProject(fallbackProject);
+          setProjectTimeline({ items: [], total: 0 });
+          setDetailError(null);
+          setTimelineError(null);
+        }
+
+        return await syncSelectedProjectPanels(nextProject.projectId, fallbackProject);
       } catch (error) {
-        if (!mountedRef.current) {
-          return;
+        if (!mountedRef.current || inventoryRequestIdRef.current !== requestId) {
+          return true;
         }
 
         setInventoryError(
@@ -1132,14 +1375,45 @@ export default function App() {
             'Project inventory timed out. Retry to keep the current list and detail visible.',
           ),
         );
+        return false;
       } finally {
-        if (mountedRef.current) {
+        if (mountedRef.current && inventoryRequestIdRef.current === requestId) {
           setInventoryLoading(false);
         }
       }
     },
-    [loadProjectDetail],
+    [syncSelectedProjectPanels],
   );
+
+  const resyncAfterReconnect = useCallback(async () => {
+    if (!mountedRef.current) {
+      return;
+    }
+
+    setStreamResyncStatus('syncing');
+    setStreamResyncMessage('Reconnected. Resyncing inventory, detail, and timeline.');
+
+    const success = await syncInventory(selectedProjectIdRef.current);
+
+    if (!mountedRef.current) {
+      return;
+    }
+
+    if (success) {
+      setStreamResyncStatus('idle');
+      setStreamResyncMessage(
+        selectedProjectIdRef.current
+          ? 'Reconnected and resynced inventory, detail, and timeline without a manual refresh.'
+          : 'Reconnected and resynced the current inventory without a manual refresh.',
+      );
+      return;
+    }
+
+    setStreamResyncStatus('failed');
+    setStreamResyncMessage(
+      'Reconnected, but a JSON resync panel failed. The last good dashboard state stayed visible while you retry.',
+    );
+  }, [syncInventory]);
 
   useEffect(() => {
     void syncInventory();
@@ -1152,7 +1426,13 @@ export default function App() {
       try {
         const raw = JSON.parse(event.data) as unknown;
         const summary = parseEventEnvelope(raw);
-        markStreamActive(summary);
+
+        if (!mountedRef.current) {
+          return;
+        }
+
+        setStreamStatus('connected');
+        setStreamSummary(summary);
 
         if (summary.type === 'project.init.updated') {
           const initEnvelope = parseProjectInitEventEnvelope(raw);
@@ -1168,8 +1448,8 @@ export default function App() {
           if (selectedProject && selectedProject.projectId === initEnvelope.projectId) {
             const mergedProject = mergeProjectInitJob(selectedProject, initEnvelope);
             const alreadySucceeded =
-              selectedProject.latestInitJob?.jobId === initEnvelope.payload.job.jobId &&
-              selectedProject.latestInitJob.stage === 'succeeded';
+              selectedProject.latestInitJob?.jobId === initEnvelope.payload.job.jobId
+              && selectedProject.latestInitJob.stage === 'succeeded';
 
             setSelectedProject(mergedProject);
             setInitError(null);
@@ -1187,27 +1467,16 @@ export default function App() {
           || summary.type === 'project.refreshed'
           || summary.type === 'project.monitor.updated'
         ) {
-          const shouldSyncDetail =
-            summary.projectId !== null &&
-            (selectedProjectIdRef.current === summary.projectId || selectedProjectIdRef.current === null);
           const activeSelectedInitJob = selectedProjectRef.current?.latestInitJob ?? null;
           const preserveSelectedDetail =
-            summary.type === 'project.refreshed' &&
-            summary.projectId !== null &&
-            selectedProjectRef.current?.projectId === summary.projectId &&
-            (hasActiveInitJob(activeSelectedInitJob) || initDetailSyncProjectIdRef.current === summary.projectId);
+            summary.type === 'project.refreshed'
+            && summary.projectId !== null
+            && selectedProjectRef.current?.projectId === summary.projectId
+            && (hasActiveInitJob(activeSelectedInitJob) || initDetailSyncProjectIdRef.current === summary.projectId);
 
           void syncInventory(summary.projectId ?? selectedProjectIdRef.current, {
             preserveSelectedDetail,
           });
-
-          if (!preserveSelectedDetail && shouldSyncDetail && summary.projectId) {
-            const fallbackProject =
-              projectsRef.current.find((project) => project.projectId === summary.projectId) ??
-              selectedProjectRef.current;
-
-            void loadProjectDetail(summary.projectId, fallbackProject);
-          }
         }
       } catch {
         // Ignore unknown or malformed SSE payloads and keep the dashboard usable.
@@ -1215,11 +1484,21 @@ export default function App() {
     };
 
     eventSource.onopen = () => {
-      markStreamActive();
+      if (!mountedRef.current) {
+        return;
+      }
+
+      setStreamStatus('connected');
+
+      if (shouldResyncOnOpenRef.current) {
+        shouldResyncOnOpenRef.current = false;
+        void resyncAfterReconnect();
+      }
     };
 
     eventSource.onerror = () => {
       if (mountedRef.current) {
+        shouldResyncOnOpenRef.current = true;
         setStreamStatus('disconnected');
       }
     };
@@ -1238,19 +1517,22 @@ export default function App() {
       eventSource.removeEventListener('project.init.updated', handleEnvelope as EventListener);
       eventSource.close();
     };
-  }, [loadProjectDetail, markStreamActive, syncInitDetailAfterSuccess, syncInventory]);
+  }, [resyncAfterReconnect, syncInitDetailAfterSuccess, syncInventory]);
 
   const selectProject = useCallback(
     (project: ProjectRecord) => {
+      selectedProjectIdRef.current = project.projectId;
       setSelectedProjectId(project.projectId);
       setSelectedProject(project);
+      setProjectTimeline({ items: [], total: 0 });
       setDetailError(null);
+      setTimelineError(null);
       setRefreshError(null);
       setInitError(null);
       setRegisterSuccess(null);
-      void loadProjectDetail(project.projectId, project);
+      void syncSelectedProjectPanels(project.projectId, project);
     },
-    [loadProjectDetail],
+    [syncSelectedProjectPanels],
   );
 
   const handleRegister = useCallback(
@@ -1303,14 +1585,17 @@ export default function App() {
         }
 
         setProjects((current) => upsertProject(current, response.project));
+        selectedProjectIdRef.current = response.project.projectId;
         setSelectedProjectId(response.project.projectId);
         setSelectedProject(response.project);
+        setProjectTimeline({ items: [], total: 0 });
         setRegisterPath('');
         setRegisterSuccess(`Registered ${describeProject(response.project)}.`);
         setDetailError(null);
+        setTimelineError(null);
         setRefreshError(null);
         setInitError(null);
-        void loadProjectDetail(response.project.projectId, response.project);
+        void syncSelectedProjectPanels(response.project.projectId, response.project);
       } catch (error) {
         if (!mountedRef.current) {
           return;
@@ -1328,7 +1613,7 @@ export default function App() {
         }
       }
     },
-    [loadProjectDetail, projects, registerPath],
+    [projects, registerPath, syncSelectedProjectPanels],
   );
 
   const handleInitializeSelected = useCallback(async () => {
@@ -1410,7 +1695,9 @@ export default function App() {
       setProjects((current) => upsertProject(current, response.project));
       setSelectedProject(response.project);
       setDetailError(null);
+      setTimelineError(null);
       setInitError(null);
+      void syncSelectedProjectPanels(response.project.projectId);
     } catch (error) {
       if (!mountedRef.current) {
         return;
@@ -1427,7 +1714,7 @@ export default function App() {
         setRefreshPending(false);
       }
     }
-  }, []);
+  }, [syncSelectedProjectPanels]);
 
   const totalProjectsLabel = pluralize(projects.length, 'project');
   const selectedInitJob = selectedProject?.latestInitJob ?? null;
@@ -1443,6 +1730,11 @@ export default function App() {
         selectedInitSyncingDetail ||
         hasActiveInitJob(selectedInitJob);
   const selectedInitSummary = summarizeInitJob(selectedInitJob);
+  const selectedMonitorSummary =
+    selectedProject === null
+      ? null
+      : describeMonitorState(selectedProject.monitor, selectedProject.snapshot.status);
+  const selectedTimelineCountLabel = describeTimelineCount(projectTimeline.total);
 
   return (
     <main className="app-shell">
@@ -1464,6 +1756,15 @@ export default function App() {
             <span className="stat-card__label">Live stream</span>
             <strong>{STREAM_STATUS_LABELS[streamStatus]}</strong>
             <span>{STREAM_STATUS_MESSAGES[streamStatus]}</span>
+            {streamResyncMessage ? (
+              <span
+                className="stream-resync-note"
+                data-testid="stream-resync-status"
+                data-resync-status={streamResyncStatus}
+              >
+                {streamResyncMessage}
+              </span>
+            ) : null}
           </div>
           <div className="stat-card" data-testid="stream-last-event">
             <span className="stat-card__label">Last SSE event</span>
@@ -1606,8 +1907,18 @@ export default function App() {
                         <span className="status-pill" data-status={project.snapshot.status}>
                           {STATUS_LABELS[project.snapshot.status]}
                         </span>
+                        <span
+                          className="status-pill"
+                          data-status={project.monitor.health}
+                          data-testid={`project-monitor-health-${project.projectId}`}
+                        >
+                          {MONITOR_HEALTH_LABELS[project.monitor.health]}
+                        </span>
                         <span>{pluralize(warningCount, 'warning')}</span>
                       </div>
+                      <p className="project-card__monitor" data-testid={`project-monitor-summary-${project.projectId}`}>
+                        {describeMonitorState(project.monitor, project.snapshot.status)}
+                      </p>
                       {initJob ? (
                         <div className="project-card__job" data-testid={`project-init-stage-${project.projectId}`}>
                           <span className="status-pill status-pill--job" data-status={initJob.stage}>
@@ -1637,12 +1948,12 @@ export default function App() {
                 className="secondary-button"
                 onClick={() => {
                   if (selectedProjectIdRef.current) {
-                    void loadProjectDetail(selectedProjectIdRef.current, selectedProjectRef.current);
+                    void syncSelectedProjectPanels(selectedProjectIdRef.current, selectedProjectRef.current);
                   }
                 }}
-                disabled={!selectedProjectId || detailLoading}
+                disabled={!selectedProjectId || detailLoading || timelineLoading}
               >
-                {detailLoading ? 'Reloading…' : 'Reload detail'}
+                {detailLoading || timelineLoading ? 'Reloading…' : 'Reload detail'}
               </button>
               <button
                 type="button"
@@ -1661,6 +1972,22 @@ export default function App() {
             <p className="inline-alert inline-alert--error" role="alert" data-testid="detail-error">
               {detailError}
             </p>
+          ) : null}
+          {timelineError ? (
+            <div className="inline-alert inline-alert--error" role="alert" data-testid="timeline-error">
+              <p>{timelineError}</p>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => {
+                  if (selectedProjectIdRef.current) {
+                    void loadProjectTimeline(selectedProjectIdRef.current);
+                  }
+                }}
+              >
+                Retry timeline
+              </button>
+            </div>
           ) : null}
           {refreshError ? (
             <p className="inline-alert inline-alert--error" role="alert" data-testid="refresh-error">
@@ -1687,6 +2014,9 @@ export default function App() {
                   <span className="status-pill" data-status={selectedProject.snapshot.status} data-testid="detail-status">
                     {STATUS_LABELS[selectedProject.snapshot.status]}
                   </span>
+                  <span className="status-pill" data-status={selectedProject.monitor.health} data-testid="detail-monitor-health">
+                    {MONITOR_HEALTH_LABELS[selectedProject.monitor.health]}
+                  </span>
                   <span className="meta-badge" data-testid="detail-warning-count">
                     {pluralize(selectedProject.snapshot.warnings.length, 'warning')}
                   </span>
@@ -1707,11 +2037,41 @@ export default function App() {
                   <dd>{selectedProject.lastEventId ?? 'Waiting for the first project event.'}</dd>
                 </div>
                 <div>
-                  <dt>Checked at</dt>
+                  <dt>Snapshot checked</dt>
                   <dd>
-                    <time dateTime={selectedProject.snapshot.checkedAt}>
+                    <time dateTime={selectedProject.snapshot.checkedAt} data-testid="detail-snapshot-checked-at">
                       {formatTimestamp(selectedProject.snapshot.checkedAt)}
                     </time>
+                  </dd>
+                </div>
+                <div>
+                  <dt>Last attempted</dt>
+                  <dd data-testid="detail-monitor-last-attempted">
+                    {selectedProject.monitor.lastAttemptedAt ? (
+                      <time dateTime={selectedProject.monitor.lastAttemptedAt}>
+                        {formatTimestamp(selectedProject.monitor.lastAttemptedAt)}
+                      </time>
+                    ) : (
+                      'Not recorded yet.'
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Last successful</dt>
+                  <dd data-testid="detail-monitor-last-successful">
+                    {selectedProject.monitor.lastSuccessfulAt ? (
+                      <time dateTime={selectedProject.monitor.lastSuccessfulAt}>
+                        {formatTimestamp(selectedProject.monitor.lastSuccessfulAt)}
+                      </time>
+                    ) : (
+                      'Not recorded yet.'
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Last trigger</dt>
+                  <dd data-testid="detail-monitor-last-trigger">
+                    {formatProjectReconcileTrigger(selectedProject.monitor.lastTrigger)}
                   </dd>
                 </div>
                 <div>
@@ -1725,6 +2085,34 @@ export default function App() {
                   <dd>{selectedProject.snapshot.identityHints.repoFingerprint ?? 'Not available yet.'}</dd>
                 </div>
               </dl>
+
+              <section className="subpanel monitor-panel" data-testid="monitor-panel">
+                <div className="subpanel__header">
+                  <div>
+                    <h4>Monitor freshness</h4>
+                    <p>Service-owned reconcile health that stays distinct from the current snapshot state.</p>
+                  </div>
+                  <div className="detail-header__meta detail-header__meta--monitor">
+                    <span className="status-pill" data-status={selectedProject.monitor.health}>
+                      {MONITOR_HEALTH_LABELS[selectedProject.monitor.health]}
+                    </span>
+                    <span className="meta-badge">{formatProjectReconcileTrigger(selectedProject.monitor.lastTrigger)}</span>
+                  </div>
+                </div>
+
+                <p className="detail-copy__lead" data-testid="monitor-summary-copy">
+                  {selectedMonitorSummary}
+                </p>
+
+                {selectedProject.monitor.lastError ? (
+                  <div className="inline-alert inline-alert--error monitor-alert" data-testid="monitor-last-error">
+                    <strong>
+                      {selectedProject.monitor.lastError.scope} at {formatTimestamp(selectedProject.monitor.lastError.at)}
+                    </strong>
+                    <p>{clampWarning(selectedProject.monitor.lastError.message)}</p>
+                  </div>
+                ) : null}
+              </section>
 
               <section className="subpanel init-panel" data-testid="init-panel">
                 <div className="subpanel__header subpanel__header--actions">
@@ -1874,6 +2262,78 @@ export default function App() {
                       </li>
                     ))}
                   </ul>
+                )}
+              </section>
+
+              <section className="subpanel timeline-panel" data-testid="timeline-panel">
+                <div className="subpanel__header subpanel__header--actions">
+                  <div>
+                    <h4>Recent timeline</h4>
+                    <p>Persisted recent monitor and refresh history from `/api/projects/:id/timeline`.</p>
+                  </div>
+                  <div className="panel-header__actions">
+                    <span className="meta-badge" data-testid="timeline-total">{selectedTimelineCountLabel}</span>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => {
+                        if (selectedProjectIdRef.current) {
+                          void loadProjectTimeline(selectedProjectIdRef.current);
+                        }
+                      }}
+                      disabled={!selectedProjectId || timelineLoading}
+                    >
+                      {timelineLoading ? 'Reloading…' : 'Reload timeline'}
+                    </button>
+                  </div>
+                </div>
+
+                {projectTimeline.items.length === 0 ? (
+                  <p data-testid="timeline-empty">No recent timeline entries are persisted for this project yet.</p>
+                ) : (
+                  <ol className="timeline-list" data-testid="timeline-list">
+                    {projectTimeline.items.map((entry) => (
+                      <li key={entry.id} className="timeline-item" data-type={entry.type} data-testid={`timeline-item-${entry.id}`}>
+                        <div className="timeline-item__header">
+                          <div className="timeline-item__badges">
+                            <span className="status-pill" data-status={timelineTone(entry.type)}>
+                              {TIMELINE_TYPE_LABELS[entry.type]}
+                            </span>
+                            <span className="status-pill" data-status={entry.monitorHealth}>
+                              {MONITOR_HEALTH_LABELS[entry.monitorHealth]}
+                            </span>
+                            <span className="meta-badge">{formatProjectReconcileTrigger(entry.trigger)}</span>
+                          </div>
+                          <time dateTime={entry.emittedAt}>{formatTimestamp(entry.emittedAt)}</time>
+                        </div>
+                        <p className="timeline-item__detail">{entry.detail}</p>
+                        <dl className="detail-facts detail-facts--compact timeline-item__facts">
+                          <div>
+                            <dt>Snapshot</dt>
+                            <dd>{STATUS_LABELS[entry.snapshotStatus]}</dd>
+                          </div>
+                          <div>
+                            <dt>Warnings</dt>
+                            <dd>{pluralize(entry.warningCount, 'warning')}</dd>
+                          </div>
+                          <div>
+                            <dt>Changed</dt>
+                            <dd>{entry.changed ? 'Yes' : 'No'}</dd>
+                          </div>
+                          <div>
+                            <dt>Event</dt>
+                            <dd>{entry.eventId ?? 'Timeline-only state'}</dd>
+                          </div>
+                        </dl>
+                        {entry.error ? (
+                          <div className="inline-alert inline-alert--error timeline-item__error">
+                            <strong>{entry.error.scope}</strong>
+                            <p>{clampWarning(entry.error.message)}</p>
+                          </div>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ol>
                 )}
               </section>
 
