@@ -1,28 +1,7 @@
 import { type CSSProperties, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 
-type HealthResponse = {
-  service: string;
-  status: 'ok';
-  checkedAt: string;
-  database: {
-    connected: boolean;
-    fileName: string;
-    schemaVersion: string;
-  };
-  assets: {
-    available: boolean;
-    directoryName: string;
-  };
-  projects: {
-    total: number;
-  };
-};
-
-type ProjectsResponse = {
-  items: [];
-  total: number;
-};
+import type { HealthResponse, ProjectsResponse } from '../shared/contracts.js';
 
 const cardStyle = {
   border: '1px solid rgba(148, 163, 184, 0.35)',
@@ -106,8 +85,8 @@ function App() {
           </p>
           <h1 style={{ marginBottom: '0.5rem' }}>gsd-web is ready for inventory and snapshot work.</h1>
           <p style={{ margin: 0, color: '#cbd5e1', lineHeight: 1.6 }}>
-            This bootstrap shell proves one Fastify process can host the dashboard, JSON API,
-            placeholder SSE contract, and SQLite-backed health status.
+            This bootstrap shell now reads the live project registry and truthful snapshot backend
+            contracts from the same Fastify-hosted process.
           </p>
         </header>
 
@@ -136,9 +115,9 @@ function App() {
         <section style={cardStyle}>
           <h2 style={{ marginTop: 0 }}>Next slice targets</h2>
           <ol style={{ marginBottom: 0, paddingLeft: '1.25rem', lineHeight: 1.8 }}>
-            <li>Persist the registry and truthful project snapshot contracts.</li>
-            <li>Publish inspectable event envelopes from the real refresh path.</li>
-            <li>Replace this shell with the hosted registration and detail dashboard.</li>
+            <li>Drive project registration through the hosted dashboard.</li>
+            <li>Render truthful empty, initialized, and degraded snapshot detail.</li>
+            <li>React to SSE envelopes instead of relying on placeholder shell text.</li>
           </ol>
         </section>
       </section>

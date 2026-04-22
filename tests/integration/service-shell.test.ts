@@ -1,13 +1,14 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
+import { TextDecoder } from 'node:util';
 import type { AddressInfo } from 'node:net';
 
 import type { FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, test } from 'vitest';
 
+import type { ProjectEventEnvelope } from '../../src/shared/contracts.js';
 import { createApp, type RuntimeSignal } from '../../src/server/app.js';
 import { startServer } from '../../src/server/index.js';
+import { createTempWorkspace, writeClientShell } from '../helpers/project-fixtures.js';
 
 const cleanupTasks: Array<() => Promise<void>> = [];
 
@@ -21,37 +22,6 @@ afterEach(async () => {
   }
 });
 
-async function createTempWorkspace() {
-  const workspace = await mkdtemp(path.join(os.tmpdir(), 'gsd-web-shell-'));
-
-  cleanupTasks.push(async () => {
-    await rm(workspace, { recursive: true, force: true });
-  });
-
-  return workspace;
-}
-
-async function writeClientShell(workspace: string) {
-  const clientDistDir = path.join(workspace, 'web-dist');
-
-  await mkdir(path.join(clientDistDir, 'assets'), { recursive: true });
-  await writeFile(
-    path.join(clientDistDir, 'index.html'),
-    [
-      '<!doctype html>',
-      '<html lang="en">',
-      '  <head><meta charset="utf-8" /><title>GSD Web Test Shell</title></head>',
-      '  <body>',
-      '    <div id="root">GSD Web Test Shell</div>',
-      '  </body>',
-      '</html>',
-    ].join('\n'),
-  );
-  await writeFile(path.join(clientDistDir, 'assets', 'main.js'), 'console.log("gsd-web shell");\n');
-
-  return clientDistDir;
-}
-
 function getBaseUrl(app: FastifyInstance) {
   const address = app.server.address() as AddressInfo | null;
 
@@ -62,10 +32,63 @@ function getBaseUrl(app: FastifyInstance) {
   return `http://127.0.0.1:${address.port}`;
 }
 
+async function readFirstSseEvent(url: string) {
+  const response = await fetch(url, {
+    headers: {
+      accept: 'text/event-stream',
+    },
+  });
+
+  expect(response.status).toBe(200);
+  expect(response.headers.get('content-type')).toContain('text/event-stream');
+  expect(response.body).not.toBeNull();
+
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (true) {
+      const separatorIndex = buffer.indexOf('\n\n');
+
+      if (separatorIndex >= 0) {
+        const rawEvent = buffer.slice(0, separatorIndex);
+        const dataLine = rawEvent
+          .replace(/\r\n/g, '\n')
+          .split('\n')
+          .find((line) => line.startsWith('data: '));
+
+        if (!dataLine) {
+          throw new Error('Expected the SSE payload to include a data line');
+        }
+
+        return JSON.parse(dataLine.slice(6)) as ProjectEventEnvelope;
+      }
+
+      const result = await Promise.race([
+        reader.read(),
+        new Promise<never>((_resolve, reject) => {
+          setTimeout(() => reject(new Error('Timed out waiting for the first SSE event')), 2_000);
+        }),
+      ]);
+
+      if (result.done) {
+        throw new Error('Event stream closed before the first event was received');
+      }
+
+      buffer += decoder.decode(result.value, { stream: true }).replace(/\r\n/g, '\n');
+    }
+  } finally {
+    await reader.cancel();
+  }
+}
+
 describe('service shell bootstrap', () => {
   test('rejects an empty database path', async () => {
-    const workspace = await createTempWorkspace();
-    const clientDistDir = await writeClientShell(workspace);
+    const workspace = await createTempWorkspace('gsd-web-shell-');
+    const clientDistDir = await writeClientShell(workspace.root);
+
+    cleanupTasks.push(workspace.cleanup);
 
     await expect(
       createApp({
@@ -77,22 +100,26 @@ describe('service shell bootstrap', () => {
   });
 
   test('fails fast when the built shell is missing', async () => {
-    const workspace = await createTempWorkspace();
+    const workspace = await createTempWorkspace('gsd-web-shell-');
+
+    cleanupTasks.push(workspace.cleanup);
 
     await expect(
       createApp({
-        databasePath: path.join(workspace, 'data', 'gsd-web.sqlite'),
-        clientDistDir: path.join(workspace, 'missing-web-dist'),
+        databasePath: path.join(workspace.root, 'data', 'gsd-web.sqlite'),
+        clientDistDir: path.join(workspace.root, 'missing-web-dist'),
         logger: false,
       }),
     ).rejects.toThrow(/missing its shell index\.html/i);
   });
 
-  test('serves health JSON, placeholder contracts, and SPA fallback from one process', async () => {
-    const workspace = await createTempWorkspace();
-    const clientDistDir = await writeClientShell(workspace);
-    const databasePath = path.join(workspace, 'data', 'gsd-web.sqlite');
+  test('serves health JSON, registry contracts, SSE backlog, and SPA fallback from one process', async () => {
+    const workspace = await createTempWorkspace('gsd-web-shell-');
+    const clientDistDir = await writeClientShell(workspace.root);
+    const databasePath = path.join(workspace.root, 'data', 'gsd-web.sqlite');
     const runtimeSignals: RuntimeSignal[] = [];
+
+    cleanupTasks.push(workspace.cleanup);
 
     const app = await startServer({
       host: '127.0.0.1',
@@ -120,7 +147,7 @@ describe('service shell bootstrap', () => {
       database: {
         connected: true,
         fileName: 'gsd-web.sqlite',
-        schemaVersion: '1',
+        schemaVersion: '2',
       },
       assets: {
         available: true,
@@ -138,17 +165,8 @@ describe('service shell bootstrap', () => {
       total: 0,
     });
 
-    const eventsResponse = await fetch(`${baseUrl}/api/events`);
-    expect(eventsResponse.status).toBe(200);
-    expect(eventsResponse.headers.get('content-type')).toContain('text/event-stream');
-
-    const eventStream = await eventsResponse.text();
-    expect(eventStream).toContain('event: service.ready');
-    const dataLine = eventStream
-      .split('\n')
-      .find((line) => line.startsWith('data: '));
-    expect(dataLine).toBeDefined();
-    expect(JSON.parse(dataLine!.slice(6))).toMatchObject({
+    const readyEvent = await readFirstSseEvent(`${baseUrl}/api/events`);
+    expect(readyEvent).toMatchObject({
       type: 'service.ready',
       payload: {
         service: 'gsd-web',
@@ -181,6 +199,10 @@ describe('service shell bootstrap', () => {
           host: '127.0.0.1',
           port: 0,
         }),
+        expect.objectContaining({
+          event: 'project_event',
+          eventType: 'service.ready',
+        }),
       ]),
     );
     expect(
@@ -189,6 +211,9 @@ describe('service shell bootstrap', () => {
       expect.arrayContaining([
         expect.objectContaining({ method: 'GET', route: '/api/health' }),
         expect.objectContaining({ method: 'GET', route: '/api/projects' }),
+        expect.objectContaining({ method: 'GET', route: '/api/projects/:id' }),
+        expect.objectContaining({ method: 'POST', route: '/api/projects/register' }),
+        expect.objectContaining({ method: 'POST', route: '/api/projects/:id/refresh' }),
         expect.objectContaining({ method: 'GET', route: '/api/events' }),
         expect.objectContaining({ method: 'GET', route: '/*' }),
       ]),

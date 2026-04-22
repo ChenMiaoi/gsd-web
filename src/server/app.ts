@@ -3,8 +3,12 @@ import fastifyStatic from '@fastify/static';
 import { existsSync } from 'node:fs';
 import { access, constants, mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
+
+import { SERVICE_NAME, type HealthResponse, type ProjectEventEnvelope } from '../shared/contracts.js';
+import { REGISTRY_SCHEMA_VERSION, RegistryDatabase } from './db.js';
+import { EventHub, registerEventsRoute } from './routes/events.js';
+import { registerProjectRoutes } from './routes/projects.js';
 
 export type RuntimeSignal =
   | {
@@ -13,8 +17,16 @@ export type RuntimeSignal =
     }
   | {
       event: 'route_registration';
-      method: 'GET';
+      method: 'GET' | 'POST';
       route: string;
+    }
+  | {
+      event: 'project_event';
+      eventId: string;
+      eventType: string;
+      projectId: string | null;
+      snapshotStatus?: string;
+      warningCount?: number;
     }
   | {
       event: 'service_start';
@@ -30,31 +42,32 @@ export interface CreateAppOptions {
   logSink?: (signal: RuntimeSignal) => void;
 }
 
-type HealthResponse = {
-  service: 'gsd-web';
-  status: 'ok';
-  checkedAt: string;
-  database: {
-    connected: true;
-    fileName: string;
-    schemaVersion: string;
-  };
-  assets: {
-    available: true;
-    directoryName: string;
-  };
-  projects: {
-    total: 0;
-  };
-};
+function resolveConfiguredPath(label: string, candidate: string): string {
+  const trimmed = candidate.trim();
 
-type ProjectsResponse = {
-  items: [];
-  total: 0;
-};
+  if (trimmed.length === 0) {
+    throw new Error(`${label} path is required`);
+  }
 
-const SERVICE_NAME = 'gsd-web';
-const SCHEMA_VERSION = '1';
+  return path.resolve(trimmed);
+}
+
+async function assertReadableFile(filePath: string, message: string) {
+  try {
+    await access(filePath, constants.R_OK);
+  } catch {
+    throw new Error(message);
+  }
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath, constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export function resolveProjectRoot(fromMetaUrl: string = import.meta.url): string {
   let currentDirectory = path.dirname(fileURLToPath(fromMetaUrl));
@@ -94,57 +107,34 @@ function emitSignal(
   app.log.info(signal, message);
 }
 
-function resolveConfiguredPath(label: string, candidate: string): string {
-  const trimmed = candidate.trim();
+function emitProjectEvent(
+  app: FastifyInstance,
+  logSink: CreateAppOptions['logSink'],
+  event: ProjectEventEnvelope,
+) {
+  const signal: Extract<RuntimeSignal, { event: 'project_event' }> = {
+    event: 'project_event',
+    eventId: event.id,
+    eventType: event.type,
+    projectId: event.projectId,
+  };
 
-  if (trimmed.length === 0) {
-    throw new Error(`${label} path is required`);
+  if ('snapshotStatus' in event.payload) {
+    signal.snapshotStatus = event.payload.snapshotStatus;
   }
 
-  return path.resolve(trimmed);
-}
-
-async function assertReadableFile(filePath: string, message: string) {
-  try {
-    await access(filePath, constants.R_OK);
-  } catch {
-    throw new Error(message);
+  if ('warningCount' in event.payload) {
+    signal.warningCount = event.payload.warningCount;
   }
+
+  emitSignal(app, logSink, signal, 'Broadcasted project event');
 }
 
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    await access(filePath, constants.R_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function openDatabase(databasePath: string): DatabaseSync {
-  const database = new DatabaseSync(databasePath);
-
-  database.exec(`
-    PRAGMA foreign_keys = ON;
-    CREATE TABLE IF NOT EXISTS service_metadata (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-  `);
-
-  const upsertMetadata = database.prepare(`
-    INSERT INTO service_metadata (key, value)
-    VALUES (?, ?)
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-  `);
-
-  upsertMetadata.run('schemaVersion', SCHEMA_VERSION);
-  upsertMetadata.run('lastBootedAt', new Date().toISOString());
-
-  return database;
-}
-
-function buildHealthResponse(databasePath: string, clientDistDir: string): HealthResponse {
+function buildHealthResponse(
+  databasePath: string,
+  clientDistDir: string,
+  projectTotal: number,
+): HealthResponse {
   return {
     service: SERVICE_NAME,
     status: 'ok',
@@ -152,37 +142,14 @@ function buildHealthResponse(databasePath: string, clientDistDir: string): Healt
     database: {
       connected: true,
       fileName: path.basename(databasePath),
-      schemaVersion: SCHEMA_VERSION,
+      schemaVersion: REGISTRY_SCHEMA_VERSION,
     },
     assets: {
       available: true,
       directoryName: path.basename(clientDistDir),
     },
     projects: {
-      total: 0,
-    },
-  };
-}
-
-function buildProjectsResponse(): ProjectsResponse {
-  return {
-    items: [],
-    total: 0,
-  };
-}
-
-function buildBootstrapEnvelope() {
-  const emittedAt = new Date().toISOString();
-
-  return {
-    id: `service-ready:${emittedAt}`,
-    type: 'service.ready',
-    emittedAt,
-    payload: {
-      service: SERVICE_NAME,
-      projects: {
-        total: 0,
-      },
+      total: projectTotal,
     },
   };
 }
@@ -228,10 +195,14 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   await mkdir(path.dirname(databasePath), { recursive: true });
 
   const app = Fastify({ logger: options.logger ?? true });
-  let database: DatabaseSync | undefined;
+  let registry: RegistryDatabase | undefined;
+  let eventHub: EventHub | undefined;
 
   try {
-    database = openDatabase(databasePath);
+    const registryInstance = new RegistryDatabase(databasePath);
+    const eventHubInstance = new EventHub(registryInstance);
+    registry = registryInstance;
+    eventHub = eventHubInstance;
     const indexHtml = await readFile(indexHtmlPath, 'utf8');
 
     emitSignal(
@@ -245,7 +216,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     );
 
     app.addHook('onClose', async () => {
-      database?.close();
+      eventHubInstance.close();
+      registryInstance.close();
     });
 
     await app.register(fastifyStatic, {
@@ -253,7 +225,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       wildcard: false,
     });
 
-    app.get('/api/health', async () => buildHealthResponse(databasePath, clientDistDir));
+    app.get('/api/health', async () =>
+      buildHealthResponse(databasePath, clientDistDir, registryInstance.getProjectCount()),
+    );
     emitSignal(
       app,
       options.logSink,
@@ -265,49 +239,41 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       'Registered route',
     );
 
-    app.get('/api/projects', async () => buildProjectsResponse());
-    emitSignal(
-      app,
-      options.logSink,
-      {
-        event: 'route_registration',
-        method: 'GET',
-        route: '/api/projects',
-      },
-      'Registered route',
-    );
-
-    app.get('/api/events', async (_request, reply) => {
-      const envelope = buildBootstrapEnvelope();
-      const payload = [
-        `id: ${envelope.id}`,
-        `event: ${envelope.type}`,
-        `data: ${JSON.stringify(envelope)}`,
-        '',
-        '',
-      ].join('\n');
-
-      reply.hijack();
-      reply.raw.writeHead(200, {
-        'cache-control': 'no-cache, no-transform',
-        connection: 'keep-alive',
-        'content-type': 'text/event-stream; charset=utf-8',
-        'x-accel-buffering': 'no',
-      });
-      reply.raw.end(payload);
-
-      return reply;
+    const projectRoutes = await registerProjectRoutes(app, {
+      registry: registryInstance,
+      eventHub: eventHubInstance,
     });
-    emitSignal(
-      app,
-      options.logSink,
-      {
-        event: 'route_registration',
-        method: 'GET',
-        route: '/api/events',
-      },
-      'Registered route',
-    );
+
+    for (const route of projectRoutes) {
+      emitSignal(
+        app,
+        options.logSink,
+        {
+          event: 'route_registration',
+          method: route.method,
+          route: route.route,
+        },
+        'Registered route',
+      );
+    }
+
+    const eventRoutes = await registerEventsRoute(app, {
+      registry: registryInstance,
+      eventHub: eventHubInstance,
+    });
+
+    for (const route of eventRoutes) {
+      emitSignal(
+        app,
+        options.logSink,
+        {
+          event: 'route_registration',
+          method: route.method,
+          route: route.route,
+        },
+        'Registered route',
+      );
+    }
 
     app.get('/*', async (request, reply) => {
       const requestPath = decodeRequestPath(request.url);
@@ -358,11 +324,21 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       'Registered route',
     );
 
+    const serviceReadyEvent = registryInstance.appendServiceReadyEvent({
+      service: SERVICE_NAME,
+      projects: {
+        total: registryInstance.getProjectCount(),
+      },
+    });
+    eventHubInstance.broadcast(serviceReadyEvent);
+    emitProjectEvent(app, options.logSink, serviceReadyEvent);
+
     await app.ready();
 
     return app;
   } catch (error) {
-    database?.close();
+    eventHub?.close();
+    registry?.close();
     throw error;
   }
 }
