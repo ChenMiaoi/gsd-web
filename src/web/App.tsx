@@ -1,10 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import {
+  PROJECT_INIT_JOB_STAGES,
+  PROJECT_INIT_REFRESH_RESULT_STATUSES,
   PROJECT_SNAPSHOT_STATUSES,
   SNAPSHOT_SOURCE_NAMES,
   SNAPSHOT_SOURCE_STATES,
   type DirectorySummary,
+  type ProjectInitEventPayload,
+  type ProjectInitJob,
+  type ProjectInitJobHistoryEntry,
+  type ProjectInitJobStage,
+  type ProjectInitRefreshResult,
+  type ProjectInitRefreshResultStatus,
   type ProjectMutationResponse,
   type ProjectRecord,
   type ProjectSnapshot,
@@ -17,7 +25,7 @@ import {
 } from '../shared/contracts.js';
 
 type StreamStatus = 'connecting' | 'connected' | 'stale' | 'disconnected';
-type KnownEventType = 'service.ready' | 'project.registered' | 'project.refreshed';
+type KnownEventType = 'service.ready' | 'project.registered' | 'project.refreshed' | 'project.init.updated';
 
 type StreamSummary = {
   id: string;
@@ -33,6 +41,7 @@ const KNOWN_EVENT_TYPES: ReadonlySet<KnownEventType> = new Set([
   'service.ready',
   'project.registered',
   'project.refreshed',
+  'project.init.updated',
 ]);
 
 const SOURCE_LABELS: Record<SnapshotSourceName, string> = {
@@ -334,6 +343,103 @@ function parseProjectSnapshot(value: unknown, label: string): ProjectSnapshot {
   };
 }
 
+function parseProjectInitJobStage(value: unknown, label: string): ProjectInitJobStage {
+  const candidate = expectString(value, label);
+
+  if (!PROJECT_INIT_JOB_STAGES.includes(candidate as ProjectInitJobStage)) {
+    throw new ResponseShapeError(`${label} must be one of ${PROJECT_INIT_JOB_STAGES.join(', ')}.`);
+  }
+
+  return candidate as ProjectInitJobStage;
+}
+
+function parseProjectInitRefreshResultStatus(
+  value: unknown,
+  label: string,
+): ProjectInitRefreshResultStatus {
+  const candidate = expectString(value, label);
+
+  if (!PROJECT_INIT_REFRESH_RESULT_STATUSES.includes(candidate as ProjectInitRefreshResultStatus)) {
+    throw new ResponseShapeError(
+      `${label} must be one of ${PROJECT_INIT_REFRESH_RESULT_STATUSES.join(', ')}.`,
+    );
+  }
+
+  return candidate as ProjectInitRefreshResultStatus;
+}
+
+function parseProjectInitJobHistoryEntry(value: unknown, label: string): ProjectInitJobHistoryEntry {
+  const record = expectRecord(value, label);
+
+  return {
+    id: expectString(record.id, `${label}.id`),
+    sequence: expectNumber(record.sequence, `${label}.sequence`),
+    stage: parseProjectInitJobStage(record.stage, `${label}.stage`),
+    detail: expectString(record.detail, `${label}.detail`),
+    outputExcerpt:
+      record.outputExcerpt === undefined
+        ? null
+        : expectNullableString(record.outputExcerpt, `${label}.outputExcerpt`),
+    emittedAt: expectString(record.emittedAt, `${label}.emittedAt`),
+  };
+}
+
+function parseProjectInitRefreshResult(value: unknown, label: string): ProjectInitRefreshResult {
+  const record = expectRecord(value, label);
+
+  return {
+    status: parseProjectInitRefreshResultStatus(record.status, `${label}.status`),
+    checkedAt: expectString(record.checkedAt, `${label}.checkedAt`),
+    detail: expectString(record.detail, `${label}.detail`),
+    snapshotStatus:
+      record.snapshotStatus === null || record.snapshotStatus === undefined
+        ? null
+        : parseSnapshotStatus(record.snapshotStatus, `${label}.snapshotStatus`),
+    warningCount:
+      record.warningCount === null || record.warningCount === undefined
+        ? null
+        : expectNumber(record.warningCount, `${label}.warningCount`),
+    changed:
+      record.changed === null || record.changed === undefined
+        ? null
+        : expectBoolean(record.changed, `${label}.changed`),
+    eventId:
+      record.eventId === null || record.eventId === undefined
+        ? null
+        : expectString(record.eventId, `${label}.eventId`),
+  };
+}
+
+function parseProjectInitJob(value: unknown, label: string): ProjectInitJob {
+  const record = expectRecord(value, label);
+
+  return {
+    jobId: expectString(record.jobId, `${label}.jobId`),
+    stage: parseProjectInitJobStage(record.stage, `${label}.stage`),
+    startedAt: expectString(record.startedAt, `${label}.startedAt`),
+    updatedAt: expectString(record.updatedAt, `${label}.updatedAt`),
+    finishedAt:
+      record.finishedAt === undefined ? null : expectNullableString(record.finishedAt, `${label}.finishedAt`),
+    outputExcerpt:
+      record.outputExcerpt === undefined
+        ? null
+        : expectNullableString(record.outputExcerpt, `${label}.outputExcerpt`),
+    lastErrorDetail:
+      record.lastErrorDetail === undefined
+        ? null
+        : expectNullableString(record.lastErrorDetail, `${label}.lastErrorDetail`),
+    refreshResult:
+      record.refreshResult === null || record.refreshResult === undefined
+        ? null
+        : parseProjectInitRefreshResult(record.refreshResult, `${label}.refreshResult`),
+    history: Array.isArray(record.history)
+      ? record.history.map((entry, index) => parseProjectInitJobHistoryEntry(entry, `${label}.history[${index}]`))
+      : (() => {
+          throw new ResponseShapeError(`${label}.history must be an array.`);
+        })(),
+  };
+}
+
 function parseProjectRecord(value: unknown, label: string = 'project'): ProjectRecord {
   const record = expectRecord(value, label);
 
@@ -346,6 +452,10 @@ function parseProjectRecord(value: unknown, label: string = 'project'): ProjectR
     lastEventId:
       record.lastEventId === undefined ? null : expectNullableString(record.lastEventId, `${label}.lastEventId`),
     snapshot: parseProjectSnapshot(record.snapshot, `${label}.snapshot`),
+    latestInitJob:
+      record.latestInitJob === null || record.latestInitJob === undefined
+        ? null
+        : parseProjectInitJob(record.latestInitJob, `${label}.latestInitJob`),
   };
 }
 
@@ -400,6 +510,18 @@ function parseProjectSnapshotEventPayload(value: unknown, label: string): Projec
   };
 }
 
+function parseProjectInitEventPayload(value: unknown, label: string): ProjectInitEventPayload {
+  const record = expectRecord(value, label);
+
+  return {
+    projectId: expectString(record.projectId, `${label}.projectId`),
+    canonicalPath: expectString(record.canonicalPath, `${label}.canonicalPath`),
+    snapshotStatus: parseSnapshotStatus(record.snapshotStatus, `${label}.snapshotStatus`),
+    job: parseProjectInitJob(record.job, `${label}.job`),
+    historyEntry: parseProjectInitJobHistoryEntry(record.historyEntry, `${label}.historyEntry`),
+  };
+}
+
 function parseEventEnvelope(value: unknown): StreamSummary {
   const record = expectRecord(value, 'project event envelope');
   const type = parseKnownEventType(record.type, 'project event envelope.type');
@@ -418,22 +540,23 @@ function parseEventEnvelope(value: unknown): StreamSummary {
 function parseProjectMutationResponse(value: unknown): ProjectMutationResponse {
   const record = expectRecord(value, 'project mutation response');
   const eventRecord = expectRecord(record.event, 'project mutation response.event');
+  const eventType = parseKnownEventType(eventRecord.type, 'project mutation response.event.type');
 
   return {
     project: parseProjectRecord(record.project, 'project mutation response.project'),
     event: {
       id: expectString(eventRecord.id, 'project mutation response.event.id'),
       sequence: expectNumber(eventRecord.sequence, 'project mutation response.event.sequence'),
-      type: parseKnownEventType(eventRecord.type, 'project mutation response.event.type'),
+      type: eventType,
       emittedAt: expectString(eventRecord.emittedAt, 'project mutation response.event.emittedAt'),
       projectId:
         eventRecord.projectId === undefined
           ? null
           : expectNullableString(eventRecord.projectId, 'project mutation response.event.projectId'),
-      payload: parseProjectSnapshotEventPayload(
-        eventRecord.payload,
-        'project mutation response.event.payload',
-      ),
+      payload:
+        eventType === 'project.init.updated'
+          ? parseProjectInitEventPayload(eventRecord.payload, 'project mutation response.event.payload')
+          : parseProjectSnapshotEventPayload(eventRecord.payload, 'project mutation response.event.payload'),
     },
   };
 }
@@ -794,11 +917,13 @@ export default function App() {
     eventSource.addEventListener('service.ready', handleEnvelope as EventListener);
     eventSource.addEventListener('project.registered', handleEnvelope as EventListener);
     eventSource.addEventListener('project.refreshed', handleEnvelope as EventListener);
+    eventSource.addEventListener('project.init.updated', handleEnvelope as EventListener);
 
     return () => {
       eventSource.removeEventListener('service.ready', handleEnvelope as EventListener);
       eventSource.removeEventListener('project.registered', handleEnvelope as EventListener);
       eventSource.removeEventListener('project.refreshed', handleEnvelope as EventListener);
+      eventSource.removeEventListener('project.init.updated', handleEnvelope as EventListener);
       eventSource.close();
     };
   }, [loadProjectDetail, markStreamActive, syncInventory]);

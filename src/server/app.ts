@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { SERVICE_NAME, type HealthResponse, type ProjectEventEnvelope } from '../shared/contracts.js';
 import { REGISTRY_SCHEMA_VERSION, RegistryDatabase } from './db.js';
 import { EventHub, registerEventsRoute } from './routes/events.js';
-import { registerProjectRoutes } from './routes/projects.js';
+import { registerProjectRoutes, type ProjectInitRunner } from './routes/projects.js';
 
 export type RuntimeSignal =
   | {
@@ -27,6 +27,9 @@ export type RuntimeSignal =
       projectId: string | null;
       snapshotStatus?: string;
       warningCount?: number;
+      initStage?: string;
+      initJobId?: string;
+      refreshStatus?: string;
     }
   | {
       event: 'service_start';
@@ -40,6 +43,8 @@ export interface CreateAppOptions {
   clientDistDir?: string;
   logger?: boolean;
   logSink?: (signal: RuntimeSignal) => void;
+  snapshotTimeoutMs?: number;
+  initRunner?: ProjectInitRunner;
 }
 
 function resolveConfiguredPath(label: string, candidate: string): string {
@@ -125,6 +130,15 @@ function emitProjectEvent(
 
   if ('warningCount' in event.payload) {
     signal.warningCount = event.payload.warningCount;
+  }
+
+  if ('job' in event.payload) {
+    signal.initStage = event.payload.job.stage;
+    signal.initJobId = event.payload.job.jobId;
+
+    if (event.payload.job.refreshResult?.status) {
+      signal.refreshStatus = event.payload.job.refreshResult.status;
+    }
   }
 
   emitSignal(app, logSink, signal, 'Broadcasted project event');
@@ -245,6 +259,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     const projectRoutes = await registerProjectRoutes(app, {
       registry: registryInstance,
       eventHub: eventHubInstance,
+      ...(options.snapshotTimeoutMs === undefined ? {} : { snapshotTimeoutMs: options.snapshotTimeoutMs }),
+      ...(options.initRunner === undefined ? {} : { initRunner: options.initRunner }),
     });
 
     for (const route of projectRoutes) {

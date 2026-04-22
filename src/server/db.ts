@@ -5,13 +5,24 @@ import type {
   ProjectEventEnvelope,
   ProjectEventPayload,
   ProjectEventType,
+  ProjectInitEventPayload,
+  ProjectInitJob,
+  ProjectInitJobHistoryEntry,
+  ProjectInitJobStage,
+  ProjectInitRefreshResult,
   ProjectRecord,
   ProjectSnapshot,
   ProjectSnapshotEventPayload,
   ServiceReadyEventPayload,
 } from '../shared/contracts.js';
+import { PROJECT_INIT_JOB_STAGES, isProjectInitJobTerminalStage } from '../shared/contracts.js';
 
-export const REGISTRY_SCHEMA_VERSION = '2';
+export const REGISTRY_SCHEMA_VERSION = '3';
+
+const MAX_INIT_JOB_HISTORY_ENTRIES = 32;
+const MAX_INIT_DETAIL_LENGTH = 320;
+const MAX_INIT_OUTPUT_EXCERPT_LENGTH = 1_200;
+const MAX_INIT_ERROR_DETAIL_LENGTH = 640;
 
 interface ProjectRow {
   project_id: string;
@@ -31,6 +42,28 @@ interface EventRow {
   payload_json: string;
 }
 
+interface InitJobRow {
+  job_id: string;
+  project_id: string;
+  stage: string;
+  output_excerpt: string | null;
+  last_error_detail: string | null;
+  refresh_result_json: string | null;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+  last_event_sequence: number | null;
+}
+
+interface InitJobHistoryRow {
+  history_sequence: number;
+  job_id: string;
+  stage: string;
+  emitted_at: string;
+  detail: string;
+  output_excerpt: string | null;
+}
+
 export interface RegisterProjectInput {
   projectId?: string;
   registeredPath: string;
@@ -43,6 +76,24 @@ export interface RefreshProjectInput {
   projectId: string;
   snapshot: ProjectSnapshot;
   eventPayload: ProjectSnapshotEventPayload;
+}
+
+export interface StartInitJobInput {
+  projectId: string;
+  detail: string;
+  emittedAt?: string;
+  outputExcerpt?: string | null;
+}
+
+export interface AppendInitJobUpdateInput {
+  projectId: string;
+  jobId: string;
+  stage: ProjectInitJobStage;
+  detail: string;
+  emittedAt: string;
+  outputExcerpt?: string | null;
+  lastErrorDetail?: string | null;
+  refreshResult?: ProjectInitRefreshResult | null;
 }
 
 export class DuplicateProjectError extends Error {
@@ -65,8 +116,36 @@ export class ProjectNotFoundError extends Error {
   }
 }
 
+export class ActiveInitJobError extends Error {
+  readonly projectId: string;
+  readonly jobId: string;
+
+  constructor(projectId: string, jobId: string) {
+    super(`Project ${projectId} already has an active init job (${jobId}).`);
+    this.name = 'ActiveInitJobError';
+    this.projectId = projectId;
+    this.jobId = jobId;
+  }
+}
+
+export class InitJobNotFoundError extends Error {
+  readonly projectId: string;
+  readonly jobId: string;
+
+  constructor(projectId: string, jobId: string) {
+    super(`Unknown init job ${jobId} for project ${projectId}.`);
+    this.name = 'InitJobNotFoundError';
+    this.projectId = projectId;
+    this.jobId = jobId;
+  }
+}
+
 function createProjectId() {
   return `prj_${randomUUID()}`;
+}
+
+function createInitJobId() {
+  return `init_${randomUUID()}`;
 }
 
 function isUniqueConstraintError(error: unknown): boolean {
@@ -77,16 +156,26 @@ function isUniqueConstraintError(error: unknown): boolean {
   );
 }
 
-function parseProjectRow(row: ProjectRow): ProjectRecord {
-  return {
-    projectId: row.project_id,
-    registeredPath: row.registered_path,
-    canonicalPath: row.canonical_path,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    lastEventId: row.last_event_sequence === null ? null : `evt_${row.last_event_sequence}`,
-    snapshot: JSON.parse(row.snapshot_json) as ProjectSnapshot,
-  };
+function clampText(value: string | null | undefined, maxLength: number) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const normalized = value.trim();
+
+  if (normalized.length === 0) {
+    return null;
+  }
+
+  return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 1)}…`;
+}
+
+function parseProjectInitJobStage(stage: string): ProjectInitJobStage {
+  if (!PROJECT_INIT_JOB_STAGES.includes(stage as ProjectInitJobStage)) {
+    throw new Error(`Invalid persisted init job stage: ${stage}`);
+  }
+
+  return stage as ProjectInitJobStage;
 }
 
 function parseEventRow<TPayload extends ProjectEventPayload>(row: EventRow): ProjectEventEnvelope<TPayload> {
@@ -97,6 +186,17 @@ function parseEventRow<TPayload extends ProjectEventPayload>(row: EventRow): Pro
     emittedAt: row.emitted_at,
     projectId: row.project_id,
     payload: JSON.parse(row.payload_json) as TPayload,
+  };
+}
+
+function parseInitJobHistoryRow(row: InitJobHistoryRow): ProjectInitJobHistoryEntry {
+  return {
+    id: `ijh_${row.history_sequence}`,
+    sequence: row.history_sequence,
+    stage: parseProjectInitJobStage(row.stage),
+    detail: row.detail,
+    outputExcerpt: row.output_excerpt,
+    emittedAt: row.emitted_at,
   };
 }
 
@@ -140,7 +240,7 @@ export class RegistryDatabase {
       )
       .all() as unknown as ProjectRow[];
 
-    return rows.map((row) => parseProjectRow(row));
+    return rows.map((row) => this.parseProjectRow(row));
   }
 
   getProjectById(projectId: string): ProjectRecord | null {
@@ -159,7 +259,7 @@ export class RegistryDatabase {
       )
       .get(projectId) as ProjectRow | undefined;
 
-    return row ? parseProjectRow(row) : null;
+    return row ? this.parseProjectRow(row) : null;
   }
 
   getProjectByCanonicalPath(canonicalPath: string): ProjectRecord | null {
@@ -178,7 +278,7 @@ export class RegistryDatabase {
       )
       .get(canonicalPath) as ProjectRow | undefined;
 
-    return row ? parseProjectRow(row) : null;
+    return row ? this.parseProjectRow(row) : null;
   }
 
   registerProject(input: RegisterProjectInput): {
@@ -275,6 +375,162 @@ export class RegistryDatabase {
     }
   }
 
+  startInitJob(input: StartInitJobInput): {
+    project: ProjectRecord;
+    event: ProjectEventEnvelope<ProjectInitEventPayload>;
+  } {
+    const emittedAt = input.emittedAt ?? new Date().toISOString();
+    const detail = clampText(input.detail, MAX_INIT_DETAIL_LENGTH) ?? 'Project initialization was queued.';
+    const outputExcerpt = clampText(input.outputExcerpt, MAX_INIT_OUTPUT_EXCERPT_LENGTH);
+    const jobId = createInitJobId();
+
+    this.begin();
+
+    try {
+      this.requireProject(input.projectId);
+
+      const activeJob = this.getLatestInitJob(input.projectId);
+
+      if (activeJob && !isProjectInitJobTerminalStage(activeJob.stage)) {
+        throw new ActiveInitJobError(input.projectId, activeJob.jobId);
+      }
+
+      this.database
+        .prepare(
+          `INSERT INTO init_jobs (
+            job_id,
+            project_id,
+            stage,
+            output_excerpt,
+            last_error_detail,
+            refresh_result_json,
+            created_at,
+            updated_at,
+            finished_at,
+            last_event_sequence
+          ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL)`,
+        )
+        .run(jobId, input.projectId, 'queued', outputExcerpt, emittedAt, emittedAt);
+
+      const historyEntry = this.insertInitJobHistory({
+        jobId,
+        stage: 'queued',
+        detail,
+        outputExcerpt,
+        emittedAt,
+      });
+      const project = this.requireProject(input.projectId);
+      const payload = this.buildProjectInitEventPayload(project, historyEntry);
+      const event = this.insertEvent('project.init.updated', input.projectId, emittedAt, payload);
+
+      this.database
+        .prepare('UPDATE projects SET last_event_sequence = ? WHERE project_id = ?')
+        .run(event.sequence, input.projectId);
+      this.database
+        .prepare('UPDATE init_jobs SET last_event_sequence = ? WHERE job_id = ?')
+        .run(event.sequence, jobId);
+
+      this.commit();
+
+      return {
+        project: this.requireProject(input.projectId),
+        event,
+      };
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
+  appendInitJobUpdate(input: AppendInitJobUpdateInput): {
+    project: ProjectRecord;
+    event: ProjectEventEnvelope<ProjectInitEventPayload>;
+  } {
+    this.begin();
+
+    try {
+      this.requireProject(input.projectId);
+      const jobRow = this.getInitJobRow(input.jobId);
+
+      if (!jobRow || jobRow.project_id !== input.projectId) {
+        throw new InitJobNotFoundError(input.projectId, input.jobId);
+      }
+
+      const stage = parseProjectInitJobStage(input.stage);
+      const detail = clampText(input.detail, MAX_INIT_DETAIL_LENGTH) ?? 'Project init job updated.';
+      const nextOutputExcerpt =
+        input.outputExcerpt === undefined
+          ? jobRow.output_excerpt
+          : clampText(input.outputExcerpt, MAX_INIT_OUTPUT_EXCERPT_LENGTH);
+      const nextLastErrorDetail =
+        input.lastErrorDetail === undefined
+          ? jobRow.last_error_detail
+          : clampText(input.lastErrorDetail, MAX_INIT_ERROR_DETAIL_LENGTH);
+      const nextRefreshResult =
+        input.refreshResult === undefined ? this.parseRefreshResultJson(jobRow.refresh_result_json) : input.refreshResult;
+      const finishedAt = isProjectInitJobTerminalStage(stage) ? input.emittedAt : null;
+
+      const updateResult = this.database
+        .prepare(
+          `UPDATE init_jobs
+          SET stage = ?,
+              output_excerpt = ?,
+              last_error_detail = ?,
+              refresh_result_json = ?,
+              updated_at = ?,
+              finished_at = ?
+          WHERE job_id = ?`,
+        )
+        .run(
+          stage,
+          nextOutputExcerpt,
+          nextLastErrorDetail,
+          nextRefreshResult === null ? null : JSON.stringify(nextRefreshResult),
+          input.emittedAt,
+          finishedAt,
+          input.jobId,
+        );
+
+      if (Number(updateResult.changes) !== 1) {
+        throw new InitJobNotFoundError(input.projectId, input.jobId);
+      }
+
+      const historyEntry = this.insertInitJobHistory({
+        jobId: input.jobId,
+        stage,
+        detail,
+        outputExcerpt: nextOutputExcerpt,
+        emittedAt: input.emittedAt,
+      });
+      const project = this.requireProject(input.projectId);
+      const payload = this.buildProjectInitEventPayload(project, historyEntry);
+      const event = this.insertEvent('project.init.updated', input.projectId, input.emittedAt, payload);
+
+      this.database
+        .prepare('UPDATE projects SET last_event_sequence = ? WHERE project_id = ?')
+        .run(event.sequence, input.projectId);
+      this.database
+        .prepare('UPDATE init_jobs SET last_event_sequence = ? WHERE job_id = ?')
+        .run(event.sequence, input.jobId);
+
+      this.commit();
+
+      return {
+        project: this.requireProject(input.projectId),
+        event,
+      };
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
+  getLatestInitJob(projectId: string): ProjectInitJob | null {
+    const row = this.getLatestInitJobRow(projectId);
+
+    return row ? this.parseInitJobRow(row) : null;
+  }
+
   appendServiceReadyEvent(payload: ServiceReadyEventPayload, emittedAt: string = new Date().toISOString()) {
     return this.insertEvent('service.ready', null, emittedAt, payload);
   }
@@ -327,10 +583,38 @@ export class RegistryDatabase {
         FOREIGN KEY(project_id) REFERENCES projects(project_id)
       );
 
+      CREATE TABLE IF NOT EXISTS init_jobs (
+        job_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        output_excerpt TEXT,
+        last_error_detail TEXT,
+        refresh_result_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT,
+        last_event_sequence INTEGER,
+        FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE,
+        FOREIGN KEY(last_event_sequence) REFERENCES project_events(sequence)
+      );
+
+      CREATE TABLE IF NOT EXISTS init_job_history (
+        history_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        emitted_at TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        output_excerpt TEXT,
+        FOREIGN KEY(job_id) REFERENCES init_jobs(job_id) ON DELETE CASCADE
+      );
+
       CREATE INDEX IF NOT EXISTS idx_projects_canonical_path ON projects(canonical_path);
       CREATE INDEX IF NOT EXISTS idx_projects_updated_at ON projects(updated_at);
       CREATE INDEX IF NOT EXISTS idx_project_events_project_id ON project_events(project_id);
       CREATE INDEX IF NOT EXISTS idx_project_events_emitted_at ON project_events(emitted_at);
+      CREATE INDEX IF NOT EXISTS idx_init_jobs_project_updated_at ON init_jobs(project_id, updated_at DESC, job_sequence DESC);
+      CREATE INDEX IF NOT EXISTS idx_init_job_history_job_sequence ON init_job_history(job_id, history_sequence ASC);
     `);
 
     const upsertMetadata = this.database.prepare(`
@@ -341,6 +625,168 @@ export class RegistryDatabase {
 
     upsertMetadata.run('schemaVersion', REGISTRY_SCHEMA_VERSION);
     upsertMetadata.run('lastBootedAt', new Date().toISOString());
+  }
+
+  private parseProjectRow(row: ProjectRow): ProjectRecord {
+    return {
+      projectId: row.project_id,
+      registeredPath: row.registered_path,
+      canonicalPath: row.canonical_path,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      lastEventId: row.last_event_sequence === null ? null : `evt_${row.last_event_sequence}`,
+      snapshot: JSON.parse(row.snapshot_json) as ProjectSnapshot,
+      latestInitJob: this.getLatestInitJob(row.project_id),
+    };
+  }
+
+  private getLatestInitJobRow(projectId: string): InitJobRow | null {
+    const row = this.database
+      .prepare(
+        `SELECT
+          job_id,
+          project_id,
+          stage,
+          output_excerpt,
+          last_error_detail,
+          refresh_result_json,
+          created_at,
+          updated_at,
+          finished_at,
+          last_event_sequence
+        FROM init_jobs
+        WHERE project_id = ?
+        ORDER BY updated_at DESC, job_sequence DESC
+        LIMIT 1`,
+      )
+      .get(projectId) as InitJobRow | undefined;
+
+    return row ?? null;
+  }
+
+  private getInitJobRow(jobId: string): InitJobRow | null {
+    const row = this.database
+      .prepare(
+        `SELECT
+          job_id,
+          project_id,
+          stage,
+          output_excerpt,
+          last_error_detail,
+          refresh_result_json,
+          created_at,
+          updated_at,
+          finished_at,
+          last_event_sequence
+        FROM init_jobs
+        WHERE job_id = ?`,
+      )
+      .get(jobId) as InitJobRow | undefined;
+
+    return row ?? null;
+  }
+
+  private parseInitJobRow(row: InitJobRow): ProjectInitJob {
+    const history = this.database
+      .prepare(
+        `SELECT
+          history_sequence,
+          job_id,
+          stage,
+          emitted_at,
+          detail,
+          output_excerpt
+        FROM init_job_history
+        WHERE job_id = ?
+        ORDER BY history_sequence ASC`,
+      )
+      .all(row.job_id) as unknown as InitJobHistoryRow[];
+
+    return {
+      jobId: row.job_id,
+      stage: parseProjectInitJobStage(row.stage),
+      startedAt: row.created_at,
+      updatedAt: row.updated_at,
+      finishedAt: row.finished_at,
+      outputExcerpt: row.output_excerpt,
+      lastErrorDetail: row.last_error_detail,
+      refreshResult: this.parseRefreshResultJson(row.refresh_result_json),
+      history: history.map((entry) => parseInitJobHistoryRow(entry)),
+    };
+  }
+
+  private parseRefreshResultJson(raw: string | null): ProjectInitRefreshResult | null {
+    if (raw === null) {
+      return null;
+    }
+
+    return JSON.parse(raw) as ProjectInitRefreshResult;
+  }
+
+  private insertInitJobHistory(input: {
+    jobId: string;
+    stage: ProjectInitJobStage;
+    detail: string;
+    outputExcerpt: string | null;
+    emittedAt: string;
+  }): ProjectInitJobHistoryEntry {
+    const result = this.database
+      .prepare(
+        `INSERT INTO init_job_history (
+          job_id,
+          stage,
+          emitted_at,
+          detail,
+          output_excerpt
+        ) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(input.jobId, input.stage, input.emittedAt, input.detail, input.outputExcerpt);
+
+    this.database
+      .prepare(
+        `DELETE FROM init_job_history
+        WHERE history_sequence IN (
+          SELECT history_sequence
+          FROM init_job_history
+          WHERE job_id = ?
+          ORDER BY history_sequence DESC
+          LIMIT -1 OFFSET ?
+        )`,
+      )
+      .run(input.jobId, MAX_INIT_JOB_HISTORY_ENTRIES);
+
+    const row = this.database
+      .prepare(
+        `SELECT
+          history_sequence,
+          job_id,
+          stage,
+          emitted_at,
+          detail,
+          output_excerpt
+        FROM init_job_history
+        WHERE history_sequence = ?`,
+      )
+      .get(Number(result.lastInsertRowid)) as unknown as InitJobHistoryRow;
+
+    return parseInitJobHistoryRow(row);
+  }
+
+  private buildProjectInitEventPayload(
+    project: ProjectRecord,
+    historyEntry: ProjectInitJobHistoryEntry,
+  ): ProjectInitEventPayload {
+    if (project.latestInitJob === null) {
+      throw new Error(`Expected project ${project.projectId} to have a latest init job.`);
+    }
+
+    return {
+      projectId: project.projectId,
+      canonicalPath: project.canonicalPath,
+      snapshotStatus: project.snapshot.status,
+      job: project.latestInitJob,
+      historyEntry,
+    };
   }
 
   private insertEvent<TPayload extends ProjectEventPayload>(

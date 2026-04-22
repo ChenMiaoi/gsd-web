@@ -38,6 +38,23 @@ export const PROJECT_SNAPSHOT_STATUSES = ['uninitialized', 'initialized', 'degra
 
 export type ProjectSnapshotStatus = (typeof PROJECT_SNAPSHOT_STATUSES)[number];
 
+export const PROJECT_INIT_JOB_STAGES = [
+  'queued',
+  'starting',
+  'initializing',
+  'refreshing',
+  'succeeded',
+  'failed',
+  'timed_out',
+  'cancelled',
+] as const;
+
+export type ProjectInitJobStage = (typeof PROJECT_INIT_JOB_STAGES)[number];
+
+export const PROJECT_INIT_REFRESH_RESULT_STATUSES = ['succeeded', 'failed'] as const;
+
+export type ProjectInitRefreshResultStatus = (typeof PROJECT_INIT_REFRESH_RESULT_STATUSES)[number];
+
 export interface SnapshotWarning {
   source: SnapshotSourceName;
   code: SnapshotWarningCode;
@@ -113,6 +130,37 @@ export interface ProjectSnapshot {
   warnings: SnapshotWarning[];
 }
 
+export interface ProjectInitRefreshResult {
+  status: ProjectInitRefreshResultStatus;
+  checkedAt: string;
+  detail: string;
+  snapshotStatus: ProjectSnapshotStatus | null;
+  warningCount: number | null;
+  changed: boolean | null;
+  eventId: string | null;
+}
+
+export interface ProjectInitJobHistoryEntry {
+  id: string;
+  sequence: number;
+  stage: ProjectInitJobStage;
+  detail: string;
+  outputExcerpt: string | null;
+  emittedAt: string;
+}
+
+export interface ProjectInitJob {
+  jobId: string;
+  stage: ProjectInitJobStage;
+  startedAt: string;
+  updatedAt: string;
+  finishedAt: string | null;
+  outputExcerpt: string | null;
+  lastErrorDetail: string | null;
+  refreshResult: ProjectInitRefreshResult | null;
+  history: ProjectInitJobHistoryEntry[];
+}
+
 export interface ProjectRecord {
   projectId: string;
   registeredPath: string;
@@ -121,6 +169,7 @@ export interface ProjectRecord {
   updatedAt: string;
   lastEventId: string | null;
   snapshot: ProjectSnapshot;
+  latestInitJob: ProjectInitJob | null;
 }
 
 export interface HealthResponse {
@@ -150,7 +199,11 @@ export interface RegisterProjectRequest {
   path: string;
 }
 
-export type ProjectEventType = 'service.ready' | 'project.registered' | 'project.refreshed';
+export type ProjectEventType =
+  | 'service.ready'
+  | 'project.registered'
+  | 'project.refreshed'
+  | 'project.init.updated';
 
 export interface ServiceReadyEventPayload {
   service: typeof SERVICE_NAME;
@@ -170,7 +223,18 @@ export interface ProjectSnapshotEventPayload {
   checkedAt: string;
 }
 
-export type ProjectEventPayload = ServiceReadyEventPayload | ProjectSnapshotEventPayload;
+export interface ProjectInitEventPayload {
+  projectId: string;
+  canonicalPath: string;
+  snapshotStatus: ProjectSnapshotStatus;
+  job: ProjectInitJob;
+  historyEntry: ProjectInitJobHistoryEntry;
+}
+
+export type ProjectEventPayload =
+  | ServiceReadyEventPayload
+  | ProjectSnapshotEventPayload
+  | ProjectInitEventPayload;
 
 export interface ProjectEventEnvelope<TPayload = ProjectEventPayload> {
   id: string;
@@ -183,7 +247,7 @@ export interface ProjectEventEnvelope<TPayload = ProjectEventPayload> {
 
 export interface ProjectMutationResponse {
   project: ProjectRecord;
-  event: ProjectEventEnvelope<ProjectSnapshotEventPayload>;
+  event: ProjectEventEnvelope<ProjectEventPayload>;
 }
 
 export function buildSourceStateMap(
@@ -199,4 +263,8 @@ export function buildSourceStateMap(
     stateMd: snapshot.sources.stateMd.state,
     gsdDb: snapshot.sources.gsdDb.state,
   };
+}
+
+export function isProjectInitJobTerminalStage(stage: ProjectInitJobStage) {
+  return stage === 'succeeded' || stage === 'failed' || stage === 'timed_out' || stage === 'cancelled';
 }

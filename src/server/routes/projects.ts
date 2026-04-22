@@ -4,13 +4,27 @@ import type { FastifyInstance, FastifyReply } from 'fastify';
 
 import {
   buildSourceStateMap,
+  isProjectInitJobTerminalStage,
+  type ProjectInitJobStage,
+  type ProjectInitRefreshResult,
   type ProjectMutationResponse,
   type ProjectSnapshot,
   type ProjectSnapshotEventPayload,
   type ProjectsResponse,
   type RegisterProjectRequest,
 } from '../../shared/contracts.js';
-import { DuplicateProjectError, ProjectNotFoundError, type RegistryDatabase } from '../db.js';
+import {
+  ActiveInitJobError,
+  DuplicateProjectError,
+  ProjectNotFoundError,
+  type RegistryDatabase,
+} from '../db.js';
+import {
+  runOfficialGsdInit,
+  type InitRunResult,
+  type InitJobStage as OfficialInitStage,
+  type RunOfficialInitOptions,
+} from '../init-jobs.js';
 import {
   DEFAULT_SNAPSHOT_TIMEOUT_MS,
   SnapshotTimeoutError,
@@ -20,6 +34,11 @@ import {
   withSnapshotTimeout,
 } from '../snapshots.js';
 import type { EventHub } from './events.js';
+
+export type ProjectInitRunner = (
+  projectRoot: string,
+  options?: RunOfficialInitOptions,
+) => Promise<InitRunResult>;
 
 function sendError(reply: FastifyReply, statusCode: number, message: string, code?: string) {
   return reply.code(statusCode).send({
@@ -87,6 +106,10 @@ function isTimeoutError(error: unknown): error is SnapshotTimeoutError {
   return error instanceof SnapshotTimeoutError;
 }
 
+function isActiveInitJobError(error: unknown): error is ActiveInitJobError {
+  return error instanceof ActiveInitJobError;
+}
+
 function toMutationResponse(
   payload: {
     project: ReturnType<RegistryDatabase['getProjectById']> extends infer TResult
@@ -101,15 +124,207 @@ function toMutationResponse(
   };
 }
 
+function mapOfficialInitStage(stage: OfficialInitStage): ProjectInitJobStage | null {
+  switch (stage) {
+    case 'queued':
+      return 'queued';
+    case 'starting':
+      return 'starting';
+    case 'project_setup':
+    case 'workflow_mode':
+    case 'git_settings':
+    case 'project_instructions':
+    case 'advanced_settings':
+    case 'essential_skills':
+    case 'review_preferences':
+    case 'verifying_bootstrap':
+      return 'initializing';
+    case 'completed':
+      return null;
+    case 'failed':
+      return 'failed';
+    case 'timed_out':
+      return 'timed_out';
+    default:
+      throw new Error(`Unsupported init adapter stage: ${String(stage)}`);
+  }
+}
+
+function buildRefreshFailureResult(
+  detail: string,
+  checkedAt: string,
+  snapshotStatus: ProjectSnapshot['status'] | null,
+  warningCount: number | null,
+): ProjectInitRefreshResult {
+  return {
+    status: 'failed',
+    checkedAt,
+    detail,
+    snapshotStatus,
+    warningCount,
+    changed: null,
+    eventId: null,
+  };
+}
+
+function persistInitUpdate(
+  registry: RegistryDatabase,
+  eventHub: EventHub,
+  input: Parameters<RegistryDatabase['appendInitJobUpdate']>[0],
+) {
+  const result = registry.appendInitJobUpdate(input);
+  eventHub.broadcast(result.event);
+  return result;
+}
+
+async function executeInitJob(options: {
+  registry: RegistryDatabase;
+  eventHub: EventHub;
+  initRunner: ProjectInitRunner;
+  projectId: string;
+  jobId: string;
+  canonicalPath: string;
+  snapshotTimeoutMs: number;
+  log: FastifyInstance['log'];
+}) {
+  let latestOutputExcerpt: string | null = null;
+
+  try {
+    const initResult = await options.initRunner(options.canonicalPath, {
+      onStage: (update) => {
+        latestOutputExcerpt = update.excerpt;
+        const mappedStage = mapOfficialInitStage(update.stage);
+
+        if (mappedStage === null || isProjectInitJobTerminalStage(mappedStage)) {
+          return;
+        }
+
+        persistInitUpdate(options.registry, options.eventHub, {
+          projectId: options.projectId,
+          jobId: options.jobId,
+          stage: mappedStage,
+          detail: update.detail,
+          outputExcerpt: update.excerpt,
+          emittedAt: update.emittedAt,
+        });
+      },
+    });
+
+    latestOutputExcerpt = initResult.outputExcerpt;
+
+    if (initResult.outcome !== 'completed') {
+      const detail = initResult.errorDetail ?? 'Project initialization failed.';
+
+      persistInitUpdate(options.registry, options.eventHub, {
+        projectId: options.projectId,
+        jobId: options.jobId,
+        stage: initResult.outcome === 'timed_out' ? 'timed_out' : 'failed',
+        detail,
+        outputExcerpt: initResult.outputExcerpt,
+        lastErrorDetail: detail,
+        emittedAt: new Date().toISOString(),
+      });
+      return;
+    }
+
+    persistInitUpdate(options.registry, options.eventHub, {
+      projectId: options.projectId,
+      jobId: options.jobId,
+      stage: 'refreshing',
+      detail: 'Bootstrap completeness was proven; refreshing the monitored project snapshot.',
+      outputExcerpt: initResult.outputExcerpt,
+      emittedAt: new Date().toISOString(),
+    });
+
+    const projectBeforeRefresh = options.registry.getProjectById(options.projectId);
+
+    if (!projectBeforeRefresh) {
+      throw new ProjectNotFoundError(options.projectId);
+    }
+
+    const snapshot = await withSnapshotTimeout(
+      () => buildProjectSnapshot(options.canonicalPath),
+      options.snapshotTimeoutMs,
+    );
+
+    if (snapshot.status === 'uninitialized') {
+      const detail = 'Post-init refresh still reported the project as uninitialized.';
+
+      persistInitUpdate(options.registry, options.eventHub, {
+        projectId: options.projectId,
+        jobId: options.jobId,
+        stage: 'failed',
+        detail,
+        outputExcerpt: initResult.outputExcerpt,
+        lastErrorDetail: detail,
+        refreshResult: buildRefreshFailureResult(detail, snapshot.checkedAt, snapshot.status, snapshot.warnings.length),
+        emittedAt: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const changed = isChangedSnapshot(projectBeforeRefresh.snapshot, snapshot);
+    const refreshResult = options.registry.refreshProject({
+      projectId: options.projectId,
+      snapshot,
+      eventPayload: buildProjectEventPayload(options.projectId, options.canonicalPath, snapshot, changed),
+    });
+    options.eventHub.broadcast(refreshResult.event);
+
+    const detail = `Initialization completed and refresh observed a truthful ${snapshot.status} snapshot.`;
+
+    persistInitUpdate(options.registry, options.eventHub, {
+      projectId: options.projectId,
+      jobId: options.jobId,
+      stage: 'succeeded',
+      detail,
+      outputExcerpt: initResult.outputExcerpt,
+      refreshResult: {
+        status: 'succeeded',
+        checkedAt: snapshot.checkedAt,
+        detail,
+        snapshotStatus: snapshot.status,
+        warningCount: snapshot.warnings.length,
+        changed,
+        eventId: refreshResult.event.id,
+      },
+      emittedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : 'Project initialization failed unexpectedly.';
+
+    options.log.error({ err: error, projectId: options.projectId, jobId: options.jobId }, 'Project init job failed');
+
+    try {
+      persistInitUpdate(options.registry, options.eventHub, {
+        projectId: options.projectId,
+        jobId: options.jobId,
+        stage: 'failed',
+        detail,
+        outputExcerpt: latestOutputExcerpt,
+        lastErrorDetail: detail,
+        emittedAt: new Date().toISOString(),
+      });
+    } catch (persistError) {
+      options.log.error(
+        { err: persistError, projectId: options.projectId, jobId: options.jobId },
+        'Failed to persist init job failure state',
+      );
+    }
+  }
+}
+
 export async function registerProjectRoutes(
   app: FastifyInstance,
   options: {
     registry: RegistryDatabase;
     eventHub: EventHub;
     snapshotTimeoutMs?: number;
+    initRunner?: ProjectInitRunner;
   },
 ) {
   const snapshotTimeoutMs = options.snapshotTimeoutMs ?? DEFAULT_SNAPSHOT_TIMEOUT_MS;
+  const initRunner = options.initRunner ?? runOfficialGsdInit;
 
   app.get('/api/projects', async (): Promise<ProjectsResponse> => {
     const items = options.registry.listProjects();
@@ -229,6 +444,63 @@ export async function registerProjectRoutes(
     }
   });
 
+  app.post<{ Params: { id: string } }>('/api/projects/:id/init', async (request, reply) => {
+    const existingProject = options.registry.getProjectById(request.params.id);
+
+    if (!existingProject) {
+      return sendError(reply, 404, `Project ${request.params.id} was not found.`, 'project_not_found');
+    }
+
+    if (existingProject.snapshot.status !== 'uninitialized') {
+      return sendError(
+        reply,
+        409,
+        `Project ${request.params.id} is not eligible for initialization because its current snapshot is ${existingProject.snapshot.status}.`,
+        'project_ineligible',
+      );
+    }
+
+    try {
+      const startResult = options.registry.startInitJob({
+        projectId: existingProject.projectId,
+        detail: 'Initialization request accepted and queued.',
+      });
+      const response = toMutationResponse(startResult);
+
+      options.eventHub.broadcast(response.event);
+
+      const jobId = response.project.latestInitJob?.jobId;
+
+      if (!jobId) {
+        throw new Error(`Expected project ${existingProject.projectId} to include the queued init job.`);
+      }
+
+      void executeInitJob({
+        registry: options.registry,
+        eventHub: options.eventHub,
+        initRunner,
+        projectId: existingProject.projectId,
+        jobId,
+        canonicalPath: existingProject.canonicalPath,
+        snapshotTimeoutMs,
+        log: request.log,
+      });
+
+      return reply.code(202).send(response);
+    } catch (error) {
+      if (isActiveInitJobError(error)) {
+        return sendError(reply, 409, error.message, 'init_job_active');
+      }
+
+      if (isNotFoundError(error)) {
+        return sendError(reply, 404, error.message, 'project_not_found');
+      }
+
+      request.log.error({ err: error, projectId: existingProject.projectId }, 'Failed to start project init job');
+      return sendError(reply, 500, 'Failed to start project initialization.', 'init_job_start_failed');
+    }
+  });
+
   return [
     {
       method: 'GET' as const,
@@ -245,6 +517,10 @@ export async function registerProjectRoutes(
     {
       method: 'POST' as const,
       route: '/api/projects/:id/refresh',
+    },
+    {
+      method: 'POST' as const,
+      route: '/api/projects/:id/init',
     },
   ];
 }
