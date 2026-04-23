@@ -54,6 +54,7 @@ async function bootService(options: { initRunner?: ProjectInitRunner; monitorInt
     databasePath,
     clientDistDir,
     logger: false,
+    watchersEnabled: false,
     ...(options.initRunner === undefined ? {} : { initRunner: options.initRunner }),
     ...(options.monitorIntervalMs === undefined ? {} : { monitorIntervalMs: options.monitorIntervalMs }),
   });
@@ -217,7 +218,10 @@ describe('project continuity routes', () => {
     const pathLostProject = await waitForProject(
       service.baseUrl,
       projectId,
-      (project) => project.continuity?.state === 'path_lost' && project.monitor.health === 'read_failed',
+      (project) =>
+        project.continuity?.state === 'path_lost'
+        && project.monitor.health === 'read_failed'
+        && project.snapshot.status === 'initialized',
     );
 
     expect(pathLostProject.snapshot.status).toBe('initialized');
