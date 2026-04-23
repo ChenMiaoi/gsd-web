@@ -96,11 +96,9 @@ export default function App() {
   const [detailError, setDetailError] = useState<string | null>(null);
   const [timelineLoading, setTimelineLoading] = useState(false);
   const [timelineError, setTimelineError] = useState<string | null>(null);
-  const [registerPath, setRegisterPath] = useState('');
   const [registerPending, setRegisterPending] = useState(false);
   const [registerError, setRegisterError] = useState<string | null>(null);
   const [registerSuccess, setRegisterSuccess] = useState<string | null>(null);
-  const [manualRegisterReady, setManualRegisterReady] = useState(false);
   const [directoryPickerOpen, setDirectoryPickerOpen] = useState(false);
   const [directoryPicker, setDirectoryPicker] = useState<FilesystemDirectoryResponse | null>(null);
   const [directoryPickerLoading, setDirectoryPickerLoading] = useState(false);
@@ -207,16 +205,6 @@ export default function App() {
   useEffect(() => {
     selectedProjectRef.current = selectedProject;
   }, [selectedProject]);
-
-  useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      setManualRegisterReady(true);
-    }, 3_000);
-
-    return () => {
-      window.clearTimeout(timeoutId);
-    };
-  }, []);
 
   useEffect(() => {
     setRelinkPath('');
@@ -766,7 +754,6 @@ export default function App() {
       }
 
       setRegisterPending(true);
-      setRegisterPath(candidatePath);
       setRegisterError(null);
       setRegisterSuccess(null);
 
@@ -801,7 +788,6 @@ export default function App() {
         setSelectedProjectId(response.project.projectId);
         setSelectedProject(response.project);
         setProjectTimeline({ items: [], total: 0 });
-        setRegisterPath('');
         setRegisterSuccess(copy.notices.registeredSuccess(describeProject(response.project)));
         setRelinkPath('');
         setRelinkError(null);
@@ -839,14 +825,6 @@ export default function App() {
       projects,
       syncSelectedProjectPanels,
     ],
-  );
-
-  const handleRegister = useCallback(
-    (event: React.FormEvent<HTMLFormElement>) => {
-      event.preventDefault();
-      void submitRegisterPath(registerPath);
-    },
-    [registerPath, submitRegisterPath],
   );
 
   const handleRelinkSelected = useCallback(
@@ -1175,7 +1153,7 @@ export default function App() {
     setRegisterError(null);
     setRegisterSuccess(null);
     setDirectoryPickerOpen(true);
-    void loadDirectoryPicker(registerPath);
+    void loadDirectoryPicker();
   };
   const renderLocaleSwitch = () => (
     <div className="locale-switch" role="group" aria-label={copy.languageToggleLabel}>
@@ -1194,86 +1172,31 @@ export default function App() {
       ))}
     </div>
   );
-  const renderRegisterPanel = (inputId: string, options: { pickerOnly?: boolean } = {}) => (
+  const renderRegisterPanel = () => (
     <div className="register-panel">
       <div>
         <h2>{copy.actions.registerProject}</h2>
         <p>{copy.help.registerPanel}</p>
       </div>
 
-      {options.pickerOnly ? (
-        <>
-          <div className="field register-panel__field">
-            <span>{copy.labels.projectPath}</span>
-            <div className="register-panel__path" data-testid="register-selected-path">
-              {registerPath || copy.messages.selectedFolderHint}
-            </div>
-          </div>
+      <div className="field register-panel__field">
+        <span>{copy.labels.projectPath}</span>
+        <div className="register-panel__path" data-testid="register-selected-path">
+          {copy.messages.selectedFolderHint}
+        </div>
+      </div>
 
-          <div className="register-panel__actions">
-            <button
-              type="button"
-              className="primary-button"
-              onClick={openRegisterDirectoryPicker}
-              disabled={directoryPickerLoading}
-            >
-              <FolderIcon />
-              <span>{copy.actions.browseFolders}</span>
-            </button>
-          </div>
-        </>
-      ) : (
-        <>
-          <form onSubmit={handleRegister}>
-            <div className="field register-panel__field">
-              <label htmlFor={inputId}>{copy.labels.projectPath}</label>
-              <div className="path-input-row">
-                <input
-                  id={inputId}
-                  name={inputId}
-                  type="text"
-                  autoComplete="off"
-                  spellCheck={false}
-                  placeholder={copy.placeholders.projectPath}
-                  value={registerPath}
-                  onChange={(nextEvent) => {
-                    setRegisterPath(nextEvent.target.value);
-                    setRegisterError(null);
-                    setRegisterSuccess(null);
-                  }}
-                />
-                <button
-                  type="button"
-                  className="secondary-button secondary-button--icon"
-                  onClick={openRegisterDirectoryPicker}
-                  disabled={directoryPickerLoading}
-                >
-                  <FolderIcon />
-                  <span>{copy.actions.browseFolders}</span>
-                </button>
-              </div>
-            </div>
-
-            <div className="register-panel__actions">
-              <button type="submit" className="primary-button" disabled={registerPending}>
-                {registerPending ? copy.actions.registering : copy.actions.registerProject}
-              </button>
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => {
-                  setRegisterPath('');
-                  setRegisterError(null);
-                  setRegisterSuccess(null);
-                }}
-                disabled={registerPending || registerPath.length === 0}
-              >
-                {copy.actions.clearInput}
-              </button>
-            </div>
-          </form>
-        </>
-      )}
+      <div className="register-panel__actions">
+        <button
+          type="button"
+          className="primary-button"
+          onClick={openRegisterDirectoryPicker}
+          disabled={directoryPickerLoading}
+        >
+          <FolderIcon />
+          <span>{copy.actions.browseFolders}</span>
+        </button>
+      </div>
 
       {registerError ? (
         <p className="inline-alert inline-alert--error" role="alert" data-testid="register-error">
@@ -1741,7 +1664,7 @@ export default function App() {
 
               <aside className="overview-side" aria-label={copy.labels.serviceState}>
                 <section className="overview-register panel">
-                  {renderRegisterPanel('overview-project-path', { pickerOnly: !manualRegisterReady })}
+                  {renderRegisterPanel()}
                 </section>
                 <section className="overview-status panel">
                   <div className="subpanel__header">
@@ -2742,7 +2665,7 @@ export default function App() {
                   className="secondary-button"
                   disabled={directoryPickerLoading}
                   onClick={() => {
-                    void loadDirectoryPicker(directoryPicker?.path ?? registerPath);
+                    void loadDirectoryPicker(directoryPicker?.path ?? null);
                   }}
                 >
                   {directoryPickerLoading ? copy.actions.loadingFolders : copy.actions.refreshFolders}

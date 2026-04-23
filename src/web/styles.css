@@ -3971,6 +3971,26 @@ code,
     0 20px 40px rgba(0, 0, 0, 0.34);
 }
 
+.directory-picker__header p,
+.directory-picker__note,
+.directory-picker__empty {
+  color: #eadfff;
+}
+
+.directory-picker__entry {
+  color: #f8f3ff;
+}
+
+.directory-picker__entry span {
+  color: #f8f3ff;
+  font-weight: 700;
+}
+
+.directory-picker__entry:hover {
+  background:
+    linear-gradient(180deg, rgba(28, 18, 66, 0.98) 0%, rgba(13, 8, 34, 0.94) 100%);
+}
+
 .panel,
 .subpanel {
   background:

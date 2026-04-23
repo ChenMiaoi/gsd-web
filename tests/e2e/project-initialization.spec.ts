@@ -11,7 +11,7 @@ import { startServer } from '../../src/server/index.js';
 import type { InitRunResult, RunOfficialInitOptions } from '../../src/server/init-jobs.js';
 import type { ProjectInitRunner } from '../../src/server/routes/projects.js';
 import { BOOTSTRAP_REQUIRED_ENTRIES } from '../../src/server/snapshots.js';
-import type { ProjectRecord, ProjectsResponse } from '../../src/shared/contracts.js';
+import type { ProjectMutationResponse, ProjectRecord, ProjectsResponse } from '../../src/shared/contracts.js';
 import {
   createBootstrapCompleteGsdDirectory,
   createEmptyProject,
@@ -67,6 +67,25 @@ async function getProjectByCanonicalPath(baseUrl: string, canonicalPath: string)
   }
 
   return match;
+}
+
+async function registerProject(baseUrl: string, projectPath: string): Promise<ProjectMutationResponse> {
+  const response = await fetch(`${baseUrl}/api/projects/register`, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      path: projectPath,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Expected project registration to succeed, got ${response.status}`);
+  }
+
+  return (await response.json()) as ProjectMutationResponse;
 }
 
 async function waitForProject(
@@ -271,10 +290,8 @@ test.describe('project initialization dashboard flow', () => {
     const projectPath = await createEmptyProject(harness.workspace.root, 'browser-init-success');
 
     try {
-      await page.goto(`${harness.baseUrl}/lazy/all`);
-
-      await page.getByLabel('Project path').fill(projectPath);
-      await page.getByRole('button', { name: 'Register project' }).click();
+      const registration = await registerProject(harness.baseUrl, projectPath);
+      await page.goto(`${harness.baseUrl}/lazy/${registration.project.projectId}`);
 
       await expect(page.getByTestId('detail-status')).toContainText('Uninitialized');
       await expect(page.getByTestId('detail-canonical-path')).toHaveText(projectPath);
@@ -318,8 +335,8 @@ test.describe('project initialization dashboard flow', () => {
       await page.goto(`${harness.baseUrl}/lazy/all`);
       await expect(page.getByTestId('stream-status')).toContainText('Disconnected');
 
-      await page.getByLabel('Project path').fill(projectPath);
-      await page.getByRole('button', { name: 'Register project' }).click();
+      const registration = await registerProject(harness.baseUrl, projectPath);
+      await page.goto(`${harness.baseUrl}/lazy/${registration.project.projectId}`);
 
       await expect(page.getByTestId('detail-status')).toContainText('Uninitialized');
       await expect(page.getByTestId('detail-canonical-path')).toHaveText(projectPath);
@@ -359,10 +376,8 @@ test.describe('project initialization dashboard flow', () => {
     const projectPath = await createEmptyProject(harness.workspace.root, 'browser-init-malformed');
 
     try {
-      await page.goto(`${harness.baseUrl}/lazy/all`);
-
-      await page.getByLabel('Project path').fill(projectPath);
-      await page.getByRole('button', { name: 'Register project' }).click();
+      const registration = await registerProject(harness.baseUrl, projectPath);
+      await page.goto(`${harness.baseUrl}/lazy/${registration.project.projectId}`);
 
       await expect(page.getByTestId('detail-status')).toContainText('Uninitialized');
       await expect(page.getByTestId('detail-canonical-path')).toHaveText(projectPath);
