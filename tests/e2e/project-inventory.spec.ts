@@ -240,7 +240,7 @@ test.describe('hosted dashboard inventory flow', () => {
 
     await page.getByRole('button', { name: /Enter overview|进入总览/ }).click();
 
-    await expect(page).toHaveURL(`${harness.baseUrl}/hello/all`);
+    await expect(page).toHaveURL(`${harness.baseUrl}/lazy/all`);
     await expect(page.getByRole('heading', { name: /Project overview|项目概览/ })).toBeVisible();
   });
 
@@ -253,7 +253,7 @@ test.describe('hosted dashboard inventory flow', () => {
       (firstRegistration.project.snapshot.sources.metricsJson.value?.totals.cost ?? 0)
       + (secondRegistration.project.snapshot.sources.metricsJson.value?.totals.cost ?? 0);
 
-    await page.goto(`${harness.baseUrl}/hello/all`);
+    await page.goto(`${harness.baseUrl}/lazy/all`);
     await expect(page.getByTestId('app-topbar-marquee-heading')).toContainText('2 projects');
     await expect(page.getByTestId('app-topbar-marquee-heading')).not.toContainText('routed-project');
     await expect(page.getByTestId('app-topbar-stage-value')).toContainText('2');
@@ -261,10 +261,10 @@ test.describe('hosted dashboard inventory flow', () => {
 
     await page.getByTestId(`overview-project-card-${firstRegistration.project.projectId}`).click();
 
-    await expect(page).toHaveURL(`${harness.baseUrl}/hello/${firstRegistration.project.projectId}`);
+    await expect(page).toHaveURL(`${harness.baseUrl}/lazy/${firstRegistration.project.projectId}`);
     await expect(page.getByTestId('detail-project-id-value')).toContainText(firstRegistration.project.projectId);
 
-    await page.goto(`${harness.baseUrl}/hello/all`);
+    await page.goto(`${harness.baseUrl}/lazy/all`);
     await expect(page.getByTestId('app-topbar-marquee-heading')).toContainText('2 projects');
     await expect(page.getByTestId('app-topbar-marquee-heading')).not.toContainText('routed-project');
   });
@@ -280,7 +280,7 @@ test.describe('hosted dashboard inventory flow', () => {
     const emptyRegistration = await registerProject(harness.baseUrl, emptyProjectPath);
     const partialRegistration = await registerProject(harness.baseUrl, partialProjectPath);
 
-    await page.goto(`${harness.baseUrl}/hello/all`);
+    await page.goto(`${harness.baseUrl}/lazy/all`);
 
     await expect(page.getByRole('heading', { name: 'Project overview' })).toBeVisible();
     await expect(page.getByTestId('inventory-count')).toContainText('2 projects');
@@ -291,7 +291,7 @@ test.describe('hosted dashboard inventory flow', () => {
     await expect(page.getByTestId('detail-directory')).toContainText('directory is empty');
     await expect(page.getByTestId('warning-list')).toContainText('No degraded or missing-source warnings');
 
-    await page.goto(`${harness.baseUrl}/hello/${partialRegistration.project.projectId}`);
+    await page.goto(`${harness.baseUrl}/lazy/${partialRegistration.project.projectId}`);
     await expect(page.getByTestId('detail-status')).toContainText('Degraded');
     await expect(page.getByTestId('detail-gsd-id')).toContainText('gsd-partial-project');
     await expect(page.getByTestId('warning-list')).toContainText('PROJECT.md');
@@ -377,7 +377,7 @@ test.describe('hosted dashboard inventory flow', () => {
       });
     });
 
-    await page.goto(`${harness.baseUrl}/hello/all`);
+    await page.goto(`${harness.baseUrl}/lazy/all`);
     await expect(page.getByLabel('Project path')).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Refresh inventory' })).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Browse folders' })).toBeVisible();
@@ -390,7 +390,7 @@ test.describe('hosted dashboard inventory flow', () => {
 
     await expect(page.getByTestId('detail-status')).toContainText('Uninitialized');
 
-    await page.goto(`${harness.baseUrl}/hello/all`);
+    await page.goto(`${harness.baseUrl}/lazy/all`);
     await page.getByRole('button', { name: 'Browse folders' }).click();
     await page.getByTestId('directory-picker').getByRole('button', { name: 'registered-project' }).click();
     await page.getByRole('button', { name: 'Register this folder' }).click();
@@ -435,7 +435,7 @@ test.describe('hosted dashboard inventory flow', () => {
       ['Export', 'export-panel'],
     ] as const;
 
-    await page.goto(`${harness.baseUrl}/hello/${registration.project.projectId}`);
+    await page.goto(`${harness.baseUrl}/lazy/${registration.project.projectId}`);
 
     await expect(page.getByTestId('detail-status')).toContainText('Initialized');
 
@@ -483,7 +483,7 @@ test.describe('hosted dashboard inventory flow', () => {
       });
     };
 
-    await page.goto(`${harness.baseUrl}/hello/${registration.project.projectId}`);
+    await page.goto(`${harness.baseUrl}/lazy/${registration.project.projectId}`);
     await expect(page.getByTestId('detail-status')).toContainText('Initialized');
     await expect(page.getByTestId('continuity-panel')).toHaveCount(0);
     await expect(page.getByTestId('init-panel')).toHaveCount(0);
@@ -533,7 +533,7 @@ test.describe('hosted dashboard inventory flow', () => {
       await route.abort('failed');
     });
 
-    await page.goto(`${harness.baseUrl}/hello/all`);
+    await page.goto(`${harness.baseUrl}/lazy/all`);
 
     await expect(page.getByTestId('stream-status')).toContainText('Disconnected');
 

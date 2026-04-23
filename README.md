@@ -1,34 +1,33 @@
 # gsd-web
 
-`gsd-web` 是一个本地优先的 GSD 项目清单面板。它用 Fastify 提供 API 和静态资源服务，用 React 渲染浏览器面板，用 SQLite 持久化已登记项目、快照、监控状态、初始化任务和时间线。
+`gsd-web` is a local-first dashboard for GSD workspaces. It registers projects on your machine, watches their `.gsd` state, keeps a durable SQLite registry, and renders a React interface for project inventory, continuity, initialization, workflow progress, metrics, and timeline events.
 
-## 功能
+The project is designed for contributors who need to run the service locally, inspect project state safely, and extend the dashboard without changing the GSD workspace format.
 
-- 登记本机项目路径，并为每个项目保留稳定的 `projectId`
-- 只读扫描项目目录和 `.gsd` bootstrap 状态
-- 展示 `initialized`、`uninitialized`、`degraded` 等真实快照状态
-- 监控项目路径丢失、恢复、重连和刷新事件
-- 支持在面板中触发受支持的 `/gsd init` 流程
-- 通过 Server-Sent Events 实时同步项目事件
-- 内置 i18n，当前支持 English 和中文
+## What It Does
 
-## 环境要求
+- Registers local project paths and assigns each project a stable `projectId`.
+- Reads `.gsd` bootstrap artifacts in a read-only snapshot pass.
+- Classifies projects as `initialized`, `uninitialized`, or `degraded`.
+- Tracks path loss, recovery, relinking, refreshes, and monitor health.
+- Starts supported `gsd init` flows from the browser UI.
+- Streams project events to the UI with Server-Sent Events.
+- Visualizes milestones, slices, tasks, dependencies, runtime metrics, model usage, and timeline activity.
+- Supports English and Chinese UI copy.
+
+## Requirements
 
 - Node.js `>=24.0.0`
 - npm
-- 如需使用面板里的初始化功能，需要本机可执行：
+- Optional, for browser-triggered initialization:
   - `gsd`
   - `python3`
 
-## 快速开始
+Node 24 is required because the server uses modern Node APIs, including the built-in SQLite binding.
 
-作为 npm 包安装后，用户只需要运行：
+## Quick Start
 
-```bash
-gsd-web
-```
-
-本地开发时：
+Install dependencies and build both the browser and server bundles:
 
 ```bash
 npm install
@@ -36,136 +35,99 @@ npm run build
 npm run start
 ```
 
-默认服务地址：
+Then open:
 
 ```text
 http://127.0.0.1:3000
 ```
 
-开发时可以直接运行 TypeScript 后端：
+For local development, run the TypeScript server directly:
 
 ```bash
 npm run dev
 ```
 
-注意：`npm run dev` 仍然服务 `dist/web` 下的前端产物。第一次运行或改动前端后，请先执行 `npm run build`。
+The development server still serves the built browser bundle. Run `npm run build:web` after changing frontend code.
 
-## 使用面板
-
-1. 打开 `http://127.0.0.1:3000` 或 `http://127.0.0.1:3000/hello` 进入欢迎页
-2. 点击进入总览，或直接打开 `http://127.0.0.1:3000/hello/all`
-3. 在 `Project path` 输入一个本机项目的绝对路径
-4. 点击 `Register project`
-5. 在总览中选择项目，进入 `/hello/<projectId>` 项目详情页查看：
-   - 快照状态
-   - 监控健康度
-   - 项目连续性
-   - 初始化任务
-   - 目录摘要
-   - 快照来源状态
-   - 仓库元数据
-   - 最近时间线
-
-如果项目路径被移动或删除，面板会保留最近一次良好快照，并在项目进入 `path_lost` 状态时提供重连入口。
-
-## 前端路由
-
-前端使用浏览器 History API 管理 URL，后端会通过 SPA fallback 返回同一个 React 入口，因此刷新或直接打开深链都可用：
-
-- `/hello`：gsd-web 欢迎页
-- `/hello/all`：项目总览
-- `/hello/<projectId>`：项目详情
-
-## i18n
-
-面板右上角提供语言切换，当前支持：
-
-- `EN`
-- `中文`
-
-语言偏好会保存到浏览器 `localStorage`：
-
-```text
-gsd-web.locale
-```
-
-文案集中在：
-
-```text
-src/web/i18n.ts
-```
-
-新增语言时，扩展 `Locale` 类型和 `UI_COPY` 字典即可。
-
-## 常用命令
+When installed as a package, the CLI entrypoint is:
 
 ```bash
-npm run clean       # 删除 dist
-npm run build       # 构建前端和后端
-npm run build:web   # 只构建 React/Vite 前端
-npm run build:server# 只编译 TypeScript 后端
-npm run dev         # 运行源码后端
-npm run cli         # 构建后用 gsd-web CLI 入口运行
-npm run start       # 运行 dist 后端
-npm test            # 运行 Vitest 集成测试
-npm run test:e2e    # 运行 Playwright 端到端测试
+gsd-web
 ```
 
-## 配置
+## Using The Dashboard
 
-常用环境变量：
+1. Open the welcome page.
+2. Enter the project overview.
+3. Register an absolute local project path.
+4. Select a project to inspect its snapshot, monitor state, continuity, initialization job, workspace notes, source health, workflow data, metrics, and event history.
+5. If a project path moves or disappears, use the relink flow to point the existing project record at the new path.
 
-| 变量 | 默认值 | 说明 |
+The dashboard keeps the last known good project information in the registry, so path loss does not erase the project from the inventory.
+
+## Browser Routes
+
+| Route | Purpose |
+| --- | --- |
+| `/lazy` | Welcome page |
+| `/lazy/all` | Project overview |
+| `/lazy/<projectId>` | Project detail |
+
+The server returns the React shell for deep links, so refreshes and direct project URLs work.
+
+The `/lazy` base path is intentional: the dashboard is for avoiding manual status checks by letting automated monitoring keep watch.
+
+## Configuration
+
+| Variable | Default | Purpose |
 | --- | --- | --- |
-| `HOST` | `127.0.0.1` | 服务监听地址 |
-| `PORT` | `3000` | 服务监听端口 |
-| `GSD_WEB_HOME` | `~/.gsd-web` | gsd-web 运行时目录 |
-| `GSD_WEB_DATABASE_PATH` | `~/.gsd-web/data/gsd-web.sqlite` | 项目注册表 SQLite 路径 |
-| `GSD_WEB_LOG_DIR` | `~/.gsd-web/logs` | 默认日志目录 |
-| `GSD_WEB_LOG_FILE` | `~/.gsd-web/logs/gsd-web.log` | Fastify/Pino JSONL 日志文件 |
-| `GSD_WEB_LOG_LEVEL` | `info` | 服务日志等级 |
-| `GSD_WEB_CLIENT_DIST_DIR` | 包内 `dist/web` | 前端静态资源目录 |
-| `GSD_BIN_PATH` | `gsd` | `/gsd init` 驱动使用的 GSD 可执行文件 |
+| `HOST` | `127.0.0.1` | HTTP listen host |
+| `PORT` | `3000` | HTTP listen port |
+| `GSD_WEB_HOME` | `~/.gsd-web` | Runtime home |
+| `GSD_WEB_DATABASE_PATH` | `~/.gsd-web/data/gsd-web.sqlite` | Registry database |
+| `GSD_WEB_LOG_DIR` | `~/.gsd-web/logs` | Log directory |
+| `GSD_WEB_LOG_FILE` | `~/.gsd-web/logs/gsd-web.log` | JSONL service log |
+| `GSD_WEB_LOG_LEVEL` | `info` | Service log level |
+| `GSD_WEB_CLIENT_DIST_DIR` | packaged browser build | Static frontend directory |
+| `GSD_BIN_PATH` | `gsd` | Executable used by the init runner |
 
-示例：
+Example:
 
 ```bash
 PORT=3001 GSD_BIN_PATH=/path/to/gsd gsd-web
 ```
 
-默认数据库路径：
+## Architecture
 
-```text
-~/.gsd-web/data/gsd-web.sqlite
-```
+The code is split into a few layers:
 
-默认服务日志路径：
+- **HTTP service**: creates the Fastify app, serves static frontend assets, exposes health checks, and wires routes.
+- **Registry database**: owns SQLite persistence for projects, snapshots, monitor state, init jobs, and timeline entries.
+- **Snapshot reader**: inspects GSD workspace artifacts without mutating the project directory.
+- **Reconciler and monitor**: refresh project records, detect path continuity changes, and publish timeline events.
+- **Project routes**: handle registration, refresh, relink, initialization, timeline reads, and directory browsing.
+- **Shared contracts**: define the server-to-browser response and event shapes.
+- **Browser app model**: validates API responses, formats state, derives portfolio summaries, and calculates workflow metrics.
+- **Browser components**: render the application shell and reusable workflow visualizations.
 
-```text
-~/.gsd-web/logs/gsd-web.log
-```
+This keeps IO, persistence, contracts, derived view data, and UI rendering separate enough that a contributor can change one layer without rewriting the others.
 
-默认前端静态资源目录：
+## API
 
-```text
-<npm package>/dist/web
-```
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/health` | Service health and schema version |
+| `GET` | `/api/projects` | Registered project inventory |
+| `POST` | `/api/projects/register` | Register a local project path |
+| `GET` | `/api/projects/<projectId>` | Project detail with recent timeline |
+| `GET` | `/api/projects/<projectId>/timeline` | Project timeline |
+| `POST` | `/api/projects/<projectId>/refresh` | Force a snapshot refresh |
+| `POST` | `/api/projects/<projectId>/init` | Start supported GSD initialization |
+| `POST` | `/api/projects/<projectId>/relink` | Attach a lost project record to a new path |
+| `GET` | `/api/filesystem/directories` | Browse server-side directories for registration |
+| `GET` | `/api/events` | Server-Sent Events stream |
 
-## API 参考
-
-健康检查：
-
-```bash
-curl http://127.0.0.1:3000/api/health
-```
-
-项目清单：
-
-```bash
-curl http://127.0.0.1:3000/api/projects
-```
-
-登记项目：
+Example registration:
 
 ```bash
 curl -X POST http://127.0.0.1:3000/api/projects/register \
@@ -173,67 +135,48 @@ curl -X POST http://127.0.0.1:3000/api/projects/register \
   -d '{"path":"/absolute/path/to/project"}'
 ```
 
-项目详情：
-
-```bash
-curl http://127.0.0.1:3000/api/projects/<projectId>
-```
-
-刷新项目：
-
-```bash
-curl -X POST http://127.0.0.1:3000/api/projects/<projectId>/refresh
-```
-
-初始化项目：
-
-```bash
-curl -X POST http://127.0.0.1:3000/api/projects/<projectId>/init
-```
-
-重连项目路径：
-
-```bash
-curl -X POST http://127.0.0.1:3000/api/projects/<projectId>/relink \
-  -H 'content-type: application/json' \
-  -d '{"path":"/absolute/path/to/moved/project"}'
-```
-
-事件流：
+Example event stream:
 
 ```bash
 curl -N http://127.0.0.1:3000/api/events
 ```
 
-## 快照判定
+## Snapshot Model
 
-项目没有 `.gsd` 目录时，快照状态为 `uninitialized`。
+A project without a `.gsd` directory is `uninitialized`.
 
-项目存在 `.gsd` 目录时，服务会检查以下来源：
+A project with complete and readable GSD bootstrap data is `initialized`.
 
-- `.gsd-id`
-- `.gsd/PROJECT.md`
-- `.gsd/repo-meta.json`
-- `.gsd/auto.lock`
-- `.gsd/STATE.md`
-- `.gsd/gsd.db`
+A project with missing, unreadable, or malformed GSD data is `degraded`. The snapshot includes warnings for each affected source so the UI can show what needs attention.
 
-所有来源可读且格式符合预期时，状态为 `initialized`。如果存在缺失、不可读或格式错误的来源，状态为 `degraded`，对应警告会显示在面板中。
+The reader checks directory presence, project identity, repository metadata, lock state, state notes, runtime metrics, and workflow database summaries where available.
 
-## 开发提示
+## Development
 
-- 后端入口：`src/server/index.ts`
-- Fastify app：`src/server/app.ts`
-- 项目 API：`src/server/routes/projects.ts`
-- SSE API：`src/server/routes/events.ts`
-- 前端入口：`src/web/App.tsx`
-- 前端样式：`src/web/styles.css`
-- 共享契约：`src/shared/contracts.ts`
-- i18n 文案：`src/web/i18n.ts`
-
-构建产物会写入：
-
-```text
-dist/web
-dist/server
+```bash
+npm run clean
+npm run build
+npm run build:web
+npm run build:server
+npm run dev
+npm test
+npm run test:e2e
 ```
+
+Before opening a pull request, run:
+
+```bash
+npm run build
+npm test
+npm run test:e2e
+```
+
+GitHub Actions runs the same build, integration test, and browser test checks on pushes and pull requests.
+
+## Contribution Notes
+
+- Keep server responses and browser parsers aligned with the shared contracts.
+- Prefer read-only project inspection unless a route explicitly performs a user-requested action.
+- Preserve existing project IDs during refresh and relink flows.
+- Add integration tests for server behavior and Playwright tests for user-visible workflows.
+- Keep browser view logic in derived model helpers when it is shared across panels.

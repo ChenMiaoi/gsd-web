@@ -271,7 +271,7 @@ test.describe('project initialization dashboard flow', () => {
     const projectPath = await createEmptyProject(harness.workspace.root, 'browser-init-success');
 
     try {
-      await page.goto(`${harness.baseUrl}/hello/all`);
+      await page.goto(`${harness.baseUrl}/lazy/all`);
 
       await page.getByLabel('Project path').fill(projectPath);
       await page.getByRole('button', { name: 'Register project' }).click();
@@ -315,7 +315,7 @@ test.describe('project initialization dashboard flow', () => {
         await route.abort('failed');
       });
 
-      await page.goto(`${harness.baseUrl}/hello/all`);
+      await page.goto(`${harness.baseUrl}/lazy/all`);
       await expect(page.getByTestId('stream-status')).toContainText('Disconnected');
 
       await page.getByLabel('Project path').fill(projectPath);
@@ -359,7 +359,7 @@ test.describe('project initialization dashboard flow', () => {
     const projectPath = await createEmptyProject(harness.workspace.root, 'browser-init-malformed');
 
     try {
-      await page.goto(`${harness.baseUrl}/hello/all`);
+      await page.goto(`${harness.baseUrl}/lazy/all`);
 
       await page.getByLabel('Project path').fill(projectPath);
       await page.getByRole('button', { name: 'Register project' }).click();
