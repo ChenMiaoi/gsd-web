@@ -11,6 +11,7 @@ import { startServer } from '../../src/server/index.js';
 import type { InitRunResult, RunOfficialInitOptions } from '../../src/server/init-jobs.js';
 import type { ProjectInitRunner } from '../../src/server/routes/projects.js';
 import { BOOTSTRAP_REQUIRED_ENTRIES } from '../../src/server/snapshots.js';
+import type { ProjectMutationResponse } from '../../src/shared/contracts.js';
 import {
   createBootstrapCompleteGsdDirectory,
   createEmptyProject,
@@ -47,6 +48,34 @@ function getBaseUrl(app: FastifyInstance) {
   }
 
   return `http://127.0.0.1:${address.port}`;
+}
+
+async function registerProject(baseUrl: string, projectPath: string): Promise<ProjectMutationResponse> {
+  const response = await fetch(`${baseUrl}/api/projects/register`, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      path: projectPath,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Expected project registration to succeed, got ${response.status}`);
+  }
+
+  return (await response.json()) as ProjectMutationResponse;
+}
+
+async function refreshProject(baseUrl: string, projectId: string) {
+  await fetch(`${baseUrl}/api/projects/${projectId}/refresh`, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+    },
+  });
 }
 
 function emitStage(
@@ -200,10 +229,9 @@ test.describe('project continuity dashboard flow', () => {
     let activeApp: FastifyInstance | null = harness.app;
 
     try {
-      await page.goto(`${harness.baseUrl}/hello/all`);
+      const registration = await registerProject(harness.baseUrl, sourceProjectPath);
 
-      await page.getByLabel('Project path').fill(sourceProjectPath);
-      await page.getByRole('button', { name: 'Register project' }).click();
+      await page.goto(`${harness.baseUrl}/hello/${registration.project.projectId}`);
 
       await expect(page.getByTestId('detail-status')).toContainText('Uninitialized');
       await page.getByTestId('init-action').click();
@@ -215,13 +243,14 @@ test.describe('project continuity dashboard flow', () => {
       expect(projectId).toBeTruthy();
 
       await moveProjectRoot(sourceProjectPath, movedProjectPath);
+      await refreshProject(harness.baseUrl, projectId!);
 
       await expect(page.getByTestId('detail-continuity-state')).toContainText('Path lost');
       await expect(page.getByTestId('detail-monitor-health')).toContainText('Read failed');
       await expect(page.getByTestId('continuity-path-lost-alert')).toContainText('preserving the last good snapshot');
       await expect(page.getByTestId('detail-project-id-value')).toHaveText(projectId!);
       await expect(page.getByTestId('init-history')).toContainText('Succeeded');
-      await expect(page.getByTestId('timeline-list')).toContainText('Path lost');
+      await expect(page.getByTestId('project-event-list')).toContainText('Path lost');
 
       const port = Number.parseInt(new URL(harness.baseUrl).port, 10);
       await activeApp.close();
@@ -245,7 +274,7 @@ test.describe('project continuity dashboard flow', () => {
       await expect(page.getByTestId('detail-continuity-state')).toContainText('Path lost');
       await expect(page.getByTestId('continuity-path-lost-alert')).toContainText('preserving the last good snapshot');
       await expect(page.getByTestId('init-stage-banner')).toContainText('Succeeded');
-      await expect(page.getByTestId('timeline-list')).toContainText('Path lost');
+      await expect(page.getByTestId('project-event-list')).toContainText('Path lost');
 
       await page.getByTestId('relink-path-input').fill(movedProjectPath);
       await page.getByRole('button', { name: 'Relink project' }).click();
@@ -256,8 +285,8 @@ test.describe('project continuity dashboard flow', () => {
       await expect(page.getByTestId('detail-continuity-state')).toContainText('Tracked');
       await expect(page.getByTestId('continuity-relinked-note')).toContainText(projectId!);
       await expect(page.getByTestId('init-history')).toContainText('Succeeded');
-      await expect(page.getByTestId('timeline-list')).toContainText('Relinked');
-      await expect(page.getByTestId('timeline-list')).toContainText('Recovered');
+      await expect(page.getByTestId('project-event-list')).toContainText('Relinked');
+      await expect(page.getByTestId('project-event-list')).toContainText('Recovered');
     } finally {
       await harness.cleanup(activeApp);
     }
@@ -271,19 +300,19 @@ test.describe('project continuity dashboard flow', () => {
     let activeApp: FastifyInstance | null = harness.app;
 
     try {
-      await page.goto(`${harness.baseUrl}/hello/all`);
+      const registration = await registerProject(harness.baseUrl, projectPath);
 
-      await page.getByLabel('Project path').fill(projectPath);
-      await page.getByRole('button', { name: 'Register project' }).click();
+      await page.goto(`${harness.baseUrl}/hello/${registration.project.projectId}`);
 
       const projectId = (await page.getByTestId('detail-project-id-value').textContent())?.trim();
       expect(projectId).toBeTruthy();
 
       await moveProjectRoot(projectPath, movedProjectPath);
+      await refreshProject(harness.baseUrl, projectId!);
 
       await expect(page.getByTestId('detail-continuity-state')).toContainText('Path lost');
       await expect(page.getByTestId('detail-project-id-value')).toHaveText(projectId!);
-      await expect(page.getByTestId('timeline-list')).toContainText('Path lost');
+      await expect(page.getByTestId('project-event-list')).toContainText('Path lost');
 
       await page.getByTestId('relink-path-input').fill(invalidRelinkPath);
       await page.getByRole('button', { name: 'Relink project' }).click();
@@ -291,8 +320,8 @@ test.describe('project continuity dashboard flow', () => {
       await expect(page.getByTestId('relink-error')).toContainText('Project path does not exist');
       await expect(page.getByTestId('detail-project-id-value')).toHaveText(projectId!);
       await expect(page.getByTestId('detail-continuity-state')).toContainText('Path lost');
-      await expect(page.getByTestId('timeline-list')).toContainText('Path lost');
-      await expect(page.getByTestId('timeline-list')).not.toContainText('Relinked');
+      await expect(page.getByTestId('project-event-list')).toContainText('Path lost');
+      await expect(page.getByTestId('project-event-list')).not.toContainText('Relinked');
     } finally {
       await harness.cleanup(activeApp);
     }

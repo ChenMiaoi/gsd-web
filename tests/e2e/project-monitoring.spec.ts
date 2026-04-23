@@ -9,7 +9,7 @@ import { test as base, expect } from '@playwright/test';
 import type { FastifyInstance } from 'fastify';
 
 import { startServer } from '../../src/server/index.js';
-import type { ProjectRecord, ProjectsResponse } from '../../src/shared/contracts.js';
+import type { ProjectMutationResponse, ProjectRecord, ProjectsResponse } from '../../src/shared/contracts.js';
 import {
   createInitializedProject,
   createTempWorkspace,
@@ -65,6 +65,25 @@ async function getProjectByCanonicalPath(baseUrl: string, canonicalPath: string)
   }
 
   return match;
+}
+
+async function registerProject(baseUrl: string, projectPath: string): Promise<ProjectMutationResponse> {
+  const response = await fetch(`${baseUrl}/api/projects/register`, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      path: projectPath,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Expected project registration to succeed, got ${response.status}`);
+  }
+
+  return (await response.json()) as ProjectMutationResponse;
 }
 
 async function waitForProject(
@@ -158,27 +177,26 @@ test.describe('project monitoring dashboard flow', () => {
       dirty: false,
     };
 
-    await page.goto(`${harness.baseUrl}/hello/all`);
+    const registration = await registerProject(harness.baseUrl, projectPath);
 
-    await page.getByLabel('Project path').fill(projectPath);
-    await page.getByRole('button', { name: 'Register project' }).click();
+    await page.goto(`${harness.baseUrl}/hello/${registration.project.projectId}`);
 
     await expect(page.getByTestId('detail-status')).toContainText('Initialized');
     await expect(page.getByTestId('detail-monitor-health')).toContainText('Healthy');
-    await expect(page.getByTestId('timeline-total')).toContainText('1 entry');
-    await expect(page.getByTestId('timeline-list')).toContainText('Registered');
+    await expect(page.getByTestId('project-event-total')).toContainText('1 entry');
+    await expect(page.getByTestId('project-event-list')).toContainText('Registered');
 
     await writeRepoMeta(projectPath, '{"currentBranch":');
 
     await expect(page.getByTestId('detail-status')).toContainText('Degraded');
     await expect(page.getByTestId('detail-monitor-health')).toContainText('Degraded');
-    await expect(page.getByTestId('timeline-list')).toContainText('Monitor observed a degraded snapshot');
+    await expect(page.getByTestId('project-event-list')).toContainText('Monitor observed a degraded snapshot');
 
     await writeRepoMeta(projectPath, `${JSON.stringify(healthyRepoMeta, null, 2)}\n`);
 
     await expect(page.getByTestId('detail-status')).toContainText('Initialized');
     await expect(page.getByTestId('detail-monitor-health')).toContainText('Healthy');
-    await expect(page.getByTestId('timeline-list')).toContainText('Monitor recovered');
+    await expect(page.getByTestId('project-event-list')).toContainText('Monitor recovered');
 
     const dbLock = lockDatabase(path.join(projectPath, '.gsd', 'gsd.db'));
 
@@ -186,7 +204,7 @@ test.describe('project monitoring dashboard flow', () => {
       await expect(page.getByTestId('detail-status')).toContainText('Initialized');
       await expect(page.getByTestId('detail-monitor-health')).toContainText('Read failed');
       await expect(page.getByTestId('monitor-last-error')).toContainText('gsdDb');
-      await expect(page.getByTestId('timeline-list')).toContainText('Monitor could not read current project truth');
+      await expect(page.getByTestId('project-event-list')).toContainText('Monitor could not read current project truth');
     } finally {
       await dbLock.release();
     }
@@ -199,31 +217,28 @@ test.describe('project monitoring dashboard flow', () => {
 
     await expect(page.getByTestId('detail-status')).toContainText('Initialized');
     await expect(page.getByTestId('detail-monitor-health')).toContainText('Healthy');
-    await expect(page.getByTestId('timeline-list')).toContainText('Monitor recovered');
+    await expect(page.getByTestId('project-event-list')).toContainText('Monitor recovered');
 
     await page.reload();
 
     await expect(page.getByTestId('detail-status')).toContainText('Initialized');
     await expect(page.getByTestId('detail-monitor-health')).toContainText('Healthy');
-    await expect(page.getByTestId('timeline-list')).toContainText('Monitor could not read current project truth');
-    await expect(page.getByTestId('timeline-list')).toContainText('Monitor recovered');
+    await expect(page.getByTestId('project-event-list')).toContainText('Monitor could not read current project truth');
+    await expect(page.getByTestId('project-event-list')).toContainText('Monitor recovered');
   });
 
   test('resyncs inventory, detail, and timeline after EventSource reconnect without manual refresh', async ({ page, harness }) => {
     const projectPath = await createInitializedProject(harness.workspace.root, 'browser-monitor-reconnect');
 
-    await page.goto(`${harness.baseUrl}/hello/all`);
+    const registration = await registerProject(harness.baseUrl, projectPath);
 
-    await page.getByLabel('Project path').fill(projectPath);
-    await page.getByRole('button', { name: 'Register project' }).click();
-
-    await expect(page.getByTestId('inventory-count')).toContainText('1 project');
+    await page.goto(`${harness.baseUrl}/hello/${registration.project.projectId}`);
 
     const project = await getProjectByCanonicalPath(harness.baseUrl, projectPath);
 
     await expect(page.getByTestId('detail-status')).toContainText('Initialized');
     await expect(page.getByTestId('detail-monitor-health')).toContainText('Healthy');
-    await expect(page.getByTestId('timeline-total')).toContainText('1 entry');
+    await expect(page.getByTestId('project-event-total')).toContainText('1 entry');
 
     const port = Number.parseInt(new URL(harness.baseUrl).port, 10);
 
@@ -289,10 +304,10 @@ test.describe('project monitoring dashboard flow', () => {
 
       await expect(page.getByTestId('stream-status')).toContainText('Connected');
       await expect(page.getByTestId('stream-resync-status')).toContainText('resynced inventory, detail, and timeline');
-      await expect(page.getByTestId(`project-card-${project.projectId}`)).toContainText('Browser Monitor Renamed');
+      await expect(page.getByTestId('app-topbar-marquee-heading')).toContainText('Browser Monitor Renamed');
       await expect(page.getByTestId('repo-meta-section')).toContainText('offline-branch');
-      await expect(page.getByTestId('timeline-total')).toContainText('2 entries');
-      await expect(page.getByTestId('timeline-list')).toContainText('Refreshed');
+      await expect(page.getByTestId('project-event-total')).toContainText('2 entries');
+      await expect(page.getByTestId('project-event-list')).toContainText('Refreshed');
     } finally {
       await restartedApp.close().catch(() => undefined);
     }

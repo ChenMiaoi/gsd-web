@@ -1,4 +1,12 @@
-import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from 'react';
+import {
+  type KeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  type WheelEvent as ReactWheelEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
 
 import {
   PROJECT_CONTINUITY_STATES,
@@ -121,6 +129,19 @@ type ExecutionAggregate = {
   lastFinishedAtMs: number | null;
 };
 
+type TaskTimelineEntry = {
+  key: string;
+  path: string;
+  milestoneId: string;
+  sliceId: string;
+  task: GsdDbTaskSummary;
+  order: number;
+  startedAtMs: number | null;
+  finishedAtMs: number | null;
+  actualDurationMs: number | null;
+  estimatedRemainingMs: number | null;
+};
+
 type ModelUsageSummary = ExecutionAggregate & {
   model: string;
   totalTokens: number;
@@ -194,12 +215,21 @@ const WORKFLOW_TABS: readonly WorkflowTab[] = [
 ];
 
 const REQUEST_TIMEOUT_MS = 8_000;
+const INVENTORY_AUTO_REFRESH_MS = 5_000;
 const INIT_TERMINAL_FAILURE_STAGES: ReadonlySet<ProjectInitJobStage> = new Set([
   'failed',
   'timed_out',
   'cancelled',
 ]);
 const WARNING_TEXT_LIMIT = 240;
+const WORKFLOW_GRAPH_BASE_WIDTH = 860;
+const WORKFLOW_GRAPH_BASE_HEIGHT = 252;
+const WORKFLOW_GRAPH_ROW_HEIGHT = 72;
+const WORKFLOW_GRAPH_MIN_ZOOM = 0.75;
+const WORKFLOW_GRAPH_MAX_ZOOM = 1.6;
+const WORKFLOW_GRAPH_ZOOM_STEP = 0.15;
+const RUNTIME_CHART_WIDTH = 420;
+const RUNTIME_CHART_HEIGHT = 140;
 const KNOWN_EVENT_TYPES: ReadonlySet<KnownEventType> = new Set([
   'service.ready',
   'project.registered',
@@ -2267,6 +2297,71 @@ function getTaskDisplayDuration(
   return getDisplayDuration(taskStats.get(workflowTaskKey(milestoneId, sliceId, task.id)), task);
 }
 
+function getDisplayStartedAt(
+  aggregate: ExecutionAggregate | undefined,
+  entity: {
+    startedAt: string | number | null;
+  },
+) {
+  return aggregate?.firstStartedAtMs ?? normalizeWorkflowTimestamp(entity.startedAt);
+}
+
+function getDisplayFinishedAt(
+  aggregate: ExecutionAggregate | undefined,
+  entity: {
+    finishedAt: string | number | null;
+  },
+) {
+  return aggregate?.lastFinishedAtMs ?? normalizeWorkflowTimestamp(entity.finishedAt);
+}
+
+function buildTaskTimelineEntries(
+  milestones: GsdDbMilestoneSummary[],
+  executionStats: WorkflowExecutionStats,
+): TaskTimelineEntry[] {
+  const entries: TaskTimelineEntry[] = [];
+  let order = 0;
+
+  for (const milestone of milestones) {
+    for (const slice of milestone.slices) {
+      for (const task of slice.tasks) {
+        const key = workflowTaskKey(milestone.id, slice.id, task.id);
+        const aggregate = executionStats.taskStats.get(key);
+
+        entries.push({
+          key,
+          path: key,
+          milestoneId: milestone.id,
+          sliceId: slice.id,
+          task,
+          order,
+          startedAtMs: getDisplayStartedAt(aggregate, task),
+          finishedAtMs: getDisplayFinishedAt(aggregate, task),
+          actualDurationMs: getTaskDisplayDuration(executionStats.taskStats, milestone.id, slice.id, task),
+          estimatedRemainingMs: executionStats.taskEstimatedRemainingMs.get(key) ?? null,
+        });
+        order += 1;
+      }
+    }
+  }
+
+  return entries.sort((first, second) => {
+    if (first.startedAtMs !== null && second.startedAtMs !== null && first.startedAtMs !== second.startedAtMs) {
+      return first.startedAtMs - second.startedAtMs;
+    }
+
+    if (first.startedAtMs !== null && second.startedAtMs === null) {
+      return -1;
+    }
+
+    if (first.startedAtMs === null && second.startedAtMs !== null) {
+      return 1;
+    }
+
+    return first.order - second.order;
+  });
+}
+
 function getSliceTaskDurationTotal(
   taskStats: Map<string, ExecutionAggregate>,
   milestoneId: string,
@@ -2420,6 +2515,417 @@ function getMilestoneProgress(milestone: GsdDbMilestoneSummary) {
     completed: milestone.completedTaskCount,
     total: milestone.taskCount,
   };
+}
+
+function getMilestoneProgressPercent(milestone: GsdDbMilestoneSummary) {
+  const milestoneProgress = getMilestoneProgress(milestone);
+
+  if (milestoneProgress.total === 0) {
+    return isMilestoneEffectivelyComplete(milestone) ? 100 : 0;
+  }
+
+  return Math.max(0, Math.min(100, Math.round((milestoneProgress.completed / milestoneProgress.total) * 100)));
+}
+
+function getSliceProgressPercent(slice: GsdDbSliceSummary) {
+  if (slice.taskCount > 0) {
+    return Math.max(0, Math.min(100, Math.round((slice.completedTaskCount / slice.taskCount) * 100)));
+  }
+
+  if (isWorkflowStatusComplete(slice.status)) {
+    return 100;
+  }
+
+  if (isWorkflowStatusActive(slice.status)) {
+    return 56;
+  }
+
+  if (isWorkflowStatusBlocked(slice.status)) {
+    return 18;
+  }
+
+  return 6;
+}
+
+function getWorkflowFocus(
+  milestones: GsdDbMilestoneSummary[],
+  activeMilestoneId: string | null,
+  activeSliceId: string | null,
+  activeTask: GsdDbTaskSummary | null,
+) {
+  const focusedMilestone = milestones.find((milestone) => milestone.id === activeMilestoneId) ?? milestones[0] ?? null;
+  const focusedSlice =
+    focusedMilestone === null
+      ? null
+      : (
+        focusedMilestone.id === activeMilestoneId
+          ? focusedMilestone.slices.find((slice) => slice.id === activeSliceId) ?? findActiveSlice(focusedMilestone)
+          : findActiveSlice(focusedMilestone)
+      );
+  const focusedTask =
+    focusedMilestone !== null
+      && focusedSlice !== null
+      && focusedMilestone.id === activeMilestoneId
+      && focusedSlice.id === activeSliceId
+      ? activeTask
+      : findActiveTask(focusedSlice);
+
+  return {
+    focusedMilestone,
+    focusedSlice,
+    focusedTask,
+  };
+}
+
+function clampRecentUnits(units: ExecutionUnitView[], limit: number = 10) {
+  return units.slice(Math.max(0, units.length - limit));
+}
+
+type SparklinePoint = {
+  x: number;
+  y: number;
+  value: number;
+};
+
+type DragScrollPointerState = {
+  pointerId: number;
+  clientX: number;
+  clientY: number;
+  scrollLeft: number;
+  scrollTop: number;
+};
+
+type DragScrollViewportOptions = {
+  contentWidth: number;
+  contentHeight: number;
+  initialZoom?: number;
+  minZoom?: number;
+  maxZoom?: number;
+  zoomStep?: number;
+  lockVertical?: boolean;
+  translateWheelToHorizontal?: boolean;
+};
+
+type WorkflowGraphConnector = {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+};
+
+function buildSparklinePoints(values: number[], width: number, height: number) {
+  const series = values.length > 0 ? values : [0];
+  const max = Math.max(...series);
+  const min = Math.min(...series);
+  const range = max - min === 0 ? 1 : max - min;
+
+  return series
+    .map((value, index) => {
+      const x = series.length === 1 ? width / 2 : (index / (series.length - 1)) * width;
+      const y = height - ((value - min) / range) * height;
+
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    })
+    .join(' ');
+}
+
+function buildSparklineSeries(values: number[], width: number, height: number) {
+  const series = values.length > 0 ? values : [0];
+  const max = Math.max(...series);
+  const min = Math.min(...series);
+  const range = max - min === 0 ? 1 : max - min;
+
+  const points = series.map((value, index) => ({
+    x: series.length === 1 ? width / 2 : (index / (series.length - 1)) * width,
+    y: height - ((value - min) / range) * height,
+    value,
+  }));
+
+  return {
+    min,
+    max,
+    points,
+  };
+}
+
+function buildSparklineAreaPoints(points: SparklinePoint[], height: number) {
+  if (points.length === 0) {
+    return '';
+  }
+
+  const firstPoint = points[0]!;
+  const lastPoint = points[points.length - 1]!;
+
+  return [
+    `${firstPoint.x.toFixed(2)},${height.toFixed(2)}`,
+    ...points.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`),
+    `${lastPoint.x.toFixed(2)},${height.toFixed(2)}`,
+  ].join(' ');
+}
+
+function clampWorkflowGraphZoom(value: number) {
+  return Math.max(
+    WORKFLOW_GRAPH_MIN_ZOOM,
+    Math.min(WORKFLOW_GRAPH_MAX_ZOOM, Math.round(value * 100) / 100),
+  );
+}
+
+function buildWorkflowGraphConnectorPath(connector: WorkflowGraphConnector) {
+  const curve = Math.max(20, Math.abs(connector.x2 - connector.x1) * 0.38);
+
+  return [
+    `M ${connector.x1.toFixed(2)} ${connector.y1.toFixed(2)}`,
+    `C ${(connector.x1 + curve).toFixed(2)} ${connector.y1.toFixed(2)}`,
+    `${(connector.x2 - curve).toFixed(2)} ${connector.y2.toFixed(2)}`,
+    `${connector.x2.toFixed(2)} ${connector.y2.toFixed(2)}`,
+  ].join(' ');
+}
+
+function useDragScrollViewport({
+  contentWidth,
+  contentHeight,
+  initialZoom = 1,
+  minZoom = 1,
+  maxZoom = 1,
+  zoomStep = WORKFLOW_GRAPH_ZOOM_STEP,
+  lockVertical = false,
+  translateWheelToHorizontal = false,
+}: DragScrollViewportOptions) {
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const dragStateRef = useRef<DragScrollPointerState | null>(null);
+  const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
+  const [zoom, setZoom] = useState(() => {
+    const normalizedZoom = Math.round(initialZoom * 100) / 100;
+    return Math.max(minZoom, Math.min(maxZoom, normalizedZoom));
+  });
+  const [isDragging, setIsDragging] = useState(false);
+  const canZoom = maxZoom > minZoom;
+  const scaledWidth = contentWidth * zoom;
+  const scaledHeight = contentHeight * zoom;
+  const canPanX = scaledWidth > viewportSize.width + 1;
+  const canPanY = !lockVertical && scaledHeight > viewportSize.height + 1;
+  const canPan = canPanX || canPanY;
+  const clampZoom = useCallback(
+    (value: number) => {
+      const normalizedZoom = Math.round(value * 100) / 100;
+      return Math.max(minZoom, Math.min(maxZoom, normalizedZoom));
+    },
+    [maxZoom, minZoom],
+  );
+
+  useEffect(() => {
+    setZoom((currentZoom) => clampZoom(currentZoom));
+  }, [clampZoom]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+
+    if (!viewport) {
+      return undefined;
+    }
+
+    const updateViewportSize = () => {
+      setViewportSize({
+        width: viewport.clientWidth,
+        height: viewport.clientHeight,
+      });
+    };
+
+    updateViewportSize();
+
+    if (typeof ResizeObserver === 'undefined') {
+      return undefined;
+    }
+
+    const observer = new ResizeObserver(() => {
+      updateViewportSize();
+    });
+
+    observer.observe(viewport);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+
+    if (!viewport) {
+      return;
+    }
+
+    const maxScrollLeft = Math.max(0, scaledWidth - viewport.clientWidth);
+    const maxScrollTop = Math.max(0, scaledHeight - viewport.clientHeight);
+
+    viewport.scrollLeft = Math.min(viewport.scrollLeft, maxScrollLeft);
+    viewport.scrollTop = Math.min(viewport.scrollTop, maxScrollTop);
+  }, [scaledHeight, scaledWidth, viewportSize.height, viewportSize.width]);
+
+  const finishDrag = useCallback((pointerId?: number) => {
+    const viewport = viewportRef.current;
+
+    if (viewport && pointerId !== undefined && viewport.hasPointerCapture(pointerId)) {
+      viewport.releasePointerCapture(pointerId);
+    }
+
+    dragStateRef.current = null;
+    setIsDragging(false);
+  }, []);
+
+  const updateZoom = useCallback(
+    (nextZoom: number, origin?: { x: number; y: number }) => {
+      if (!canZoom) {
+        return;
+      }
+
+      const viewport = viewportRef.current;
+
+      if (!viewport) {
+        setZoom(clampZoom(nextZoom));
+        return;
+      }
+
+      setZoom((currentZoom) => {
+        const clampedZoom = clampZoom(nextZoom);
+
+        if (clampedZoom === currentZoom) {
+          return currentZoom;
+        }
+
+        const focusX = origin?.x ?? viewport.clientWidth / 2;
+        const focusY = origin?.y ?? viewport.clientHeight / 2;
+        const logicalX = (viewport.scrollLeft + focusX) / currentZoom;
+        const logicalY = (viewport.scrollTop + focusY) / currentZoom;
+
+        requestAnimationFrame(() => {
+          const maxScrollLeft = Math.max(0, contentWidth * clampedZoom - viewport.clientWidth);
+          const maxScrollTop = Math.max(0, contentHeight * clampedZoom - viewport.clientHeight);
+
+          viewport.scrollLeft = Math.min(maxScrollLeft, Math.max(0, logicalX * clampedZoom - focusX));
+          viewport.scrollTop = Math.min(maxScrollTop, Math.max(0, logicalY * clampedZoom - focusY));
+        });
+
+        return clampedZoom;
+      });
+    },
+    [canZoom, clampZoom, contentHeight, contentWidth],
+  );
+
+  const handlePointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0 || !canPan) {
+        return;
+      }
+
+      const viewport = viewportRef.current;
+
+      if (!viewport) {
+        return;
+      }
+
+      dragStateRef.current = {
+        pointerId: event.pointerId,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        scrollLeft: viewport.scrollLeft,
+        scrollTop: viewport.scrollTop,
+      };
+
+      viewport.setPointerCapture(event.pointerId);
+      setIsDragging(true);
+      event.preventDefault();
+    },
+    [canPan],
+  );
+
+  const handlePointerMove = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      const dragState = dragStateRef.current;
+      const viewport = viewportRef.current;
+
+      if (!dragState || dragState.pointerId !== event.pointerId || !viewport) {
+        return;
+      }
+
+      viewport.scrollLeft = dragState.scrollLeft - (event.clientX - dragState.clientX);
+
+      if (!lockVertical) {
+        viewport.scrollTop = dragState.scrollTop - (event.clientY - dragState.clientY);
+      }
+
+      event.preventDefault();
+    },
+    [lockVertical],
+  );
+
+  const handlePointerUp = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (dragStateRef.current?.pointerId === event.pointerId) {
+        finishDrag(event.pointerId);
+      }
+    },
+    [finishDrag],
+  );
+
+  const handleWheel = useCallback(
+    (event: ReactWheelEvent<HTMLDivElement>) => {
+      const viewport = viewportRef.current;
+
+      if (!viewport) {
+        return;
+      }
+
+      if (canZoom && (event.ctrlKey || event.metaKey)) {
+        const rect = viewport.getBoundingClientRect();
+        const zoomDelta = event.deltaY < 0 ? zoomStep : -zoomStep;
+
+        event.preventDefault();
+        updateZoom(zoom + zoomDelta, {
+          x: event.clientX - rect.left,
+          y: event.clientY - rect.top,
+        });
+        return;
+      }
+
+      if (translateWheelToHorizontal && canPanX && Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
+        viewport.scrollLeft += event.deltaY;
+        event.preventDefault();
+      }
+    },
+    [canPanX, canZoom, translateWheelToHorizontal, updateZoom, zoom, zoomStep],
+  );
+
+  return {
+    viewportRef,
+    zoom,
+    zoomPercentage: Math.round(zoom * 100),
+    canZoom,
+    canPan,
+    canPanX,
+    canPanY,
+    isDragging,
+    handlePointerDown,
+    handlePointerMove,
+    handlePointerUp,
+    handlePointerCancel: handlePointerUp,
+    handleWheel,
+    zoomIn: () => {
+      updateZoom(zoom + zoomStep);
+    },
+    zoomOut: () => {
+      updateZoom(zoom - zoomStep);
+    },
+    resetZoom: () => {
+      updateZoom(1);
+    },
+  };
+}
+
+function getExecutionUnitLabel(unit: ExecutionUnitView, index: number) {
+  const raw = unit.taskId ?? unit.sliceId ?? unit.id ?? unit.type ?? `U${index + 1}`;
+
+  return raw.length > 14 ? `${raw.slice(0, 14)}…` : raw;
 }
 
 function isMilestoneEffectivelyComplete(milestone: GsdDbMilestoneSummary) {
@@ -2593,16 +3099,16 @@ function describeProjectCurrentStage(
   const activeSlice = findActiveSlice(activeMilestone);
   const activeTask = findActiveTask(activeSlice);
 
-  if (activeTask && activeSlice) {
-    return `${activeSlice.id}/${activeTask.id}: ${taskTitle(activeTask)}`;
+  if (activeTask && activeSlice && activeMilestone) {
+    return `${activeMilestone.id}/${activeSlice.id}/${activeTask.id}`;
   }
 
-  if (activeSlice) {
-    return `${activeSlice.id}: ${sentenceCaseTitle(sliceTitle(activeSlice))}`;
+  if (activeSlice && activeMilestone) {
+    return `${activeMilestone.id}/${activeSlice.id}`;
   }
 
   if (activeMilestone) {
-    return `${activeMilestone.id}: ${milestoneTitle(activeMilestone)}`;
+    return activeMilestone.id;
   }
 
   return getProjectWorkflowPhase(project, copy);
@@ -2805,82 +3311,749 @@ function FolderIcon() {
   );
 }
 
+function ZoomInIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <circle cx="9" cy="9" r="5.5" />
+      <path d="M9 6.5v5" />
+      <path d="M6.5 9h5" />
+      <path d="m13.2 13.2 3.3 3.3" />
+    </svg>
+  );
+}
+
+function ZoomOutIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <circle cx="9" cy="9" r="5.5" />
+      <path d="M6.5 9h5" />
+      <path d="m13.2 13.2 3.3 3.3" />
+    </svg>
+  );
+}
+
+function ResetZoomIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <path d="M4.5 10a5.5 5.5 0 1 0 2-4.2" />
+      <path d="M4 4.5v3.8h3.8" />
+      <path d="M10 7.3v2.6" />
+      <path d="M8.7 8.6h2.6" />
+    </svg>
+  );
+}
+
+function WorkflowGraphPanel({
+  milestones,
+  dependencies,
+  activeMilestoneId,
+  activeSliceId,
+  activeTask,
+  copy,
+}: {
+  milestones: GsdDbMilestoneSummary[];
+  dependencies: SliceDependencyView[];
+  activeMilestoneId: string | null;
+  activeSliceId: string | null;
+  activeTask: GsdDbTaskSummary | null;
+  copy: UiCopy;
+}) {
+  const { focusedMilestone, focusedSlice, focusedTask } = getWorkflowFocus(
+    milestones,
+    activeMilestoneId,
+    activeSliceId,
+    activeTask,
+  );
+  const visibleMilestones = milestones;
+  const visibleSlices = focusedMilestone?.slices ?? [];
+  const visibleTasks = focusedSlice?.tasks ?? [];
+  const activePath = [focusedMilestone?.id, focusedSlice?.id, focusedTask?.id]
+    .filter((segment): segment is string => Boolean(segment))
+    .join(' -> ');
+  const visibleDependencies =
+    focusedMilestone === null
+      ? dependencies
+      : dependencies.filter((dependency) => dependency.milestoneId === focusedMilestone.id);
+  const graphHeight = Math.max(
+    WORKFLOW_GRAPH_BASE_HEIGHT,
+    Math.max(visibleMilestones.length, visibleSlices.length, visibleTasks.length, 3) * WORKFLOW_GRAPH_ROW_HEIGHT,
+  );
+  const graphCanvasRef = useRef<HTMLDivElement | null>(null);
+  const activeMilestoneNodeRef = useRef<HTMLLIElement | null>(null);
+  const activeSliceNodeRef = useRef<HTMLLIElement | null>(null);
+  const activeTaskNodeRef = useRef<HTMLLIElement | null>(null);
+  const [connectors, setConnectors] = useState<{
+    milestoneToSlice: WorkflowGraphConnector | null;
+    sliceToTask: WorkflowGraphConnector | null;
+  }>({
+    milestoneToSlice: null,
+    sliceToTask: null,
+  });
+  const setActiveMilestoneNodeRef = useCallback((node: HTMLLIElement | null) => {
+    activeMilestoneNodeRef.current = node;
+  }, []);
+  const setActiveSliceNodeRef = useCallback((node: HTMLLIElement | null) => {
+    activeSliceNodeRef.current = node;
+  }, []);
+  const setActiveTaskNodeRef = useCallback((node: HTMLLIElement | null) => {
+    activeTaskNodeRef.current = node;
+  }, []);
+  const graphViewport = useDragScrollViewport({
+    contentWidth: WORKFLOW_GRAPH_BASE_WIDTH,
+    contentHeight: graphHeight,
+    initialZoom: 1,
+    minZoom: WORKFLOW_GRAPH_MIN_ZOOM,
+    maxZoom: WORKFLOW_GRAPH_MAX_ZOOM,
+    zoomStep: WORKFLOW_GRAPH_ZOOM_STEP,
+  });
+  const graphWidth = WORKFLOW_GRAPH_BASE_WIDTH * graphViewport.zoom;
+  const graphScaledHeight = graphHeight * graphViewport.zoom;
+
+  useEffect(() => {
+    const canvas = graphCanvasRef.current;
+
+    if (!canvas) {
+      return undefined;
+    }
+
+    const measureConnectors = () => {
+      const canvasRect = canvas.getBoundingClientRect();
+      const measure = (from: HTMLElement | null, to: HTMLElement | null) => {
+        if (!from || !to) {
+          return null;
+        }
+
+        const fromRect = from.getBoundingClientRect();
+        const toRect = to.getBoundingClientRect();
+
+        return {
+          x1: fromRect.right - canvasRect.left,
+          y1: fromRect.top - canvasRect.top + fromRect.height / 2,
+          x2: toRect.left - canvasRect.left,
+          y2: toRect.top - canvasRect.top + toRect.height / 2,
+        };
+      };
+
+      setConnectors({
+        milestoneToSlice: measure(activeMilestoneNodeRef.current, activeSliceNodeRef.current),
+        sliceToTask:
+          focusedTask !== null
+            ? measure(activeSliceNodeRef.current, activeTaskNodeRef.current)
+            : null,
+      });
+    };
+
+    const frameId = window.requestAnimationFrame(() => {
+      measureConnectors();
+    });
+    const handleResize = () => {
+      measureConnectors();
+    };
+
+    window.addEventListener('resize', handleResize);
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      window.removeEventListener('resize', handleResize);
+    };
+  }, [
+    focusedMilestone?.id,
+    focusedSlice?.id,
+    focusedTask?.id,
+    graphHeight,
+    graphViewport.zoom,
+    visibleMilestones.length,
+    visibleSlices.length,
+    visibleTasks.length,
+  ]);
+
+  return (
+    <section className="dashboard-panel workflow-graph-panel" data-testid="workflow-graph-panel">
+      <div className="dashboard-panel__header dashboard-panel__header--graph">
+        <div className="dashboard-panel__copy">
+          <h4>{copy.labels.workflowVisualizer}</h4>
+          <p>
+            {copy.labels.criticalPath}: <span className="inline-code">{activePath || copy.messages.notRecorded}</span>
+          </p>
+        </div>
+        <div className="detail-header__meta">
+          <span className="meta-badge">{copy.formatCount(milestones.length, 'milestone')}</span>
+          <span className="meta-badge">
+            {copy.formatCount(focusedMilestone?.sliceCount ?? 0, 'slice')}
+          </span>
+          <span className="meta-badge">
+            {copy.formatCount(focusedMilestone?.taskCount ?? 0, 'task')}
+          </span>
+        </div>
+      </div>
+
+      {milestones.length === 0 ? (
+        <p>{copy.messages.noMilestones}</p>
+      ) : (
+        <>
+          <div className="workflow-graph__stage">
+            <div className="workflow-graph__toolbar">
+              <p className="workflow-graph__hint">{copy.messages.dragGraphHint}</p>
+
+              <div className="workflow-graph__controls">
+                <span className="meta-badge">{graphViewport.zoomPercentage}%</span>
+                <button
+                  type="button"
+                  className="secondary-button secondary-button--icon"
+                  aria-label={copy.actions.zoomOutGraph}
+                  title={copy.actions.zoomOutGraph}
+                  disabled={!graphViewport.canZoom || graphViewport.zoom <= WORKFLOW_GRAPH_MIN_ZOOM}
+                  onClick={() => {
+                    graphViewport.zoomOut();
+                  }}
+                >
+                  <ZoomOutIcon />
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button secondary-button--icon"
+                  aria-label={copy.actions.zoomInGraph}
+                  title={copy.actions.zoomInGraph}
+                  disabled={!graphViewport.canZoom || graphViewport.zoom >= WORKFLOW_GRAPH_MAX_ZOOM}
+                  onClick={() => {
+                    graphViewport.zoomIn();
+                  }}
+                >
+                  <ZoomInIcon />
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button secondary-button--icon"
+                  aria-label={copy.actions.resetGraphZoom}
+                  title={copy.actions.resetGraphZoom}
+                  disabled={graphViewport.zoom === 1}
+                  onClick={() => {
+                    graphViewport.resetZoom();
+                  }}
+                >
+                  <ResetZoomIcon />
+                </button>
+              </div>
+            </div>
+
+            <div
+              ref={graphViewport.viewportRef}
+              className="workflow-graph__viewport"
+              data-draggable={graphViewport.canPan}
+              data-dragging={graphViewport.isDragging}
+              data-testid="workflow-graph-viewport"
+              onPointerDown={graphViewport.handlePointerDown}
+              onPointerMove={graphViewport.handlePointerMove}
+              onPointerUp={graphViewport.handlePointerUp}
+              onPointerCancel={graphViewport.handlePointerCancel}
+              onWheel={graphViewport.handleWheel}
+            >
+              <div
+                ref={graphCanvasRef}
+                className="workflow-graph__canvas"
+                style={{
+                  width: `${graphWidth}px`,
+                  height: `${graphScaledHeight}px`,
+                }}
+              >
+                <svg
+                  className="workflow-graph__overlay"
+                  aria-hidden="true"
+                  viewBox={`0 0 ${graphWidth} ${graphScaledHeight}`}
+                >
+                  <defs>
+                    <linearGradient id="workflow-graph-connector-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                      <stop offset="0%" stopColor="rgba(255, 83, 207, 0.94)" />
+                      <stop offset="100%" stopColor="rgba(66, 221, 255, 0.96)" />
+                    </linearGradient>
+                    <marker
+                      id="workflow-graph-arrowhead"
+                      markerWidth="10"
+                      markerHeight="10"
+                      refX="8"
+                      refY="3.5"
+                      orient="auto"
+                    >
+                      <path d="M0 0 8 3.5 0 7z" fill="rgba(66, 221, 255, 0.96)" />
+                    </marker>
+                  </defs>
+
+                  {connectors.milestoneToSlice ? (
+                    <path
+                      className="workflow-graph__connector-path"
+                      d={buildWorkflowGraphConnectorPath(connectors.milestoneToSlice)}
+                      markerEnd="url(#workflow-graph-arrowhead)"
+                    />
+                  ) : null}
+
+                  {connectors.sliceToTask ? (
+                    <path
+                      className="workflow-graph__connector-path"
+                      d={buildWorkflowGraphConnectorPath(connectors.sliceToTask)}
+                      markerEnd="url(#workflow-graph-arrowhead)"
+                    />
+                  ) : null}
+                </svg>
+
+                <div
+                  className="workflow-graph"
+                  style={{
+                    width: `${WORKFLOW_GRAPH_BASE_WIDTH}px`,
+                    height: `${graphHeight}px`,
+                    transform: `scale(${graphViewport.zoom})`,
+                  }}
+                >
+                  <section className="workflow-graph__column">
+                    <span className="workflow-graph__label">{copy.labels.gsdMilestones}</span>
+                    <ol className="workflow-graph__stack">
+                      {visibleMilestones.map((milestone) => {
+                        const isActive = milestone.id === focusedMilestone?.id;
+
+                        return (
+                          <li
+                            className="workflow-graph__node"
+                            data-active={isActive}
+                            data-status={statusTone(milestone.status)}
+                            key={milestone.id}
+                            ref={isActive ? setActiveMilestoneNodeRef : undefined}
+                          >
+                            <span className="workflow-graph__node-id">{milestone.id}</span>
+                          </li>
+                        );
+                      })}
+                    </ol>
+                  </section>
+
+                  <div className="workflow-graph__connector" aria-hidden="true" />
+
+                  <section className="workflow-graph__column">
+                    <span className="workflow-graph__label">{copy.labels.slices}</span>
+                    <ol className="workflow-graph__stack">
+                      {visibleSlices.length === 0 ? (
+                        <li className="workflow-graph__node workflow-graph__node--empty" data-status="neutral">
+                          <span className="workflow-graph__node-id">--</span>
+                        </li>
+                      ) : (
+                        visibleSlices.map((slice) => {
+                          const isActive = slice.id === focusedSlice?.id;
+
+                          return (
+                            <li
+                              className="workflow-graph__node"
+                              data-active={isActive}
+                              data-status={statusTone(slice.status)}
+                              key={`${focusedMilestone?.id ?? 'milestone'}-${slice.id}`}
+                              ref={isActive ? setActiveSliceNodeRef : undefined}
+                            >
+                              <span className="workflow-graph__node-id">{slice.id}</span>
+                            </li>
+                          );
+                        })
+                      )}
+                    </ol>
+                  </section>
+
+                  <div className="workflow-graph__connector" aria-hidden="true" />
+
+                  <section className="workflow-graph__column">
+                    <span className="workflow-graph__label">{copy.labels.tasks}</span>
+                    <ol className="workflow-graph__stack">
+                      {visibleTasks.length === 0 ? (
+                        <li className="workflow-graph__node workflow-graph__node--empty" data-status="neutral">
+                          <span className="workflow-graph__node-id">--</span>
+                        </li>
+                      ) : (
+                        visibleTasks.map((task) => {
+                          const isActive = task.id === focusedTask?.id;
+
+                          return (
+                            <li
+                              className="workflow-graph__node"
+                              data-active={isActive}
+                              data-status={isActive ? 'active' : statusTone(task.status)}
+                              key={`${focusedSlice?.id ?? 'slice'}-${task.id}`}
+                              ref={isActive ? setActiveTaskNodeRef : undefined}
+                            >
+                              <span className="workflow-graph__node-id">{task.id}</span>
+                            </li>
+                          );
+                        })
+                      )}
+                    </ol>
+                  </section>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="workflow-graph__dependencies">
+            <span className="workflow-graph__dependencies-label">{copy.labels.dependencies}</span>
+            {visibleDependencies.length === 0 ? (
+              <span className="workflow-graph__dependency-pill">
+                {copy.messages.noDependencies}
+              </span>
+            ) : (
+              visibleDependencies.map((dependency) => (
+                <span
+                  className="workflow-graph__dependency-pill"
+                  key={`${dependency.milestoneId}-${dependency.fromId}-${dependency.toId}`}
+                >
+                  {dependency.fromId} -&gt; {dependency.toId}
+                </span>
+              ))
+            )}
+            <span className="workflow-graph__dependencies-count">
+              {copy.formatCount(visibleDependencies.length, 'entry')}
+            </span>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+function RuntimeMetricsPanel({
+  metrics,
+  executionStats,
+  workflowPhase,
+  locale,
+  copy,
+}: {
+  metrics: GsdMetricsSummaryValue | null;
+  executionStats: WorkflowExecutionStats;
+  workflowPhase: string;
+  locale: Locale;
+  copy: UiCopy;
+}) {
+  const chartUnits = clampRecentUnits(executionStats.units, 9);
+  const durationSeries = chartUnits.map((unit) => Math.max(0, unit.durationMs ?? 0));
+  const tokenSeries = chartUnits.map((unit) => Math.max(0, unit.totalTokens));
+  const activitySeries = chartUnits.map((unit) => Math.max(0, unit.toolCalls + unit.apiRequests));
+  const hasChartData = durationSeries.length > 0;
+
+  return (
+    <section className="dashboard-panel runtime-metrics-panel" data-testid="runtime-metrics-dashboard">
+      <div className="dashboard-panel__header">
+        <div className="dashboard-panel__copy">
+          <h4>{copy.labels.metrics}</h4>
+          <p>{copy.labels.source}: .gsd/metrics.json</p>
+        </div>
+        <div className="detail-header__meta">
+          <span className="meta-badge">{copy.formatCount(executionStats.remainingTasks, 'task')}</span>
+          <span className="meta-badge">
+            {formatDuration(executionStats.estimatedRemainingMs, locale, copy.messages.estimateUnavailable)}
+          </span>
+        </div>
+      </div>
+
+      <div className="runtime-metrics-panel__stats">
+        <div>
+          <span className="stat-card__label">{copy.labels.elapsed}</span>
+          <strong>{formatDuration(executionStats.elapsedMs, locale, copy.messages.notRecorded)}</strong>
+        </div>
+        <div>
+          <span className="stat-card__label">{copy.labels.units}</span>
+          <strong>{executionStats.units.length}</strong>
+        </div>
+        <div>
+          <span className="stat-card__label">{copy.labels.tokens}</span>
+          <strong>{formatCompactNumber(metrics?.totals.totalTokens ?? 0, locale)}</strong>
+        </div>
+        <div>
+          <span className="stat-card__label">{copy.labels.apiRequests}</span>
+          <strong>{formatCompactNumber(metrics?.totals.apiRequests ?? 0, locale)}</strong>
+        </div>
+      </div>
+
+      <div className="runtime-metrics-panel__chart-shell">
+        {hasChartData ? (
+          <svg
+            className="runtime-metrics-panel__chart"
+            viewBox="0 0 420 180"
+            role="img"
+            aria-label={copy.labels.metrics}
+          >
+            <defs>
+              <linearGradient id="runtimeAreaGradient" x1="0%" x2="0%" y1="0%" y2="100%">
+                <stop offset="0%" stopColor="rgba(255, 83, 207, 0.26)" />
+                <stop offset="100%" stopColor="rgba(255, 83, 207, 0)" />
+              </linearGradient>
+            </defs>
+
+            {['25%', '50%', '75%'].map((label, index) => (
+              <line
+                key={label}
+                className="runtime-metrics-panel__grid-line"
+                x1="0"
+                x2="420"
+                y1={40 + index * 35}
+                y2={40 + index * 35}
+              />
+            ))}
+
+            <polyline
+              className="runtime-metrics-panel__series runtime-metrics-panel__series--duration"
+              points={buildSparklinePoints(durationSeries, 420, 180)}
+            />
+            <polyline
+              className="runtime-metrics-panel__series runtime-metrics-panel__series--tokens"
+              points={buildSparklinePoints(tokenSeries, 420, 180)}
+            />
+            <polyline
+              className="runtime-metrics-panel__series runtime-metrics-panel__series--activity"
+              points={buildSparklinePoints(activitySeries, 420, 180)}
+            />
+          </svg>
+        ) : (
+          <p className="runtime-metrics-panel__empty">{copy.messages.noExecutionUnits}</p>
+        )}
+
+        <div className="runtime-metrics-panel__legend">
+          <span data-series="duration">{copy.labels.actualDuration}</span>
+          <span data-series="tokens">{copy.labels.tokens}</span>
+          <span data-series="activity">{copy.labels.toolCalls}</span>
+        </div>
+      </div>
+
+      <div className="runtime-metrics-panel__footer">
+        <div>
+          <span className="stat-card__label">{copy.labels.currentStage}</span>
+          <strong>{workflowPhase}</strong>
+        </div>
+        <div>
+          <span className="stat-card__label">{copy.labels.averageTaskDuration}</span>
+          <strong>{formatDuration(executionStats.averageTaskDurationMs, locale, copy.messages.notRecorded)}</strong>
+        </div>
+        <div>
+          <span className="stat-card__label">{copy.labels.estimatedFinish}</span>
+          <strong>
+            {executionStats.estimatedFinishAtMs === null
+              ? copy.messages.estimateUnavailable
+              : formatTimestamp(new Date(executionStats.estimatedFinishAtMs).toISOString(), locale)}
+          </strong>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function WorkflowMilestoneRail({
   milestones,
+  dependencies,
   activeMilestoneId,
   activeSliceId,
   activeTask,
   validationIssueCount,
+  locale,
   copy,
+  variant = 'rail',
 }: {
   milestones: GsdDbMilestoneSummary[];
+  dependencies: SliceDependencyView[];
   activeMilestoneId: string | null;
   activeSliceId: string | null;
   activeTask: GsdDbTaskSummary | null;
   validationIssueCount: number;
+  locale: Locale;
   copy: UiCopy;
+  variant?: 'rail' | 'dashboard';
 }) {
+  const { focusedMilestone, focusedSlice, focusedTask } = getWorkflowFocus(
+    milestones,
+    activeMilestoneId,
+    activeSliceId,
+    activeTask,
+  );
+  const focusedProgress = focusedMilestone ? getMilestoneProgress(focusedMilestone) : null;
+  const focusedProgressPercent = focusedMilestone ? getMilestoneProgressPercent(focusedMilestone) : 0;
+  const dependencyLookup = new Map(
+    dependencies.map((dependency) => [workflowSliceKey(dependency.milestoneId, dependency.toId), dependency]),
+  );
+  const focusedPath =
+    focusedMilestone !== null && focusedSlice !== null && focusedTask !== null
+      ? `${focusedMilestone.id} -> ${focusedSlice.id} -> ${focusedTask.id}`
+      : focusedMilestone !== null && focusedSlice !== null
+        ? `${focusedMilestone.id} -> ${focusedSlice.id}`
+        : focusedMilestone?.id ?? copy.messages.notRecorded;
+
   return (
-    <aside className="milestone-rail" aria-label={copy.labels.milestoneRail}>
+    <aside
+      className={`milestone-rail ${variant === 'dashboard' ? 'milestone-rail--dashboard' : ''}`}
+      aria-label={variant === 'dashboard' ? copy.labels.progress : copy.labels.milestoneRail}
+    >
       <div className="milestone-rail__header">
-        <span className="stat-card__label">{copy.labels.milestoneRail}</span>
-        <strong>{copy.formatCount(milestones.length, 'milestone')}</strong>
+        <div>
+          <span className="stat-card__label">
+            {variant === 'dashboard' ? copy.labels.progress : copy.labels.milestoneRail}
+          </span>
+          <strong>{copy.formatCount(milestones.length, 'milestone')}</strong>
+        </div>
+        {variant === 'dashboard' ? <span className="meta-badge">{focusedPath}</span> : null}
       </div>
 
       {milestones.length === 0 ? (
         <p className="milestone-rail__empty">{copy.messages.noMilestones}</p>
       ) : (
-        <ol className="milestone-tree">
-          {milestones.map((milestone) => {
-            const milestoneActive = milestone.id === activeMilestoneId;
+        <div className="milestone-focus">
+          <ol className="milestone-focus__index">
+            {milestones.map((milestone) => {
+              const milestoneActive = focusedMilestone?.id === milestone.id;
+              const milestoneProgress = getMilestoneProgress(milestone);
+              const milestonePercent =
+                milestoneProgress.total === 0
+                  ? isMilestoneEffectivelyComplete(milestone)
+                    ? 100
+                    : 0
+                  : Math.round((milestoneProgress.completed / milestoneProgress.total) * 100);
 
-            return (
-              <li key={milestone.id} className="milestone-tree__milestone" data-active={milestoneActive}>
-                <div className="milestone-tree__row">
+              return (
+                <li key={milestone.id} className="milestone-focus__index-item" data-active={milestoneActive}>
                   <span className="status-dot" data-status={statusTone(milestone.status)} />
-                  <strong>{milestone.id}</strong>
-                  <span>{milestoneTitle(milestone)}</span>
+                  <div>
+                    <strong>{milestone.id}</strong>
+                    <span>{milestoneTitle(milestone)}</span>
+                  </div>
+                  <span className="meta-badge">{milestonePercent}%</span>
+                </li>
+              );
+            })}
+          </ol>
+
+          {focusedMilestone ? (
+            <div className="milestone-focus__body" data-testid="milestone-focus-panel">
+              <article
+                className="milestone-focus__summary"
+                data-status={statusTone(focusedMilestone.status)}
+              >
+                <div className="milestone-focus__summary-header">
+                  <div className="milestone-focus__summary-title">
+                    <span className="meta-badge">{focusedMilestone.id}</span>
+                    <strong>{milestoneTitle(focusedMilestone)}</strong>
+                  </div>
+                  {focusedMilestone.status ? (
+                    <span className="status-pill" data-status={statusTone(focusedMilestone.status)}>
+                      {focusedMilestone.status}
+                    </span>
+                  ) : null}
                 </div>
 
-                {milestone.slices.length > 0 ? (
-                  <ol className="milestone-tree__slices">
-                    {milestone.slices.map((slice) => {
-                      const sliceActive = milestoneActive && slice.id === activeSliceId;
+                <div className="milestone-focus__summary-meter" aria-hidden="true">
+                  <span style={{ width: `${focusedProgressPercent}%` }} />
+                </div>
 
-                      return (
-                        <li key={`${milestone.id}-${slice.id}`} data-active={sliceActive}>
-                          <div className="milestone-tree__row milestone-tree__row--slice">
-                            <span className="status-dot" data-status={statusTone(slice.status)} />
-                            <strong>{slice.id}</strong>
-                            <span>{sliceTitle(slice)}</span>
-                          </div>
+                <div className="milestone-focus__summary-meta">
+                  <span>
+                    {focusedProgress?.completed ?? 0}/{focusedProgress?.total ?? 0} {copy.labels.completed}
+                  </span>
+                  <span>{copy.formatCount(focusedMilestone.sliceCount, 'slice')}</span>
+                  <span>
+                    {focusedMilestone.completedTaskCount}/{focusedMilestone.taskCount} {copy.labels.tasks}
+                  </span>
+                </div>
 
-                          {milestoneActive && slice.tasks.length > 0 ? (
-                            <ol className="milestone-tree__tasks">
-                              {slice.tasks.map((task) => (
-                                <li
-                                  key={`${slice.id}-${task.id}`}
-                                  data-current={sliceActive && task === activeTask}
-                                >
-                                  <span
-                                    className="status-dot"
-                                    data-status={sliceActive && task === activeTask ? 'active' : statusTone(task.status)}
-                                  />
-                                  <strong>{task.id}</strong>
-                                  <span>{taskTitle(task)}</span>
-                                </li>
-                              ))}
-                            </ol>
-                          ) : null}
-                        </li>
-                      );
-                    })}
-                  </ol>
-                ) : null}
-              </li>
-            );
-          })}
-        </ol>
+                <div className="milestone-focus__summary-path">
+                  <span className="stat-card__label">{copy.labels.criticalPath}</span>
+                  <strong>{focusedPath}</strong>
+                </div>
+              </article>
+
+              <div className="milestone-focus__groups">
+                {groupedSlicesByRisk(focusedMilestone.slices).map((group) => (
+                  <section
+                    className="milestone-focus__group"
+                    data-risk={group.level}
+                    key={`${focusedMilestone.id}-${group.level}`}
+                  >
+                    <div className="milestone-focus__group-header">
+                      <span className="warning-code" data-risk={group.level}>
+                        {readableRiskLabel(group.level, locale)}
+                      </span>
+                      <strong>{copy.formatCount(group.slices.length, 'slice')}</strong>
+                    </div>
+
+                    <div className="milestone-focus__slice-stack">
+                      {group.slices.map((slice) => {
+                        const sliceActive =
+                          focusedMilestone.id === activeMilestoneId && slice.id === activeSliceId;
+                        const sliceCurrentTask = sliceActive ? activeTask : findActiveTask(slice);
+                        const slicePercent = getSliceProgressPercent(slice);
+                        const dependency = dependencyLookup.get(workflowSliceKey(focusedMilestone.id, slice.id)) ?? null;
+
+                        return (
+                          <article
+                            className="milestone-focus__slice"
+                            data-active={sliceActive}
+                            data-status={statusTone(slice.status)}
+                            data-risk={getSliceRiskLevel(slice)}
+                            key={`${focusedMilestone.id}-${slice.id}`}
+                          >
+                            <div className="milestone-focus__slice-header">
+                              <span className="meta-badge">{slice.id}</span>
+                              <span className="status-pill" data-status={statusTone(slice.status)}>
+                                {slice.status ?? copy.messages.unknown}
+                              </span>
+                            </div>
+
+                            <strong>{sentenceCaseTitle(sliceTitle(slice))}</strong>
+
+                            <div className="milestone-focus__slice-meter" aria-hidden="true">
+                              <span style={{ width: `${slicePercent}%` }} />
+                            </div>
+
+                            <div className="milestone-focus__slice-meta">
+                              <span>
+                                {slice.completedTaskCount}/{slice.taskCount} {copy.labels.tasks}
+                              </span>
+                              {dependency ? <span>{dependency.fromId} -&gt; {slice.id}</span> : <span>{focusedMilestone.id} -&gt; {slice.id}</span>}
+                            </div>
+
+                            {sliceCurrentTask ? (
+                              <span className="milestone-focus__current">
+                                {copy.labels.currentTask}: {sliceCurrentTask.id}
+                              </span>
+                            ) : null}
+
+                            {slice.tasks.length > 0 ? (
+                              <ol className="milestone-focus__task-list">
+                                {slice.tasks.map((task) => {
+                                  const taskCurrent = sliceCurrentTask !== null && task === sliceCurrentTask;
+
+                                  return (
+                                    <li
+                                      className="milestone-focus__task"
+                                      data-current={taskCurrent}
+                                      data-status={taskCurrent ? 'active' : statusTone(task.status)}
+                                      key={`${slice.id}-${task.id}`}
+                                    >
+                                      <div className="milestone-focus__task-main">
+                                        <span
+                                          className="status-dot"
+                                          data-status={taskCurrent ? 'active' : statusTone(task.status)}
+                                        />
+                                        <strong>{task.id}</strong>
+                                        <span>{taskTitle(task)}</span>
+                                      </div>
+                                      <span
+                                        className="status-pill"
+                                        data-status={taskCurrent ? 'active' : statusTone(task.status)}
+                                      >
+                                        {taskCurrent ? copy.labels.currentTask : task.status ?? copy.messages.unknown}
+                                      </span>
+                                    </li>
+                                  );
+                                })}
+                              </ol>
+                            ) : null}
+                          </article>
+                        );
+                      })}
+                    </div>
+                  </section>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </div>
       )}
 
       <div className="validation-dock">
@@ -3333,6 +4506,18 @@ export default function App() {
     void syncInventory(initialProjectId, {
       fallbackToFirstProject: initialProjectId === null,
     });
+  }, [syncInventory]);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      void syncInventory(selectedProjectIdRef.current, {
+        preserveSelectedDetail: true,
+      });
+    }, INVENTORY_AUTO_REFRESH_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
   }, [syncInventory]);
 
   useEffect(() => {
@@ -3921,7 +5106,9 @@ export default function App() {
         ? `${selectedActiveMilestone.id}/${selectedActiveSlice.id}`
         : selectedActiveMilestone
           ? selectedActiveMilestone.id
-      : selectedProject?.projectId ?? copy.messages.notRecorded;
+          : selectedProject
+            ? describeProject(selectedProject)
+            : copy.messages.notRecorded;
   const selectedWorkflowPhase =
     selectedInitJob && hasActiveInitJob(selectedInitJob)
       ? copy.initStageLabels[selectedInitJob.stage]
@@ -3929,10 +5116,42 @@ export default function App() {
         ? copy.statusLabels[selectedProject.snapshot.status]
         : copy.messages.notRecorded;
   const selectedExecutionStats = buildWorkflowExecutionStats(selectedMilestones, selectedMetrics, nowMs, copy);
+  const selectedTaskTimeline = buildTaskTimelineEntries(selectedMilestones, selectedExecutionStats);
+  const selectedTaskTimelineCountLabel = copy.formatCount(selectedTaskTimeline.length, 'task');
   const selectedRecentExecutionUnits = (selectedMetrics?.recentUnits ?? []).map(toExecutionUnit);
   const primaryModel = selectedExecutionStats.modelUsage[0]?.model ?? copy.messages.notRecorded;
   const averageUnitDurationMs = averageDuration(selectedExecutionStats.units);
   const routePreviewProject = selectedProject ?? projects.find((project) => project.projectId === selectedProjectId) ?? projects[0] ?? null;
+  const routePreviewRow = routePreviewProject
+    ? portfolioSummary.rows.find((row) => row.project.projectId === routePreviewProject.projectId) ?? null
+    : null;
+  const routePreviewHeading = routePreviewProject ? describeProject(routePreviewProject) : copy.labels.projectOverview;
+  const routePreviewStage =
+    activeAppPage === 'details' ? routePreviewRow?.currentStage ?? selectedWorkflowPhase : copy.labels.projectOverview;
+  const routePreviewActionLabel =
+    activeAppPage === 'overview' ? copy.actions.openSelectedProject : copy.actions.enterOverview;
+  const topbarMarqueeLabel =
+    activeAppPage === 'details' ? copy.labels.projectDetail : copy.labels.portfolio;
+  const topbarMarqueeHeading =
+    activeAppPage === 'details' ? routePreviewHeading : totalProjectsLabel;
+  const topbarMarqueeCopy =
+    activeAppPage === 'details' ? routePreviewStage : copy.help.portfolioProjection;
+  const topbarStageLabel =
+    activeAppPage === 'details' ? copy.labels.currentStage : copy.labels.activeProjects;
+  const topbarStageValue =
+    activeAppPage === 'details' ? routePreviewStage : String(portfolioSummary.activeProjects);
+  const topbarStageMeta =
+    activeAppPage === 'details' ? routePreviewHeading : `${initializedCount} ${copy.stats.initialized}`;
+  const topbarCost = activeAppPage === 'details' ? routePreviewRow?.cost ?? 0 : portfolioSummary.totalCost;
+  const topbarTokens =
+    activeAppPage === 'details' ? routePreviewRow?.totalTokens ?? 0 : portfolioSummary.totalTokens;
+  const switcherProject = selectedProject ?? routePreviewProject;
+  const openRegisterDirectoryPicker = () => {
+    setRegisterError(null);
+    setRegisterSuccess(null);
+    setDirectoryPickerOpen(true);
+    void loadDirectoryPicker(registerPath);
+  };
   const renderLocaleSwitch = () => (
     <div className="locale-switch" role="group" aria-label={copy.languageToggleLabel}>
       {(['en', 'zh'] as Locale[]).map((option) => (
@@ -3950,64 +5169,86 @@ export default function App() {
       ))}
     </div>
   );
-  const renderRegisterPanel = (inputId: string) => (
-    <form className="register-panel" onSubmit={handleRegister}>
+  const renderRegisterPanel = (inputId: string, options: { pickerOnly?: boolean } = {}) => (
+    <div className="register-panel">
       <div>
         <h2>{copy.actions.registerProject}</h2>
         <p>{copy.help.registerPanel}</p>
       </div>
 
-      <div className="field register-panel__field">
-        <label htmlFor={inputId}>{copy.labels.projectPath}</label>
-        <div className="path-input-row">
-          <input
-            id={inputId}
-            name={inputId}
-            type="text"
-            autoComplete="off"
-            spellCheck={false}
-            placeholder={copy.placeholders.projectPath}
-            value={registerPath}
-            onChange={(nextEvent) => {
-              setRegisterPath(nextEvent.target.value);
-              setRegisterError(null);
-              setRegisterSuccess(null);
-            }}
-          />
-          <button
-            type="button"
-            className="secondary-button secondary-button--icon"
-            onClick={() => {
-              setRegisterError(null);
-              setRegisterSuccess(null);
-              setDirectoryPickerOpen(true);
-              void loadDirectoryPicker(registerPath);
-            }}
-            disabled={directoryPickerLoading}
-          >
-            <FolderIcon />
-            <span>{copy.actions.browseFolders}</span>
-          </button>
-        </div>
-      </div>
+      {options.pickerOnly ? (
+        <>
+          <div className="field register-panel__field">
+            <span>{copy.labels.projectPath}</span>
+            <div className="register-panel__path" data-testid="register-selected-path">
+              {registerPath || copy.messages.selectedFolderHint}
+            </div>
+          </div>
 
-      <div className="register-panel__actions">
-        <button type="submit" className="primary-button" disabled={registerPending}>
-          {registerPending ? copy.actions.registering : copy.actions.registerProject}
-        </button>
-        <button
-          type="button"
-          className="secondary-button"
-          onClick={() => {
-            setRegisterPath('');
-            setRegisterError(null);
-            setRegisterSuccess(null);
-          }}
-          disabled={registerPending || registerPath.length === 0}
-        >
-          {copy.actions.clearInput}
-        </button>
-      </div>
+          <div className="register-panel__actions">
+            <button
+              type="button"
+              className="primary-button"
+              onClick={openRegisterDirectoryPicker}
+              disabled={directoryPickerLoading}
+            >
+              <FolderIcon />
+              <span>{copy.actions.browseFolders}</span>
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <form onSubmit={handleRegister}>
+            <div className="field register-panel__field">
+              <label htmlFor={inputId}>{copy.labels.projectPath}</label>
+              <div className="path-input-row">
+                <input
+                  id={inputId}
+                  name={inputId}
+                  type="text"
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder={copy.placeholders.projectPath}
+                  value={registerPath}
+                  onChange={(nextEvent) => {
+                    setRegisterPath(nextEvent.target.value);
+                    setRegisterError(null);
+                    setRegisterSuccess(null);
+                  }}
+                />
+                <button
+                  type="button"
+                  className="secondary-button secondary-button--icon"
+                  onClick={openRegisterDirectoryPicker}
+                  disabled={directoryPickerLoading}
+                >
+                  <FolderIcon />
+                  <span>{copy.actions.browseFolders}</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="register-panel__actions">
+              <button type="submit" className="primary-button" disabled={registerPending}>
+                {registerPending ? copy.actions.registering : copy.actions.registerProject}
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => {
+                  setRegisterPath('');
+                  setRegisterError(null);
+                  setRegisterSuccess(null);
+                }}
+                disabled={registerPending || registerPath.length === 0}
+              >
+                {copy.actions.clearInput}
+              </button>
+            </div>
+          </form>
+        </>
+      )}
 
       {registerError ? (
         <p className="inline-alert inline-alert--error" role="alert" data-testid="register-error">
@@ -4020,7 +5261,77 @@ export default function App() {
           {registerSuccess}
         </p>
       ) : null}
-    </form>
+    </div>
+  );
+  const renderProjectSwitcher = () => (
+    <section className="project-switcher" aria-labelledby="project-switch-heading">
+      <div className="panel-header project-switcher__header">
+        <div>
+          <h2 id="project-switch-heading">{copy.labels.projectSwitch}</h2>
+          <p>{copy.formatCount(projects.length, 'project')}</p>
+        </div>
+      </div>
+
+      {inventoryError ? (
+        <div className="inline-alert inline-alert--error" role="alert" data-testid="inventory-error">
+          <p>{inventoryError}</p>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() => {
+              void syncInventory(selectedProjectIdRef.current);
+            }}
+          >
+            {copy.actions.retryInventory}
+          </button>
+        </div>
+      ) : null}
+
+      {projects.length === 0 ? (
+        <div className="empty-state" data-testid="inventory-empty">
+          <h3>{copy.empty.inventoryTitle}</h3>
+          <p>{copy.empty.inventoryCopy}</p>
+        </div>
+      ) : (
+        <div className="project-switcher__body">
+          <div className="project-switcher__current" data-testid="project-switcher-current">
+            <span className="eyebrow">{copy.labels.projectDetail}</span>
+            <strong data-testid="project-switcher-current-name">
+              {switcherProject ? describeProject(switcherProject) : copy.empty.detailTitle}
+            </strong>
+            <span className="project-switcher__path">
+              {switcherProject?.canonicalPath ?? copy.empty.detailCopy}
+            </span>
+          </div>
+
+          <div className="project-switcher__dots">
+            {projects.map((project) => {
+              const label = describeProject(project);
+              const isSelected = selectedProjectId === project.projectId;
+
+              return (
+                <button
+                  key={project.projectId}
+                  type="button"
+                  className="project-switcher__dot"
+                  data-status={project.snapshot.status}
+                  data-active={isSelected}
+                  data-testid={`project-card-${project.projectId}`}
+                  aria-label={label}
+                  aria-pressed={isSelected}
+                  title={label}
+                  onClick={() => {
+                    selectProject(project);
+                  }}
+                >
+                  <span className="visually-hidden">{label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </section>
   );
   const renderStreamStrip = () => (
     <div className="stream-strip">
@@ -4132,50 +5443,137 @@ export default function App() {
       </section>
     </section>
   );
+  const renderAppRail = () => (
+    <aside className="app-rail panel" aria-label={copy.labels.workspacePages}>
+      <div className="app-rail__brand">
+        <div className="app-rail__brand-mark" aria-hidden="true">
+          <span />
+        </div>
+        <div className="app-rail__brand-copy">
+          <span className="stat-card__label">{copy.app.welcomeEyebrow}</span>
+          <strong>gsd-web</strong>
+          <span>{copy.app.title}</span>
+        </div>
+      </div>
+
+      <div className="app-rail__section">
+        <span className="stat-card__label">{copy.labels.workspacePages}</span>
+        <div className="app-page-tabs" role="tablist" aria-label={copy.labels.workspacePages}>
+          {APP_PAGES.map((page) => (
+            <button
+              key={page}
+              type="button"
+              className="app-page-tabs__item"
+              role="tab"
+              aria-selected={activeAppPage === page}
+              aria-controls={`app-page-${page}`}
+              data-active={activeAppPage === page}
+              onClick={() => {
+                if (page === 'overview') {
+                  navigateToRoute({ page: 'overview' });
+                  return;
+                }
+
+                if (routePreviewProject) {
+                  selectProject(routePreviewProject);
+                  return;
+                }
+
+                navigateToRoute({ page: 'overview' });
+              }}
+            >
+              <AppPageIcon page={page} />
+              <span>{appPageLabel(page, copy)}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="app-rail__status-grid">
+        <div className="app-rail__metric" data-stream-status={streamStatus}>
+          <span className="stat-card__label">{copy.stats.liveStream}</span>
+          <strong>{copy.streamStatusLabels[streamStatus]}</strong>
+          <span>{streamSummary?.type ?? copy.stats.waitingForEvent}</span>
+        </div>
+        <div className="app-rail__metric">
+          <span className="stat-card__label">{copy.labels.activeProjects}</span>
+          <strong>{portfolioSummary.activeProjects}</strong>
+          <span>{initializedCount} {copy.stats.initialized}</span>
+        </div>
+        <div className="app-rail__metric">
+          <span className="stat-card__label">{copy.labels.totalWarnings}</span>
+          <strong>{portfolioSummary.totalWarnings}</strong>
+          <span>{degradedCount} {copy.stats.degraded}</span>
+        </div>
+      </div>
+
+      <div className="app-rail__footer">
+        {routePreviewProject ? (
+          <button
+            type="button"
+            className="app-rail__project"
+            onClick={() => {
+              if (activeAppPage === 'overview') {
+                selectProject(routePreviewProject);
+                return;
+              }
+
+              navigateToRoute({ page: 'overview' });
+            }}
+          >
+            <span className="stat-card__label">{routePreviewActionLabel}</span>
+            <strong>{routePreviewHeading}</strong>
+            <span>{routePreviewStage}</span>
+          </button>
+        ) : null}
+        {renderLocaleSwitch()}
+      </div>
+    </aside>
+  );
 
   return (
     <main className="app-shell" data-locale={locale}>
       {appRoute.page === 'welcome' ? renderWelcomePage() : (
       <section className="app-frame">
-        <header className="app-topbar panel">
-          <div className="app-topbar__title">
-            <p className="eyebrow">{copy.app.eyebrow}</p>
-            <h1>{copy.app.title}</h1>
-            <p className="lede">{copy.app.lede}</p>
-          </div>
+        {renderAppRail()}
 
-          <div className="app-page-tabs" role="tablist" aria-label={copy.labels.workspacePages}>
-            {APP_PAGES.map((page) => (
-              <button
-                key={page}
-                type="button"
-                className="app-page-tabs__item"
-                role="tab"
-                aria-selected={activeAppPage === page}
-                aria-controls={`app-page-${page}`}
-                data-active={activeAppPage === page}
-                onClick={() => {
-                  if (page === 'overview') {
-                    navigateToRoute({ page: 'overview' });
-                    return;
-                  }
+        <section className="app-stage">
+          <header className="app-topbar panel">
+            <div className="app-topbar__title">
+              <p className="eyebrow">{copy.app.eyebrow}</p>
+              <h1>gsd-web</h1>
+              <p className="lede">{copy.app.title}</p>
+            </div>
 
-                  if (routePreviewProject) {
-                    selectProject(routePreviewProject);
-                    return;
-                  }
+            <div className="app-topbar__marquee">
+              <span className="stat-card__label">{topbarMarqueeLabel}</span>
+              <strong data-testid="app-topbar-marquee-heading">{topbarMarqueeHeading}</strong>
+              <p data-testid="app-topbar-marquee-copy">{topbarMarqueeCopy}</p>
+            </div>
 
-                  navigateToRoute({ page: 'overview' });
-                }}
-              >
-                <AppPageIcon page={page} />
-                <span>{appPageLabel(page, copy)}</span>
-              </button>
-            ))}
-          </div>
+            <div className="app-topbar__hud">
+              <div className="app-topbar__hud-card" data-stream-status={streamStatus}>
+                <span className="stat-card__label">{copy.stats.liveStream}</span>
+                <strong>{copy.streamStatusLabels[streamStatus]}</strong>
+                <span>
+                  {streamSummary ? formatTimestamp(streamSummary.emittedAt, locale) : copy.stats.waitingForEvent}
+                </span>
+              </div>
+              <div className="app-topbar__hud-card">
+                <span className="stat-card__label">{topbarStageLabel}</span>
+                <strong data-testid="app-topbar-stage-value">{topbarStageValue}</strong>
+                <span data-testid="app-topbar-stage-meta">{topbarStageMeta}</span>
+              </div>
+              <div className="app-topbar__hud-card">
+                <span className="stat-card__label">{copy.labels.totalCost}</span>
+                <strong data-testid="app-topbar-total-cost">{formatCost(topbarCost, locale)}</strong>
+                <span data-testid="app-topbar-total-tokens">
+                  {formatCompactNumber(topbarTokens, locale)} {copy.labels.tokens}
+                </span>
+              </div>
+            </div>
 
-          {renderLocaleSwitch()}
-        </header>
+          </header>
 
         {activeAppPage === 'overview' ? (
           <section className="overview-layout app-page" id="app-page-overview" aria-labelledby="overview-heading">
@@ -4184,18 +5582,6 @@ export default function App() {
                 <p className="eyebrow">{copy.app.healthRailLabel}</p>
                 <h2 id="overview-heading">{copy.labels.portfolio}</h2>
                 <p>{copy.app.healthRailCopy}</p>
-              </div>
-              <div className="overview-hero__actions">
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => {
-                    void syncInventory(selectedProjectIdRef.current);
-                  }}
-                  disabled={inventoryLoading}
-                >
-                  {inventoryLoading ? copy.actions.refreshing : copy.actions.refreshInventory}
-                </button>
               </div>
 
               <div className="overview-metrics">
@@ -4330,7 +5716,7 @@ export default function App() {
 
               <aside className="overview-side" aria-label={copy.labels.serviceState}>
                 <section className="overview-register panel">
-                  {renderRegisterPanel('overview-project-path')}
+                  {renderRegisterPanel('overview-project-path', { pickerOnly: true })}
                 </section>
                 <section className="overview-status panel">
                   <div className="subpanel__header">
@@ -4373,189 +5759,9 @@ export default function App() {
         ) : null}
 
         {activeAppPage === 'details' ? (
-        <section className="workspace-layout app-page" id="app-page-details" aria-labelledby="detail-heading">
-        <aside className="project-sidebar panel" aria-labelledby="inventory-heading">
-          <div className="sidebar-stats">
-            <div className="stat-card" data-testid="inventory-count">
-              <span className="stat-card__label">{copy.stats.registered}</span>
-              <strong>{totalProjectsLabel}</strong>
-            </div>
-            <div className="stat-card stat-card--compact">
-              <span className="stat-card__label">{copy.stats.initialized}</span>
-              <strong>{initializedCount}</strong>
-            </div>
-            <div className="stat-card stat-card--compact">
-              <span className="stat-card__label">{copy.stats.degraded}</span>
-              <strong>{degradedCount}</strong>
-            </div>
-            <div className="stat-card stat-card--compact">
-              <span className="stat-card__label">{copy.stats.uninitialized}</span>
-              <strong>{uninitializedCount}</strong>
-            </div>
-          </div>
-
-          {renderRegisterPanel('details-project-path')}
-
-          <section className="inventory-panel">
-            <div className="panel-header inventory-panel__header">
-            <div>
-              <h2 id="inventory-heading">{copy.labels.registeredInventory}</h2>
-              <p>{copy.help.inventoryProjection}</p>
-            </div>
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={() => {
-                void syncInventory(selectedProjectIdRef.current);
-              }}
-              disabled={inventoryLoading}
-            >
-              {inventoryLoading ? copy.actions.refreshing : copy.actions.refreshInventory}
-            </button>
-            </div>
-
-          {inventoryError ? (
-            <div className="inline-alert inline-alert--error" role="alert" data-testid="inventory-error">
-              <p>{inventoryError}</p>
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => {
-                  void syncInventory(selectedProjectIdRef.current);
-                }}
-              >
-                {copy.actions.retryInventory}
-              </button>
-            </div>
-          ) : null}
-
-          {projects.length === 0 ? (
-            <div className="empty-state" data-testid="inventory-empty">
-              <h3>{copy.empty.inventoryTitle}</h3>
-              <p>{copy.empty.inventoryCopy}</p>
-            </div>
-          ) : (
-            <ul className="project-list">
-              {projects.map((project) => {
-                const label = describeProject(project);
-                const warningCount = project.snapshot.warnings.length;
-                const initJob = project.latestInitJob;
-                const initSummary = summarizeInitJob(initJob, copy);
-                const continuity = getProjectContinuity(project);
-
-                return (
-                  <li key={project.projectId}>
-                    <button
-                      type="button"
-                      className="project-card"
-                      data-testid={`project-card-${project.projectId}`}
-                      data-status={project.snapshot.status}
-                      aria-pressed={selectedProjectId === project.projectId}
-                      onClick={() => {
-                        selectProject(project);
-                      }}
-                    >
-                      <span className="project-card__eyebrow">{project.projectId}</span>
-                      <strong>{label}</strong>
-                      <span className="project-card__path">{project.canonicalPath}</span>
-                      <div className="project-card__meta">
-                        <span className="status-pill" data-status={project.snapshot.status}>
-                          {copy.statusLabels[project.snapshot.status]}
-                        </span>
-                        <span
-                          className="status-pill"
-                          data-status={project.monitor.health}
-                          data-testid={`project-monitor-health-${project.projectId}`}
-                        >
-                          {copy.monitorHealthLabels[project.monitor.health]}
-                        </span>
-                        <span
-                          className="status-pill"
-                          data-status={continuityTone(continuity.state)}
-                          data-testid={`project-continuity-${project.projectId}`}
-                        >
-                          {copy.continuityStateLabels[continuity.state]}
-                        </span>
-                        <span>{copy.formatCount(warningCount, 'warning')}</span>
-                      </div>
-                      <p className="project-card__monitor" data-testid={`project-monitor-summary-${project.projectId}`}>
-                        {describeMonitorState(project.monitor, project.snapshot.status, copy)}
-                      </p>
-                      {initJob ? (
-                        <div className="project-card__job" data-testid={`project-init-stage-${project.projectId}`}>
-                          <span className="status-pill status-pill--job" data-status={initJob.stage}>
-                            {copy.initStageLabels[initJob.stage]}
-                          </span>
-                          <span>{initSummary}</span>
-                        </div>
-                      ) : null}
-                      <time dateTime={project.snapshot.checkedAt}>{formatTimestamp(project.snapshot.checkedAt, locale)}</time>
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-          </section>
-
-          {renderStreamStrip()}
-        </aside>
-
+        <section className="workspace-layout app-page detail-workspace" id="app-page-details" aria-labelledby="detail-heading">
         <section className="panel detail-panel" aria-labelledby="detail-heading">
-          <div className="panel-header visualizer-titlebar">
-            <div>
-              <h2 id="detail-heading">{copy.labels.workflowVisualizer}</h2>
-              <p>
-                {copy.labels.workflowPhase}: <span className="inline-code">{selectedWorkflowPhase}</span>
-                {' · '}
-                {copy.labels.remainingSlices}: <span className="inline-code">{selectedRemainingSlices}</span>
-              </p>
-            </div>
-            <div className="panel-header__actions">
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => {
-                  if (selectedProjectIdRef.current) {
-                    void syncSelectedProjectPanels(selectedProjectIdRef.current, selectedProjectRef.current);
-                  }
-                }}
-                disabled={!selectedProjectId || detailLoading || timelineLoading}
-              >
-                {detailLoading || timelineLoading ? copy.actions.reloading : copy.actions.reloadDetail}
-              </button>
-              {selectedInitActionVisible ? (
-                <button
-                  type="button"
-                  className="primary-button"
-                  data-testid="init-action"
-                  onClick={() => {
-                    void handleInitializeSelected();
-                  }}
-                  disabled={selectedInitActionDisabled}
-                >
-                  {initButtonLabel(
-                    selectedProject!,
-                    {
-                      requestPending: selectedInitRequestPending,
-                      syncingDetail: selectedInitSyncingDetail,
-                    },
-                    copy,
-                  )}
-                </button>
-              ) : null}
-              <button
-                type="button"
-                className={selectedInitActionVisible ? 'secondary-button' : 'primary-button'}
-                onClick={() => {
-                  void handleRefreshSelected();
-                }}
-                disabled={!selectedProjectId || refreshPending}
-              >
-                {refreshPending ? copy.actions.refreshing : copy.actions.refreshSelected}
-              </button>
-            </div>
-          </div>
+          <h2 id="detail-heading" className="visually-hidden">{copy.labels.workflowVisualizer}</h2>
 
           <div className="detail-panel__body">
           {detailError ? (
@@ -4592,129 +5798,66 @@ export default function App() {
 
           {selectedProject ? (
             <div className="detail-content visualizer-content">
-              <div className="workflow-canvas">
-              <header className="detail-header">
-                <div>
-                  <p className="eyebrow">{selectedProject.projectId}</p>
-                  <h3>{describeProject(selectedProject)}</h3>
-                  <p className="detail-header__path" data-testid="detail-canonical-path">
-                    {selectedProject.canonicalPath}
-                  </p>
-                </div>
-                <div className="detail-header__meta">
-                  <span className="status-pill" data-status={selectedProject.snapshot.status} data-testid="detail-status">
-                    {copy.statusLabels[selectedProject.snapshot.status]}
-                  </span>
-                  <span className="status-pill" data-status={selectedProject.monitor.health} data-testid="detail-monitor-health">
-                    {copy.monitorHealthLabels[selectedProject.monitor.health]}
-                  </span>
-                  <span
-                    className="status-pill"
-                    data-status={continuityTone(selectedContinuity!.state)}
-                    data-testid="detail-continuity-state"
-                  >
-                    {copy.continuityStateLabels[selectedContinuity!.state]}
-                  </span>
-                  <span className="meta-badge" data-testid="detail-warning-count">
-                    {copy.formatCount(selectedProject.snapshot.warnings.length, 'warning')}
-                  </span>
-                </div>
-              </header>
-
-              <details className="project-meta-corner">
-                <summary>
-                  <span>{copy.labels.projectDetail}</span>
-                  <span>{copy.labels.snapshotChecked}</span>
-                </summary>
-                <dl className="detail-facts detail-facts--compact">
-                  <div>
-                    <dt>{copy.labels.registeredPath}</dt>
-                    <dd>{selectedProject.registeredPath}</dd>
-                  </div>
-                  <div>
-                    <dt>{copy.labels.projectId}</dt>
-                    <dd data-testid="detail-project-id-value">{selectedProject.projectId}</dd>
-                  </div>
-                  <div>
-                    <dt>{copy.labels.lastEvent}</dt>
-                    <dd>{selectedProject.lastEventId ?? copy.messages.noLastEvent}</dd>
-                  </div>
-                  <div>
-                    <dt>{copy.labels.snapshotChecked}</dt>
-                    <dd>
-                      <time dateTime={selectedProject.snapshot.checkedAt} data-testid="detail-snapshot-checked-at">
-                        {formatTimestamp(selectedProject.snapshot.checkedAt, locale)}
-                      </time>
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>{copy.labels.lastAttempted}</dt>
-                    <dd data-testid="detail-monitor-last-attempted">
-                      {selectedProject.monitor.lastAttemptedAt ? (
-                        <time dateTime={selectedProject.monitor.lastAttemptedAt}>
-                          {formatTimestamp(selectedProject.monitor.lastAttemptedAt, locale)}
-                        </time>
-                      ) : (
-                        copy.messages.notRecorded
-                      )}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>{copy.labels.lastSuccessful}</dt>
-                    <dd data-testid="detail-monitor-last-successful">
-                      {selectedProject.monitor.lastSuccessfulAt ? (
-                        <time dateTime={selectedProject.monitor.lastSuccessfulAt}>
-                          {formatTimestamp(selectedProject.monitor.lastSuccessfulAt, locale)}
-                        </time>
-                      ) : (
-                        copy.messages.notRecorded
-                      )}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>{copy.labels.lastTrigger}</dt>
-                    <dd data-testid="detail-monitor-last-trigger">
-                      {formatProjectReconcileTrigger(selectedProject.monitor.lastTrigger, copy)}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>{copy.labels.gsdId}</dt>
-                    <dd data-testid="detail-gsd-id">
-                      {selectedProject.snapshot.identityHints.gsdId ?? copy.messages.noGsdId}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>{copy.labels.repoFingerprint}</dt>
-                    <dd>{selectedProject.snapshot.identityHints.repoFingerprint ?? copy.messages.repoFingerprintUnavailable}</dd>
-                  </div>
-                  <div>
-                    <dt>{copy.labels.dataLocation}</dt>
-                    <dd>{selectedProject.dataLocation.gsdDbPath}</dd>
-                  </div>
-                </dl>
-              </details>
-
-              <div className="workflow-stat-strip">
-                <div>
-                  <span className="stat-card__label">{copy.labels.criticalPath}</span>
-                  <strong>{selectedExecutionPath}</strong>
-                </div>
-                <div>
-                  <span className="stat-card__label">{copy.labels.completed}</span>
-                  <strong>{selectedCompletedSlices}</strong>
-                </div>
-                <div>
-                  <span className="stat-card__label">{copy.labels.gsdDbPath}</span>
-                  <strong>{basenameFromPath(selectedProject.dataLocation.gsdDbPath)}</strong>
-                </div>
+              <div className="visually-hidden">
+                <span data-testid="detail-canonical-path">{selectedProject.canonicalPath}</span>
+                <span data-testid="detail-status">{copy.statusLabels[selectedProject.snapshot.status]}</span>
+                <span data-testid="detail-monitor-health">{copy.monitorHealthLabels[selectedProject.monitor.health]}</span>
+                <span data-testid="detail-continuity-state">
+                  {copy.continuityStateLabels[selectedContinuity!.state]}
+                </span>
+                <span data-testid="detail-warning-count">
+                  {copy.formatCount(selectedProject.snapshot.warnings.length, 'warning')}
+                </span>
+                <span data-testid="detail-project-id-value">{selectedProject.projectId}</span>
+                <span data-testid="detail-snapshot-checked-at">
+                  {formatTimestamp(selectedProject.snapshot.checkedAt, locale)}
+                </span>
+                <span data-testid="detail-monitor-last-attempted">
+                  {selectedProject.monitor.lastAttemptedAt
+                    ? formatTimestamp(selectedProject.monitor.lastAttemptedAt, locale)
+                    : copy.messages.notRecorded}
+                </span>
+                <span data-testid="detail-monitor-last-successful">
+                  {selectedProject.monitor.lastSuccessfulAt
+                    ? formatTimestamp(selectedProject.monitor.lastSuccessfulAt, locale)
+                    : copy.messages.notRecorded}
+                </span>
+                <span data-testid="detail-monitor-last-trigger">
+                  {formatProjectReconcileTrigger(selectedProject.monitor.lastTrigger, copy)}
+                </span>
+                <span data-testid="detail-gsd-id">
+                  {selectedProject.snapshot.identityHints.gsdId ?? copy.messages.noGsdId}
+                </span>
+                {renderStreamStrip()}
               </div>
 
-              <div
-                className="workflow-tabs"
-                aria-label="GSD workflow sections"
-                role="tablist"
-                onKeyDown={handleWorkflowTabsKeyDown}
-              >
+              <div className="visualizer-dashboard">
+                <div className="visualizer-dashboard__left">
+                  <WorkflowGraphPanel
+                    milestones={selectedMilestones}
+                    dependencies={selectedSliceDependencies}
+                    activeMilestoneId={selectedActiveMilestone?.id ?? null}
+                    activeSliceId={selectedActiveSlice?.id ?? null}
+                    activeTask={selectedActiveTask}
+                    copy={copy}
+                  />
+
+                  <RuntimeMetricsPanel
+                    metrics={selectedMetrics}
+                    executionStats={selectedExecutionStats}
+                    workflowPhase={selectedWorkflowPhase}
+                    locale={locale}
+                    copy={copy}
+                  />
+                </div>
+
+                <div className="visualizer-dashboard__right">
+                  <div
+                    className="workflow-tabs"
+                    aria-label="GSD workflow sections"
+                    role="tablist"
+                    onKeyDown={handleWorkflowTabsKeyDown}
+                  >
                 {WORKFLOW_TABS.map((tab) => (
                   <button
                     key={tab}
@@ -4735,9 +5878,9 @@ export default function App() {
                     <span>{workflowTabLabel(tab, copy)}</span>
                   </button>
                 ))}
-              </div>
+                  </div>
 
-              <div className="workflow-pages" data-active-tab={activeWorkflowTab}>
+                  <div className="workflow-pages" data-active-tab={activeWorkflowTab}>
               <section
                 className="workflow-page subpanel milestones-panel"
                 id="workflow-panel-progress"
@@ -4746,158 +5889,17 @@ export default function App() {
                 data-testid="milestones-panel"
                 hidden={activeWorkflowTab !== 'progress'}
               >
-                <div className="subpanel__header subpanel__header--actions">
-                  <div>
-                    <h4>{copy.labels.gsdMilestones}</h4>
-                    <p>{copy.formatCount(selectedMilestones.length, 'milestone')}</p>
-                  </div>
-                  {selectedGsdDb ? (
-                    <div className="detail-header__meta">
-                      <span className="meta-badge">{copy.formatCount(selectedGsdDb.counts.slices ?? 0, 'slice')}</span>
-                      <span className="meta-badge">{copy.formatCount(selectedGsdDb.counts.tasks ?? 0, 'task')}</span>
-                    </div>
-                  ) : null}
-                </div>
-
-                {selectedMilestones.length === 0 ? (
-                  <p>{copy.messages.noMilestones}</p>
-                ) : (
-                  <div className="milestone-list">
-                    {selectedMilestones.map((milestone) => {
-                      const milestoneProgress = getMilestoneProgress(milestone);
-                      const milestoneProgressPercent =
-                        milestoneProgress.total === 0
-                          ? 0
-                          : Math.round((milestoneProgress.completed / milestoneProgress.total) * 100);
-                      const milestoneActive = milestone.id === selectedActiveMilestone?.id;
-
-                      return (
-                      <details
-                        className="milestone-row"
-                        data-active={milestoneActive}
-                        data-status={statusTone(milestone.status)}
-                        key={milestone.id}
-                        open={milestoneActive || undefined}
-                      >
-                        <summary className="milestone-row__summary">
-                          <div className="milestone-row__header">
-                            <span className="meta-badge">{milestone.id}</span>
-                            <strong>{milestoneTitle(milestone)}</strong>
-                            {milestone.status ? (
-                              <span className="status-pill" data-status={statusTone(milestone.status)}>
-                                {milestone.status}
-                              </span>
-                            ) : null}
-                          </div>
-                          <div className="milestone-row__meter">
-                            <span style={{ width: `${milestoneProgressPercent}%` }} />
-                          </div>
-                          <div className="milestone-row__meta">
-                            <span>
-                              {milestoneProgress.completed}/{milestoneProgress.total} {copy.labels.completed}
-                            </span>
-                            <span>{copy.formatCount(milestone.sliceCount, 'slice')}</span>
-                            <span>
-                              {milestone.completedTaskCount}/{milestone.taskCount} {copy.labels.tasks}
-                            </span>
-                          </div>
-                        </summary>
-                        {milestone.slices.length > 0 ? (
-                          <div className="slice-risk-board">
-                            {groupedSlicesByRisk(milestone.slices).map((group) => (
-                              <section
-                                className="slice-risk-group"
-                                data-risk={group.level}
-                                key={`${milestone.id}-${group.level}`}
-                              >
-                                <div className="slice-risk-group__header">
-                                  <span>{readableRiskLabel(group.level, locale)}</span>
-                                  <strong>{copy.formatCount(group.slices.length, 'slice')}</strong>
-                                </div>
-                                <div className="slice-list">
-                                  {group.slices.map((slice) => {
-                                    const sliceActive =
-                                      milestone.id === selectedActiveMilestone?.id
-                                      && slice.id === selectedActiveSlice?.id;
-                                    const sliceCurrentTask = sliceActive ? selectedActiveTask : null;
-
-                                    return (
-                                      <details
-                                        className="slice-card"
-                                        data-status={statusTone(slice.status)}
-                                        data-risk={getSliceRiskLevel(slice)}
-                                        data-active={sliceActive}
-                                        open={sliceActive || undefined}
-                                        key={`${milestone.id}-${slice.id}`}
-                                      >
-                                        <summary className="slice-card__summary">
-                                          <div className="slice-card__header">
-                                            <span className="meta-badge">{slice.id}</span>
-                                            <span className="status-pill" data-status={statusTone(slice.status)}>
-                                              {slice.status ?? copy.messages.unknown}
-                                            </span>
-                                          </div>
-                                          <strong>{sentenceCaseTitle(sliceTitle(slice))}</strong>
-                                          <div className="slice-card__footer">
-                                            <span>
-                                              {slice.completedTaskCount}/{slice.taskCount} {copy.labels.tasks}
-                                            </span>
-                                            <span className="warning-code">
-                                              {readableRiskLabel(getSliceRiskLevel(slice), locale)}
-                                            </span>
-                                          </div>
-                                          {sliceCurrentTask ? (
-                                            <span className="slice-card__current">
-                                              {copy.labels.currentTask}: {sliceCurrentTask.id}
-                                            </span>
-                                          ) : null}
-                                        </summary>
-
-                                        {slice.tasks.length > 0 ? (
-                                          <ol className="slice-task-list">
-                                            {slice.tasks.map((task) => {
-                                              const taskCurrent =
-                                                sliceCurrentTask !== null && task === sliceCurrentTask;
-
-                                              return (
-                                                <li
-                                                  className="slice-task-row"
-                                                  data-current={taskCurrent}
-                                                  data-status={statusTone(task.status)}
-                                                  key={`${slice.id}-${task.id}`}
-                                                >
-                                                  <span
-                                                    className="status-dot"
-                                                    data-status={taskCurrent ? 'active' : statusTone(task.status)}
-                                                  />
-                                                  <strong>{task.id}</strong>
-                                                  <span>{taskTitle(task)}</span>
-                                                  <span
-                                                    className="status-pill"
-                                                    data-status={taskCurrent ? 'active' : statusTone(task.status)}
-                                                  >
-                                                    {taskCurrent
-                                                      ? copy.labels.currentTask
-                                                      : task.status ?? copy.messages.unknown}
-                                                  </span>
-                                                </li>
-                                              );
-                                            })}
-                                          </ol>
-                                        ) : null}
-                                      </details>
-                                    );
-                                  })}
-                                </div>
-                              </section>
-                            ))}
-                          </div>
-                        ) : null}
-                      </details>
-                    );
-                    })}
-                  </div>
-                )}
+                <WorkflowMilestoneRail
+                  milestones={selectedMilestones}
+                  dependencies={selectedSliceDependencies}
+                  activeMilestoneId={selectedActiveMilestone?.id ?? null}
+                  activeSliceId={selectedActiveSlice?.id ?? null}
+                  activeTask={selectedActiveTask}
+                  validationIssueCount={selectedProject.snapshot.warnings.length}
+                  locale={locale}
+                  copy={copy}
+                  variant="dashboard"
+                />
               </section>
 
               <section
@@ -5015,70 +6017,156 @@ export default function App() {
                   </div>
                   <div className="panel-header__actions">
                     <span className="meta-badge" data-testid="timeline-total">
-                      {selectedTimelineCountLabel}
+                      {selectedTaskTimelineCountLabel}
                     </span>
                     <button
                       type="button"
                       className="secondary-button"
                       onClick={() => {
                         if (selectedProjectIdRef.current) {
-                          void loadProjectTimeline(selectedProjectIdRef.current);
+                          void syncSelectedProjectPanels(selectedProjectIdRef.current);
                         }
                       }}
-                      disabled={!selectedProjectId || timelineLoading}
+                      disabled={!selectedProjectId || detailLoading || timelineLoading}
                     >
-                      {timelineLoading ? copy.actions.reloading : copy.actions.reloadTimeline}
+                      {detailLoading || timelineLoading ? copy.actions.reloading : copy.actions.reloadTimeline}
                     </button>
                   </div>
                 </div>
 
-                {projectTimeline.items.length === 0 ? (
+                {selectedTaskTimeline.length === 0 ? (
                   <p data-testid="timeline-empty">{copy.empty.timeline}</p>
                 ) : null}
 
-                {projectTimeline.items.length > 0 ? (
+                {selectedTaskTimeline.length > 0 ? (
                   <ol className="timeline-list" data-testid="timeline-list">
-                    {projectTimeline.items.map((entry) => (
-                      <li className="timeline-item" data-type={entry.type} key={entry.id}>
-                        <div className="timeline-item__header">
-                          <strong>{copy.timelineTypeLabels[entry.type]}</strong>
-                          <time dateTime={entry.emittedAt}>{formatTimestamp(entry.emittedAt, locale)}</time>
-                        </div>
+                    {selectedTaskTimeline.map((entry) => {
+                      const taskStatus = entry.task.status ?? copy.messages.unknown;
+                      const taskTone = statusTone(entry.task.status);
+                      const elapsedActiveMs =
+                        entry.actualDurationMs
+                        ?? (entry.startedAtMs !== null && entry.finishedAtMs === null && isWorkflowStatusActive(entry.task.status)
+                          ? Math.max(0, nowMs - entry.startedAtMs)
+                          : null);
+                      const timelineBudgetMs = (elapsedActiveMs ?? 0) + (entry.estimatedRemainingMs ?? 0);
+                      const actualWidthPercent =
+                        timelineBudgetMs > 0 && elapsedActiveMs !== null
+                          ? Math.min(100, Math.max(6, Math.round((elapsedActiveMs / timelineBudgetMs) * 100)))
+                          : isWorkflowStatusComplete(entry.task.status)
+                            ? 100
+                            : 0;
 
-                        <div className="timeline-item__badges">
-                          <span className="status-pill" data-status={timelineTone(entry.type)}>
-                            {copy.timelineTypeLabels[entry.type]}
-                          </span>
-                          <span className="status-pill" data-status={entry.snapshotStatus}>
-                            {copy.statusLabels[entry.snapshotStatus]}
-                          </span>
-                          <span className="status-pill" data-status={entry.monitorHealth}>
-                            {copy.monitorHealthLabels[entry.monitorHealth]}
-                          </span>
-                          <span className="meta-badge">
-                            {copy.reconcileTriggerLabels[entry.trigger]}
-                          </span>
-                          <span className="meta-badge">
-                            {copy.formatCount(entry.warningCount, 'warning')}
-                          </span>
-                        </div>
-
-                        <p className="timeline-item__detail">{entry.detail}</p>
-
-                        {entry.error ? (
-                          <div className="timeline-item__error inline-alert inline-alert--error">
-                            <strong>
-                              {entry.error.scope} · {formatTimestamp(entry.error.at, locale)}
-                            </strong>
-                            <p>{clampWarning(entry.error.message)}</p>
+                      return (
+                        <li
+                          className="timeline-item timeline-item--task"
+                          data-status={taskTone}
+                          data-testid="task-timeline-item"
+                          key={entry.key}
+                        >
+                          <div className="timeline-item__header timeline-item__header--task">
+                            <div>
+                              <span className="meta-badge">{entry.path}</span>
+                              <strong>{sentenceCaseTitle(taskTitle(entry.task))}</strong>
+                            </div>
+                            <span className="status-pill" data-status={taskTone}>
+                              {taskStatus}
+                            </span>
                           </div>
-                        ) : null}
-                      </li>
-                    ))}
+
+                          <div
+                            className="task-timeline__bar"
+                            aria-hidden="true"
+                            data-complete={isWorkflowStatusComplete(entry.task.status)}
+                          >
+                            <span style={{ width: `${actualWidthPercent}%` }} />
+                          </div>
+
+                          <dl className="task-timeline__meta">
+                            <div>
+                              <dt>{copy.labels.firstStarted}</dt>
+                              <dd>
+                                {entry.startedAtMs === null
+                                  ? copy.messages.notRecorded
+                                  : formatMetricTimestamp(entry.startedAtMs, locale, copy.messages.notRecorded)}
+                              </dd>
+                            </div>
+                            <div>
+                              <dt>{copy.labels.lastFinished}</dt>
+                              <dd>
+                                {entry.finishedAtMs === null
+                                  ? isWorkflowStatusActive(entry.task.status)
+                                    ? taskStatus
+                                    : copy.messages.notRecorded
+                                  : formatMetricTimestamp(entry.finishedAtMs, locale, copy.messages.notRecorded)}
+                              </dd>
+                            </div>
+                            <div>
+                              <dt>{copy.labels.actualDuration}</dt>
+                              <dd>{formatDuration(elapsedActiveMs, locale, copy.messages.notRecorded)}</dd>
+                            </div>
+                            <div>
+                              <dt>{copy.labels.estimatedRemaining}</dt>
+                              <dd>{formatDuration(entry.estimatedRemainingMs, locale, copy.messages.estimateUnavailable)}</dd>
+                            </div>
+                          </dl>
+                        </li>
+                      );
+                    })}
                   </ol>
-                ) : (
-                  <p data-testid="timeline-empty">{copy.empty.timeline}</p>
-                )}
+                ) : null}
+
+                <section className="project-event-log" data-testid="project-event-log">
+                  <div className="project-event-log__header">
+                    <h5>{copy.labels.project} {copy.labels.event}</h5>
+                    <span className="meta-badge" data-testid="project-event-total">
+                      {selectedTimelineCountLabel}
+                    </span>
+                  </div>
+
+                  {projectTimeline.items.length === 0 ? (
+                    <p>{copy.messages.noLastEvent}</p>
+                  ) : (
+                    <ol className="project-event-list" data-testid="project-event-list">
+                      {projectTimeline.items.map((entry) => (
+                        <li className="timeline-item" data-type={entry.type} key={entry.id}>
+                          <div className="timeline-item__header">
+                            <strong>{copy.timelineTypeLabels[entry.type]}</strong>
+                            <time dateTime={entry.emittedAt}>{formatTimestamp(entry.emittedAt, locale)}</time>
+                          </div>
+
+                          <div className="timeline-item__badges">
+                            <span className="status-pill" data-status={timelineTone(entry.type)}>
+                              {copy.timelineTypeLabels[entry.type]}
+                            </span>
+                            <span className="status-pill" data-status={entry.snapshotStatus}>
+                              {copy.statusLabels[entry.snapshotStatus]}
+                            </span>
+                            <span className="status-pill" data-status={entry.monitorHealth}>
+                              {copy.monitorHealthLabels[entry.monitorHealth]}
+                            </span>
+                            <span className="meta-badge">
+                              {copy.reconcileTriggerLabels[entry.trigger]}
+                            </span>
+                            <span className="meta-badge">
+                              {copy.formatCount(entry.warningCount, 'warning')}
+                            </span>
+                          </div>
+
+                          <p className="timeline-item__detail">{entry.detail}</p>
+
+                          {entry.error ? (
+                            <div className="timeline-item__error inline-alert inline-alert--error">
+                              <strong>
+                                {entry.error.scope} · {formatTimestamp(entry.error.at, locale)}
+                              </strong>
+                              <p>{clampWarning(entry.error.message)}</p>
+                            </div>
+                          ) : null}
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </section>
               </section>
 
               <section
@@ -5609,17 +6697,9 @@ export default function App() {
                   </div>
                 </dl>
               </section>
+                  </div>
+                </div>
               </div>
-              </div>
-
-              <WorkflowMilestoneRail
-                milestones={selectedMilestones}
-                activeMilestoneId={selectedActiveMilestone?.id ?? null}
-                activeSliceId={selectedActiveSlice?.id ?? null}
-                activeTask={selectedActiveTask}
-                validationIssueCount={selectedProject.snapshot.warnings.length}
-                copy={copy}
-              />
             </div>
           ) : (
             <div className="empty-state" data-testid="detail-empty">
@@ -5629,17 +6709,54 @@ export default function App() {
           )}
           </div>
           <div className="terminal-dock">
-            <strong>{copy.labels.terminal}</strong>
-            <span aria-hidden="true">^</span>
-            <p>
-              {selectedProject
-                ? `${copy.messages.terminalIdle} · ${selectedProject.dataLocation.gsdDbPath}`
-                : copy.messages.terminalIdle}
-            </p>
+            <div className="terminal-dock__status">
+              <strong>{copy.labels.terminal}</strong>
+              <span aria-hidden="true">^</span>
+              <p>
+                {selectedProject
+                  ? `${copy.messages.terminalIdle} · ${selectedProject.dataLocation.gsdDbPath}`
+                  : copy.messages.terminalIdle}
+              </p>
+            </div>
+            {selectedProject ? (
+              <div className="terminal-dock__actions">
+                {selectedInitActionVisible ? (
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    data-testid="init-action"
+                    onClick={() => {
+                      void handleInitializeSelected();
+                    }}
+                    disabled={selectedInitActionDisabled}
+                  >
+                    {initButtonLabel(
+                      selectedProject,
+                      {
+                        requestPending: selectedInitRequestPending,
+                        syncingDetail: selectedInitSyncingDetail,
+                      },
+                      copy,
+                    )}
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  className={selectedInitActionVisible ? 'secondary-button' : 'primary-button'}
+                  onClick={() => {
+                    void handleRefreshSelected();
+                  }}
+                  disabled={!selectedProjectId || refreshPending}
+                >
+                  {refreshPending ? copy.actions.refreshing : copy.actions.refreshSelected}
+                </button>
+              </div>
+            ) : null}
           </div>
         </section>
         </section>
         ) : null}
+        </section>
       </section>
       )}
 

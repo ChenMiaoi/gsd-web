@@ -52,6 +52,7 @@ export interface UiCopy {
     newProjectPath: string;
     registeredInventory: string;
     projectDetail: string;
+    projectSwitch: string;
     monitorFreshness: string;
     projectContinuity: string;
     initialization: string;
@@ -166,6 +167,9 @@ export interface UiCopy {
     reloadTimeline: string;
     retryTimeline: string;
     exportSnapshot: string;
+    zoomInGraph: string;
+    zoomOutGraph: string;
+    resetGraphZoom: string;
     browseFolders: string;
     closePicker: string;
     useCurrentFolder: string;
@@ -225,6 +229,7 @@ export interface UiCopy {
     noAgentUnits: string;
     noModelUsage: string;
     selectedFolderHint: string;
+    dragGraphHint: string;
   };
   notices: {
     registeredSuccess: (name: string) => string;
@@ -343,12 +348,13 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       newProjectPath: 'New project path',
       registeredInventory: 'Registered inventory',
       projectDetail: 'Project detail',
+      projectSwitch: 'Project switch',
       monitorFreshness: 'Monitor freshness',
       projectContinuity: 'Project continuity',
       initialization: 'Initialization',
       directorySummary: 'Directory summary',
       warnings: 'Warnings',
-      recentTimeline: 'Recent timeline',
+      recentTimeline: 'Task timeline',
       snapshotSourceStates: 'Snapshot source states',
       repoMetadata: 'Repo metadata',
       workspaceNotes: 'Workspace notes',
@@ -436,7 +442,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       monitor: 'Service-owned reconcile health that stays distinct from the current snapshot state.',
       continuity: 'Stable identity, explicit path-loss truth, and relink stay attached to the same project record.',
       initialization: 'Explicitly run the supported `/gsd init` flow without leaving this project detail.',
-      timeline: 'Persisted project events from registration, refresh, monitoring, path loss, and relink activity.',
+      timeline: 'Each task is shown from startedAt to finishedAt, with actual time and the current estimate.',
       sources: 'Per-source truth from the backend snapshot adapter.',
     },
     actions: {
@@ -459,6 +465,9 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       reloadTimeline: 'Reload timeline',
       retryTimeline: 'Retry timeline',
       exportSnapshot: 'Export snapshot JSON',
+      zoomInGraph: 'Zoom in graph',
+      zoomOutGraph: 'Zoom out graph',
+      resetGraphZoom: 'Reset graph zoom',
       browseFolders: 'Browse folders',
       closePicker: 'Close',
       useCurrentFolder: 'Register this folder',
@@ -477,7 +486,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       inventoryCopy: 'Register an empty directory or initialized workspace to see truthful snapshot status.',
       detailTitle: 'No project selected.',
       detailCopy: 'Register or choose a project card to inspect its truthful snapshot detail.',
-      timeline: 'No recent timeline entries are persisted for this project yet.',
+      timeline: 'No task timing rows were found in the current workflow snapshot yet.',
       init: 'This project will stay uninitialized until you explicitly start the supported bootstrap flow.',
     },
     messages: {
@@ -521,6 +530,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       noAgentUnits: 'No recent agent units were recorded yet.',
       noModelUsage: 'No model usage has been recorded yet.',
       selectedFolderHint: 'Choose a folder from the service host and use it as the project path.',
+      dragGraphHint: 'Drag the graph to pan. Use zoom controls when the workflow exceeds the visible area.',
     },
     notices: {
       registeredSuccess: (name) => `Registered ${name}.`,
@@ -667,12 +677,13 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       newProjectPath: '新的项目路径',
       registeredInventory: '已登记清单',
       projectDetail: '项目详情',
+      projectSwitch: '项目切换',
       monitorFreshness: '监控新鲜度',
       projectContinuity: '项目连续性',
       initialization: '初始化',
       directorySummary: '目录摘要',
       warnings: '警告',
-      recentTimeline: '最近时间线',
+      recentTimeline: '任务时间线',
       snapshotSourceStates: '快照来源状态',
       repoMetadata: '仓库元数据',
       workspaceNotes: '工作区备注',
@@ -758,7 +769,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       monitor: '服务侧 reconcile 健康度，与当前快照状态分开呈现。',
       continuity: '稳定身份、路径丢失事实和重连记录都会保留在同一个项目记录上。',
       initialization: '无需离开详情页，即可显式运行受支持的 `/gsd init` 流程。',
-      timeline: '展示登记、刷新、监控、路径丢失与重连等已持久化项目事件。',
+      timeline: '展示每个任务从 startedAt 到 finishedAt 的区间，并附带实际耗时与当前预估。',
       sources: '后端快照适配器返回的逐来源事实。',
     },
     actions: {
@@ -781,6 +792,9 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       reloadTimeline: '重新加载时间线',
       retryTimeline: '重试时间线',
       exportSnapshot: '导出快照 JSON',
+      zoomInGraph: '放大图形',
+      zoomOutGraph: '缩小图形',
+      resetGraphZoom: '重置图形缩放',
       browseFolders: '选择目录',
       closePicker: '关闭',
       useCurrentFolder: '登记此目录',
@@ -799,7 +813,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       inventoryCopy: '登记一个空目录或已初始化工作区，即可查看真实快照状态。',
       detailTitle: '未选择项目。',
       detailCopy: '登记或选择一个项目卡片来查看真实快照详情。',
-      timeline: '该项目还没有持久化的最近时间线记录。',
+      timeline: '当前工作流快照中还没有可显示的任务计时记录。',
       init: '在你显式启动受支持的 bootstrap 流程之前，该项目会保持未初始化状态。',
     },
     messages: {
@@ -842,6 +856,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       noAgentUnits: '还没有记录最近的 Agent 单元。',
       noModelUsage: '还没有记录模型使用情况。',
       selectedFolderHint: '从服务运行机器的文件树中选择目录，并作为项目路径使用。',
+      dragGraphHint: '当工作流超出可视范围时，可以拖动画布查看，并使用缩放按钮调整视图。',
     },
     notices: {
       registeredSuccess: (name) => `已登记 ${name}。`,

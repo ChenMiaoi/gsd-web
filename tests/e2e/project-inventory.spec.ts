@@ -67,6 +67,34 @@ async function getProjectByCanonicalPath(baseUrl: string, canonicalPath: string)
   return match;
 }
 
+async function registerProject(baseUrl: string, projectPath: string): Promise<ProjectMutationResponse> {
+  const response = await fetch(`${baseUrl}/api/projects/register`, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      path: projectPath,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Expected project registration to succeed, got ${response.status}`);
+  }
+
+  return (await response.json()) as ProjectMutationResponse;
+}
+
+function formatUsd(value: number) {
+  return new Intl.NumberFormat('en', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: value < 1 ? 3 : 2,
+    maximumFractionDigits: value < 1 ? 3 : 2,
+  }).format(value);
+}
+
 type Harness = {
   app: FastifyInstance;
   baseUrl: string;
@@ -113,21 +141,28 @@ test.describe('hosted dashboard inventory flow', () => {
   });
 
   test('opens project detail through the overview route', async ({ page, harness }) => {
-    const initializedProjectPath = await createInitializedProject(harness.workspace.root, 'routed-project');
+    const firstProjectPath = await createInitializedProject(harness.workspace.root, 'routed-project');
+    const secondProjectPath = await createInitializedProject(harness.workspace.root, 'summary-project');
+    const firstRegistration = await registerProject(harness.baseUrl, firstProjectPath);
+    const secondRegistration = await registerProject(harness.baseUrl, secondProjectPath);
+    const totalCost =
+      (firstRegistration.project.snapshot.sources.metricsJson.value?.totals.cost ?? 0)
+      + (secondRegistration.project.snapshot.sources.metricsJson.value?.totals.cost ?? 0);
 
     await page.goto(`${harness.baseUrl}/hello/all`);
-    await page.getByLabel('Project path').fill(initializedProjectPath);
-    await page.getByRole('button', { name: 'Register project' }).click();
-    await expect(page.getByTestId('register-success')).toContainText('Registered');
+    await expect(page.getByTestId('app-topbar-marquee-heading')).toContainText('2 projects');
+    await expect(page.getByTestId('app-topbar-marquee-heading')).not.toContainText('routed-project');
+    await expect(page.getByTestId('app-topbar-stage-value')).toContainText('2');
+    await expect(page.getByTestId('app-topbar-total-cost')).toContainText(formatUsd(totalCost));
 
-    const registeredProject = await getProjectByCanonicalPath(harness.baseUrl, initializedProjectPath);
+    await page.getByTestId(`overview-project-card-${firstRegistration.project.projectId}`).click();
 
-    await expect(page).toHaveURL(`${harness.baseUrl}/hello/${registeredProject.projectId}`);
+    await expect(page).toHaveURL(`${harness.baseUrl}/hello/${firstRegistration.project.projectId}`);
+    await expect(page.getByTestId('detail-project-id-value')).toContainText(firstRegistration.project.projectId);
+
     await page.goto(`${harness.baseUrl}/hello/all`);
-    await page.getByTestId(`overview-project-card-${registeredProject.projectId}`).click();
-
-    await expect(page).toHaveURL(`${harness.baseUrl}/hello/${registeredProject.projectId}`);
-    await expect(page.getByTestId('detail-project-id-value')).toContainText(registeredProject.projectId);
+    await expect(page.getByTestId('app-topbar-marquee-heading')).toContainText('2 projects');
+    await expect(page.getByTestId('app-topbar-marquee-heading')).not.toContainText('routed-project');
   });
 
   test('registers empty and degraded projects, then refreshes live detail', async ({ page, harness }) => {
@@ -138,26 +173,21 @@ test.describe('hosted dashboard inventory flow', () => {
       stateMdContent: new Uint8Array([0xc3, 0x28]),
       gsdDbMode: 'corrupt',
     });
+    const emptyRegistration = await registerProject(harness.baseUrl, emptyProjectPath);
+    const partialRegistration = await registerProject(harness.baseUrl, partialProjectPath);
 
     await page.goto(`${harness.baseUrl}/hello/all`);
 
-    await expect(page.getByRole('heading', { name: 'Project inventory' })).toBeVisible();
-    await expect(page.getByTestId('inventory-empty')).toContainText('No registered projects yet');
+    await expect(page.getByRole('heading', { name: 'Project overview' })).toBeVisible();
+    await expect(page.getByTestId('inventory-count')).toContainText('2 projects');
     await expect(page.getByTestId('stream-status')).toContainText('Connected');
 
-    await page.getByLabel('Project path').fill(emptyProjectPath);
-    await page.getByRole('button', { name: 'Register project' }).click();
-
-    await expect(page.getByTestId('inventory-count')).toContainText('1 project');
+    await page.getByTestId(`overview-project-card-${emptyRegistration.project.projectId}`).click();
     await expect(page.getByTestId('detail-status')).toContainText('Uninitialized');
     await expect(page.getByTestId('detail-directory')).toContainText('directory is empty');
     await expect(page.getByTestId('warning-list')).toContainText('No degraded or missing-source warnings');
-    await expect(page.getByTestId('stream-last-event')).toContainText('project.registered');
 
-    await page.getByLabel('Project path').fill(partialProjectPath);
-    await page.getByRole('button', { name: 'Register project' }).click();
-
-    await expect(page.getByTestId('inventory-count')).toContainText('2 projects');
+    await page.goto(`${harness.baseUrl}/hello/${partialRegistration.project.projectId}`);
     await expect(page.getByTestId('detail-status')).toContainText('Degraded');
     await expect(page.getByTestId('detail-gsd-id')).toContainText('gsd-partial-project');
     await expect(page.getByTestId('warning-list')).toContainText('PROJECT.md');
@@ -197,27 +227,71 @@ test.describe('hosted dashboard inventory flow', () => {
     await expect(page.getByTestId('stream-last-event')).toContainText('project.refreshed');
   });
 
-  test('rejects blank, duplicate, and server-failed registrations without mutating inventory', async ({ page, harness }) => {
+  test('uses a picker-only registration entrypoint on the overview', async ({ page, harness }) => {
     const registeredProjectPath = await createEmptyProject(harness.workspace.root, 'registered-project');
     const failingProjectPath = await createEmptyProject(harness.workspace.root, 'server-error-project');
+    const workspaceRoot = harness.workspace.root;
+
+    await page.route('**/api/filesystem/directories**', async (route) => {
+      const url = new URL(route.request().url());
+      const currentPath = url.searchParams.get('path');
+
+      if (!currentPath || currentPath === workspaceRoot) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            path: workspaceRoot,
+            parentPath: path.dirname(workspaceRoot),
+            entries: [
+              {
+                name: 'registered-project',
+                path: registeredProjectPath,
+                hidden: false,
+              },
+              {
+                name: 'server-error-project',
+                path: failingProjectPath,
+                hidden: false,
+              },
+            ],
+            truncated: false,
+          }),
+        });
+        return;
+      }
+
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          path: currentPath,
+          parentPath: workspaceRoot,
+          entries: [],
+          truncated: false,
+        }),
+      });
+    });
 
     await page.goto(`${harness.baseUrl}/hello/all`);
+    await expect(page.getByLabel('Project path')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Refresh inventory' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Browse folders' })).toBeVisible();
+    await expect(page.getByTestId('register-selected-path')).toContainText('Choose a folder');
 
-    await page.getByRole('button', { name: 'Register project' }).click();
-    await expect(page.getByTestId('register-error')).toContainText('Enter a local path');
-    await expect(page.getByTestId('inventory-count')).toContainText('0 projects');
+    await page.getByRole('button', { name: 'Browse folders' }).click();
+    await expect(page.getByTestId('directory-picker')).toBeVisible();
+    await page.getByTestId('directory-picker').getByRole('button', { name: 'registered-project' }).click();
+    await page.getByRole('button', { name: 'Register this folder' }).click();
 
-    await page.getByLabel('Project path').fill(registeredProjectPath);
-    await page.getByRole('button', { name: 'Register project' }).click();
-
-    await expect(page.getByTestId('inventory-count')).toContainText('1 project');
     await expect(page.getByTestId('detail-status')).toContainText('Uninitialized');
 
-    await page.getByLabel('Project path').fill(registeredProjectPath);
-    await page.getByRole('button', { name: 'Register project' }).click();
+    await page.goto(`${harness.baseUrl}/hello/all`);
+    await page.getByRole('button', { name: 'Browse folders' }).click();
+    await page.getByTestId('directory-picker').getByRole('button', { name: 'registered-project' }).click();
+    await page.getByRole('button', { name: 'Register this folder' }).click();
 
-    await expect(page.getByTestId('register-error')).toContainText('already present in the inventory');
-    await expect(page.getByLabel('Project path')).toHaveValue(registeredProjectPath);
+    await expect(page.getByTestId('directory-register-error')).toContainText('already present in the inventory');
     await expect(page.getByTestId('inventory-count')).toContainText('1 project');
 
     await page.route(
@@ -235,29 +309,29 @@ test.describe('hosted dashboard inventory flow', () => {
       { times: 1 },
     );
 
-    await page.getByLabel('Project path').fill(failingProjectPath);
-    await page.getByRole('button', { name: 'Register project' }).click();
+    await page.getByRole('button', { name: 'Close' }).click();
+    await page.getByRole('button', { name: 'Browse folders' }).click();
+    await page.getByTestId('directory-picker').getByRole('button', { name: 'server-error-project' }).click();
+    await page.getByRole('button', { name: 'Register this folder' }).click();
 
-    await expect(page.getByTestId('register-error')).toContainText('Simulated register failure');
-    await expect(page.getByLabel('Project path')).toHaveValue(failingProjectPath);
+    await expect(page.getByTestId('directory-register-error')).toContainText('Simulated register failure');
     await expect(page.getByTestId('inventory-count')).toContainText('1 project');
   });
 
   test('switches each workflow tab to the matching panel', async ({ page, harness }) => {
     const initializedProjectPath = await createInitializedProject(harness.workspace.root, 'tabbed-project');
+    const registration = await registerProject(harness.baseUrl, initializedProjectPath);
     const panels = [
       ['Progress', 'milestones-panel'],
       ['Dependencies', 'dependencies-panel'],
       ['Metrics', 'metrics-panel'],
-      ['Recent timeline', 'timeline-panel'],
+      ['Task timeline', 'timeline-panel'],
       ['Agent', 'monitor-panel'],
       ['Changes', 'source-grid'],
       ['Export', 'export-panel'],
     ] as const;
 
-    await page.goto(`${harness.baseUrl}/hello/all`);
-    await page.getByLabel('Project path').fill(initializedProjectPath);
-    await page.getByRole('button', { name: 'Register project' }).click();
+    await page.goto(`${harness.baseUrl}/hello/${registration.project.projectId}`);
 
     await expect(page.getByTestId('detail-status')).toContainText('Initialized');
 
@@ -265,6 +339,13 @@ test.describe('hosted dashboard inventory flow', () => {
       await page.getByRole('tab', { name: tabName }).click();
       await expect(page.getByRole('tab', { name: tabName })).toHaveAttribute('aria-selected', 'true');
       await expect(page.getByTestId(panelTestId)).toBeVisible();
+
+      if (panelTestId === 'timeline-panel') {
+        await expect(page.getByTestId('timeline-list')).toContainText('M001/S01/T01');
+        await expect(page.getByTestId('timeline-list')).toContainText('Completed task');
+        await expect(page.getByTestId('timeline-list')).toContainText('Estimated remaining');
+        await expect(page.getByTestId('project-event-list')).toContainText('Registered');
+      }
 
       for (const [_otherTabName, otherPanelTestId] of panels) {
         if (otherPanelTestId !== panelTestId) {
@@ -288,11 +369,13 @@ test.describe('hosted dashboard inventory flow', () => {
 
     await expect(page.getByTestId('stream-status')).toContainText('Disconnected');
 
-    await page.getByLabel('Project path').fill(initializedProjectPath);
-    await page.getByRole('button', { name: 'Register project' }).click();
+    const registration = await registerProject(harness.baseUrl, initializedProjectPath);
 
-    await expect(page.getByTestId('register-success')).toContainText('Registered');
-    await expect(page.getByTestId('inventory-count')).toContainText('1 project');
+    await expect(page.getByTestId('inventory-count')).toContainText('1 project', {
+      timeout: 8_000,
+    });
+    await expect(page.getByRole('button', { name: 'Refresh inventory' })).toHaveCount(0);
+    await page.getByTestId(`overview-project-card-${registration.project.projectId}`).click();
 
     const registeredProject = await getProjectByCanonicalPath(harness.baseUrl, initializedProjectPath);
     const oversizedWarningMessage = 'Oversized warning text '.repeat(40);
