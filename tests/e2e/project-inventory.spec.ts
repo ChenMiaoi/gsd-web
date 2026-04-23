@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
+import { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
 
 import { test as base, expect } from '@playwright/test';
@@ -93,6 +94,109 @@ function formatUsd(value: number) {
     minimumFractionDigits: value < 1 ? 3 : 2,
     maximumFractionDigits: value < 1 ? 3 : 2,
   }).format(value);
+}
+
+async function addOverflowingWorkflowRows(projectRoot: string) {
+  const database = new DatabaseSync(path.join(projectRoot, '.gsd', 'gsd.db'));
+  const metricUnits = [
+    {
+      type: 'execute-task',
+      id: 'M001/S01/T01',
+      model: 'gpt-5.4',
+      startedAt: 1776865480000,
+      finishedAt: 1776865540000,
+      tokens: { total: 100 },
+      cost: 0.01,
+      toolCalls: 1,
+      apiRequests: 1,
+    },
+    {
+      type: 'execute-task',
+      id: 'M001/S02/T02',
+      model: 'gpt-5.4',
+      startedAt: 1776865600000,
+      finishedAt: 1776865660000,
+      tokens: { total: 100 },
+      cost: 0.01,
+      toolCalls: 1,
+      apiRequests: 1,
+    },
+  ];
+
+  try {
+    const insertSlice = database.prepare(`
+      INSERT INTO slices (id, milestone_id, title, status, risk, depends, sequence)
+      VALUES (?, 'M001', ?, ?, ?, ?, ?)
+    `);
+    const insertDependency = database.prepare(`
+      INSERT INTO slice_dependencies (milestone_id, slice_id, depends_on_slice_id)
+      VALUES ('M001', ?, ?)
+    `);
+    const insertTask = database.prepare(`
+      INSERT INTO tasks (id, slice_id, title, status)
+      VALUES (?, ?, ?, ?)
+    `);
+
+    for (let index = 3; index <= 21; index += 1) {
+      const sliceId = `S${String(index).padStart(2, '0')}`;
+      const previousSliceId = `S${String(index - 1).padStart(2, '0')}`;
+      const sliceStatus = index === 21 ? 'pending' : index % 4 === 0 ? 'active' : 'complete';
+      const risk = index % 5 === 0 ? 'medium' : 'low';
+
+      insertSlice.run(
+        sliceId,
+        `Scrollable slice ${index}`,
+        sliceStatus,
+        risk,
+        JSON.stringify([previousSliceId]),
+        index,
+      );
+      insertDependency.run(sliceId, previousSliceId);
+
+      for (let taskIndex = 1; taskIndex <= 2; taskIndex += 1) {
+        const taskId = `T${String((index - 1) * 2 + taskIndex).padStart(2, '0')}`;
+        const taskStatus = sliceStatus === 'pending' ? 'pending' : sliceStatus === 'active' && taskIndex === 2 ? 'active' : 'complete';
+        const startedAt = 1776865600000 + index * 180000 + taskIndex * 90000;
+
+        insertTask.run(
+          taskId,
+          sliceId,
+          `Scrollable ${sliceId} task ${taskIndex}`,
+          taskStatus,
+        );
+        if (taskStatus === 'pending') {
+          continue;
+        }
+
+        metricUnits.push({
+          type: 'execute-task',
+          id: `M001/${sliceId}/${taskId}`,
+          model: 'gpt-5.4',
+          startedAt,
+          finishedAt: taskStatus === 'active' ? null : startedAt + 60000,
+          tokens: { total: 100 + index + taskIndex },
+          cost: 0.01,
+          toolCalls: 1,
+          apiRequests: 1,
+        });
+      }
+    }
+  } finally {
+    database.close();
+  }
+
+  await writeFile(
+    path.join(projectRoot, '.gsd', 'metrics.json'),
+    `${JSON.stringify(
+      {
+        version: 1,
+        projectStartedAt: 1776865480000,
+        units: metricUnits,
+      },
+      null,
+      2,
+    )}\n`,
+  );
 }
 
 type Harness = {
@@ -353,6 +457,70 @@ test.describe('hosted dashboard inventory flow', () => {
         }
       }
     }
+  });
+
+  test('keeps dense workflow tab panels scrollable inside the dashboard', async ({ page, harness }) => {
+    await page.setViewportSize({ width: 1440, height: 720 });
+
+    const initializedProjectPath = await createInitializedProject(harness.workspace.root, 'scrollable-tabs-project');
+    await addOverflowingWorkflowRows(initializedProjectPath);
+
+    const registration = await registerProject(harness.baseUrl, initializedProjectPath);
+    const workflowPages = page.locator('.workflow-pages');
+    const isWorkflowPagesScrollable = async () => {
+      return workflowPages.evaluate((element) => {
+        const style = window.getComputedStyle(element);
+
+        return element.scrollHeight > element.clientHeight && ['auto', 'scroll'].includes(style.overflowY);
+      });
+    };
+    const scrollWorkflowPagesToEnd = async () => {
+      return workflowPages.evaluate((element) => {
+        element.scrollTop = 0;
+        element.scrollTop = element.scrollHeight;
+
+        return element.scrollTop;
+      });
+    };
+
+    await page.goto(`${harness.baseUrl}/hello/${registration.project.projectId}`);
+    await expect(page.getByTestId('detail-status')).toContainText('Initialized');
+    await expect(page.getByTestId('continuity-panel')).toHaveCount(0);
+    await expect(page.getByTestId('init-panel')).toHaveCount(0);
+    await expect(page.locator('.milestone-focus__index')).toHaveCount(0);
+    await expect(page.getByTestId('milestone-focus-milestone').first()).toContainText('M001');
+    await expect(page.getByTestId('milestone-focus-slice').first()).toContainText('S20');
+    await expect(page.getByTestId('milestone-focus-slice').first()).toContainText('T40');
+
+    await page.getByRole('tab', { name: 'Task timeline' }).click();
+    await expect(page.getByTestId('timeline-list')).toContainText('M001/S20/T40');
+    await expect(page.getByTestId('timeline-list')).toContainText('M001/S21/T41');
+    await expect(page.getByTestId('task-timeline-item').first()).toContainText('M001/S20/T40');
+    await expect(page.getByTestId('task-timeline-item').nth(1)).toContainText('M001/S16/T32');
+
+    const timelineItemPaths = await page.getByTestId('task-timeline-item').evaluateAll((items) =>
+      items.map((item) => item.textContent ?? ''),
+    );
+    const firstPendingIndex = timelineItemPaths.findIndex((text) => text.includes('M001/S21/T41'));
+    const firstCompletedIndex = timelineItemPaths.findIndex((text) => text.includes('M001/S20/T39'));
+
+    expect(firstPendingIndex).toBeGreaterThan(-1);
+    expect(firstCompletedIndex).toBeGreaterThan(-1);
+    expect(firstPendingIndex).toBeLessThan(firstCompletedIndex);
+    await expect.poll(isWorkflowPagesScrollable).toBe(true);
+    await expect(await scrollWorkflowPagesToEnd()).toBeGreaterThan(0);
+
+    const firstTaskBackground = await page
+      .getByTestId('task-timeline-item')
+      .first()
+      .evaluate((element) => window.getComputedStyle(element).backgroundImage);
+
+    expect(firstTaskBackground).toContain('rgba(12, 47, 72');
+
+    await page.getByRole('tab', { name: 'Dependencies' }).click();
+    await expect(page.getByTestId('dependencies-panel')).toContainText('S20');
+    await expect.poll(isWorkflowPagesScrollable).toBe(true);
+    await expect(await scrollWorkflowPagesToEnd()).toBeGreaterThan(0);
   });
 
   test('surfaces disconnected SSE state, truncates oversized warnings, and fails fast on malformed refresh payloads', async ({

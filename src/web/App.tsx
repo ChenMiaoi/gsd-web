@@ -1563,6 +1563,10 @@ function isWorkflowStatusActive(status: string | null) {
   return status !== null && /^(active|running|executing|in_progress|in-progress|current)$/iu.test(status.trim());
 }
 
+function isWorkflowStatusPending(status: string | null) {
+  return status !== null && /^(pending|queued|planned|ready|todo|to_do|not_started|not-started|open)$/iu.test(status.trim());
+}
+
 function isWorkflowStatusBlocked(status: string | null) {
   return status !== null && /^(failed|blocked|error|degraded|high)$/iu.test(status.trim());
 }
@@ -1578,6 +1582,10 @@ function statusTone(status: string | null) {
 
   if (isWorkflowStatusActive(status)) {
     return 'active';
+  }
+
+  if (isWorkflowStatusPending(status)) {
+    return 'pending';
   }
 
   if (isWorkflowStatusBlocked(status)) {
@@ -2315,6 +2323,18 @@ function getDisplayFinishedAt(
   return aggregate?.lastFinishedAtMs ?? normalizeWorkflowTimestamp(entity.finishedAt);
 }
 
+function getTaskTimelineActivityTime(entry: TaskTimelineEntry) {
+  if (entry.startedAtMs === null && entry.finishedAtMs === null) {
+    return null;
+  }
+
+  return Math.max(entry.startedAtMs ?? Number.NEGATIVE_INFINITY, entry.finishedAtMs ?? Number.NEGATIVE_INFINITY);
+}
+
+function getTaskTimelineStatusRank(entry: TaskTimelineEntry) {
+  return getWorkflowStatusRank(entry.task.status);
+}
+
 function buildTaskTimelineEntries(
   milestones: GsdDbMilestoneSummary[],
   executionStats: WorkflowExecutionStats,
@@ -2346,15 +2366,25 @@ function buildTaskTimelineEntries(
   }
 
   return entries.sort((first, second) => {
-    if (first.startedAtMs !== null && second.startedAtMs !== null && first.startedAtMs !== second.startedAtMs) {
-      return first.startedAtMs - second.startedAtMs;
+    const firstStatusRank = getTaskTimelineStatusRank(first);
+    const secondStatusRank = getTaskTimelineStatusRank(second);
+
+    if (firstStatusRank !== secondStatusRank) {
+      return firstStatusRank - secondStatusRank;
     }
 
-    if (first.startedAtMs !== null && second.startedAtMs === null) {
+    const firstActivityMs = getTaskTimelineActivityTime(first);
+    const secondActivityMs = getTaskTimelineActivityTime(second);
+
+    if (firstActivityMs !== null && secondActivityMs !== null && firstActivityMs !== secondActivityMs) {
+      return secondActivityMs - firstActivityMs;
+    }
+
+    if (firstActivityMs !== null && secondActivityMs === null) {
       return -1;
     }
 
-    if (first.startedAtMs === null && second.startedAtMs !== null) {
+    if (firstActivityMs === null && secondActivityMs !== null) {
       return 1;
     }
 
@@ -2501,6 +2531,87 @@ function getCompletedTaskCount(milestones: GsdDbMilestoneSummary[]) {
 
 function getCompletedSliceCount(milestone: GsdDbMilestoneSummary) {
   return milestone.slices.filter((slice) => isWorkflowStatusComplete(slice.status)).length;
+}
+
+function getWorkflowStatusRank(status: string | null) {
+  if (isWorkflowStatusActive(status)) {
+    return 0;
+  }
+
+  if (isWorkflowStatusPending(status) || isWorkflowStatusBlocked(status)) {
+    return 1;
+  }
+
+  if (status !== null && !isWorkflowStatusComplete(status)) {
+    return 2;
+  }
+
+  if (isWorkflowStatusComplete(status)) {
+    return 3;
+  }
+
+  return 4;
+}
+
+function getWorkflowEntityActivityTime(entity: {
+  startedAt: string | number | null;
+  finishedAt: string | number | null;
+}) {
+  const startedAtMs = normalizeWorkflowTimestamp(entity.startedAt);
+  const finishedAtMs = normalizeWorkflowTimestamp(entity.finishedAt);
+
+  if (startedAtMs === null && finishedAtMs === null) {
+    return null;
+  }
+
+  return Math.max(startedAtMs ?? Number.NEGATIVE_INFINITY, finishedAtMs ?? Number.NEGATIVE_INFINITY);
+}
+
+function getTaskWorkflowActivityTime(task: GsdDbTaskSummary) {
+  return getWorkflowEntityActivityTime(task);
+}
+
+function getSliceWorkflowActivityTime(slice: GsdDbSliceSummary) {
+  const ownActivityMs = getWorkflowEntityActivityTime(slice);
+  const taskActivityTimes = slice.tasks
+    .map(getTaskWorkflowActivityTime)
+    .filter((value): value is number => value !== null);
+
+  return taskActivityTimes.length > 0
+    ? Math.max(...taskActivityTimes, ownActivityMs ?? Number.NEGATIVE_INFINITY)
+    : ownActivityMs;
+}
+
+function getMilestoneWorkflowActivityTime(milestone: GsdDbMilestoneSummary) {
+  const ownActivityMs = getWorkflowEntityActivityTime(milestone);
+  const sliceActivityTimes = milestone.slices
+    .map(getSliceWorkflowActivityTime)
+    .filter((value): value is number => value !== null);
+
+  return sliceActivityTimes.length > 0
+    ? Math.max(...sliceActivityTimes, ownActivityMs ?? Number.NEGATIVE_INFINITY)
+    : ownActivityMs;
+}
+
+function compareWorkflowActivity(
+  firstActivityMs: number | null,
+  secondActivityMs: number | null,
+  firstIndex: number,
+  secondIndex: number,
+) {
+  if (firstActivityMs !== null && secondActivityMs !== null && firstActivityMs !== secondActivityMs) {
+    return secondActivityMs - firstActivityMs;
+  }
+
+  if (firstActivityMs !== null && secondActivityMs === null) {
+    return -1;
+  }
+
+  if (firstActivityMs === null && secondActivityMs !== null) {
+    return 1;
+  }
+
+  return secondIndex - firstIndex;
 }
 
 function getMilestoneProgress(milestone: GsdDbMilestoneSummary) {
@@ -2940,16 +3051,26 @@ function isMilestoneEffectivelyComplete(milestone: GsdDbMilestoneSummary) {
   return milestone.taskCount > 0 && milestone.completedTaskCount >= milestone.taskCount;
 }
 
-function getMilestoneOrderBucket(milestone: GsdDbMilestoneSummary, activeMilestoneId: string | null) {
+function getSliceOrderRank(slice: GsdDbSliceSummary, activeSliceId: string | null) {
+  if (slice.id === activeSliceId) {
+    return 0;
+  }
+
+  const taskRanks = slice.tasks.map((task) => getWorkflowStatusRank(task.status));
+  const bestTaskRank = taskRanks.length > 0 ? Math.min(...taskRanks) : Number.POSITIVE_INFINITY;
+
+  return Math.min(getWorkflowStatusRank(slice.status), bestTaskRank);
+}
+
+function getMilestoneOrderRank(milestone: GsdDbMilestoneSummary, activeMilestoneId: string | null) {
   if (milestone.id === activeMilestoneId) {
     return 0;
   }
 
-  if (isMilestoneEffectivelyComplete(milestone)) {
-    return 2;
-  }
+  const sliceRanks = milestone.slices.map((slice) => getSliceOrderRank(slice, null));
+  const bestSliceRank = sliceRanks.length > 0 ? Math.min(...sliceRanks) : Number.POSITIVE_INFINITY;
 
-  return 1;
+  return Math.min(getWorkflowStatusRank(milestone.status), bestSliceRank);
 }
 
 function orderWorkflowMilestones(
@@ -2959,20 +3080,61 @@ function orderWorkflowMilestones(
   return milestones
     .map((milestone, index) => ({ milestone, index }))
     .sort((first, second) => {
-      const firstBucket = getMilestoneOrderBucket(first.milestone, activeMilestoneId);
-      const secondBucket = getMilestoneOrderBucket(second.milestone, activeMilestoneId);
+      const firstRank = getMilestoneOrderRank(first.milestone, activeMilestoneId);
+      const secondRank = getMilestoneOrderRank(second.milestone, activeMilestoneId);
 
-      return firstBucket === secondBucket ? first.index - second.index : firstBucket - secondBucket;
+      return firstRank === secondRank
+        ? compareWorkflowActivity(
+          getMilestoneWorkflowActivityTime(first.milestone),
+          getMilestoneWorkflowActivityTime(second.milestone),
+          first.index,
+          second.index,
+        )
+        : firstRank - secondRank;
     })
     .map((entry) => entry.milestone);
 }
 
+function orderWorkflowSlices(slices: GsdDbSliceSummary[], activeSliceId: string | null) {
+  return slices
+    .map((slice, index) => ({ slice, index }))
+    .sort((first, second) => {
+      const firstRank = getSliceOrderRank(first.slice, activeSliceId);
+      const secondRank = getSliceOrderRank(second.slice, activeSliceId);
+
+      return firstRank === secondRank
+        ? compareWorkflowActivity(
+          getSliceWorkflowActivityTime(first.slice),
+          getSliceWorkflowActivityTime(second.slice),
+          first.index,
+          second.index,
+        )
+        : firstRank - secondRank;
+    })
+    .map((entry) => entry.slice);
+}
+
+function orderWorkflowTasks(tasks: GsdDbTaskSummary[], activeTaskId: string | null) {
+  return tasks
+    .map((task, index) => ({ task, index }))
+    .sort((first, second) => {
+      const firstRank = first.task.id === activeTaskId ? 0 : getWorkflowStatusRank(first.task.status);
+      const secondRank = second.task.id === activeTaskId ? 0 : getWorkflowStatusRank(second.task.status);
+
+      return firstRank === secondRank
+        ? compareWorkflowActivity(
+          getTaskWorkflowActivityTime(first.task),
+          getTaskWorkflowActivityTime(second.task),
+          first.index,
+          second.index,
+        )
+        : firstRank - secondRank;
+    })
+    .map((entry) => entry.task);
+}
+
 function findActiveMilestone(milestones: GsdDbMilestoneSummary[]) {
-  return (
-    milestones.find((milestone) => isWorkflowStatusActive(milestone.status))
-    ?? milestones.find((milestone) => !isMilestoneEffectivelyComplete(milestone))
-    ?? null
-  );
+  return orderWorkflowMilestones(milestones, null).find((milestone) => !isMilestoneEffectivelyComplete(milestone)) ?? null;
 }
 
 function findActiveTask(slice: GsdDbSliceSummary | null) {
@@ -2980,11 +3142,7 @@ function findActiveTask(slice: GsdDbSliceSummary | null) {
     return null;
   }
 
-  return (
-    slice.tasks.find((task) => isWorkflowStatusActive(task.status))
-    ?? slice.tasks.find((task) => !isWorkflowStatusComplete(task.status))
-    ?? null
-  );
+  return orderWorkflowTasks(slice.tasks, null).find((task) => !isWorkflowStatusComplete(task.status)) ?? null;
 }
 
 function findActiveSlice(milestone: GsdDbMilestoneSummary | null) {
@@ -2992,11 +3150,7 @@ function findActiveSlice(milestone: GsdDbMilestoneSummary | null) {
     return null;
   }
 
-  return (
-    milestone.slices.find((slice) => isWorkflowStatusActive(slice.status))
-    ?? milestone.slices.find((slice) => !isWorkflowStatusComplete(slice.status))
-    ?? null
-  );
+  return orderWorkflowSlices(milestone.slices, null).find((slice) => !isWorkflowStatusComplete(slice.status)) ?? null;
 }
 
 function upsertProject(projects: ProjectRecord[], nextProject: ProjectRecord) {
@@ -3858,14 +4012,13 @@ function WorkflowMilestoneRail({
   copy: UiCopy;
   variant?: 'rail' | 'dashboard';
 }) {
+  const orderedMilestones = orderWorkflowMilestones(milestones, activeMilestoneId);
   const { focusedMilestone, focusedSlice, focusedTask } = getWorkflowFocus(
-    milestones,
+    orderedMilestones,
     activeMilestoneId,
     activeSliceId,
     activeTask,
   );
-  const focusedProgress = focusedMilestone ? getMilestoneProgress(focusedMilestone) : null;
-  const focusedProgressPercent = focusedMilestone ? getMilestoneProgressPercent(focusedMilestone) : 0;
   const dependencyLookup = new Map(
     dependencies.map((dependency) => [workflowSliceKey(dependency.milestoneId, dependency.toId), dependency]),
   );
@@ -3886,137 +4039,129 @@ function WorkflowMilestoneRail({
           <span className="stat-card__label">
             {variant === 'dashboard' ? copy.labels.progress : copy.labels.milestoneRail}
           </span>
-          <strong>{copy.formatCount(milestones.length, 'milestone')}</strong>
+          <strong>{copy.formatCount(orderedMilestones.length, 'milestone')}</strong>
         </div>
         {variant === 'dashboard' ? <span className="meta-badge">{focusedPath}</span> : null}
       </div>
 
-      {milestones.length === 0 ? (
+      {orderedMilestones.length === 0 ? (
         <p className="milestone-rail__empty">{copy.messages.noMilestones}</p>
       ) : (
         <div className="milestone-focus">
-          <ol className="milestone-focus__index">
-            {milestones.map((milestone) => {
-              const milestoneActive = focusedMilestone?.id === milestone.id;
+          <div className="milestone-focus__body" data-testid="milestone-focus-panel">
+            {orderedMilestones.map((milestone) => {
+              const milestoneExpanded = focusedMilestone?.id === milestone.id;
               const milestoneProgress = getMilestoneProgress(milestone);
-              const milestonePercent =
-                milestoneProgress.total === 0
-                  ? isMilestoneEffectivelyComplete(milestone)
-                    ? 100
-                    : 0
-                  : Math.round((milestoneProgress.completed / milestoneProgress.total) * 100);
+              const milestoneProgressPercent = getMilestoneProgressPercent(milestone);
+              const milestoneSlices = orderWorkflowSlices(
+                milestone.slices,
+                milestoneExpanded ? focusedSlice?.id ?? null : null,
+              );
+              const milestonePath =
+                milestoneExpanded && focusedSlice !== null && focusedTask !== null
+                  ? `${milestone.id} -> ${focusedSlice.id} -> ${focusedTask.id}`
+                  : milestoneExpanded && focusedSlice !== null
+                    ? `${milestone.id} -> ${focusedSlice.id}`
+                    : milestone.id;
 
               return (
-                <li key={milestone.id} className="milestone-focus__index-item" data-active={milestoneActive}>
-                  <span className="status-dot" data-status={statusTone(milestone.status)} />
-                  <div>
-                    <strong>{milestone.id}</strong>
-                    <span>{milestoneTitle(milestone)}</span>
-                  </div>
-                  <span className="meta-badge">{milestonePercent}%</span>
-                </li>
-              );
-            })}
-          </ol>
-
-          {focusedMilestone ? (
-            <div className="milestone-focus__body" data-testid="milestone-focus-panel">
-              <article
-                className="milestone-focus__summary"
-                data-status={statusTone(focusedMilestone.status)}
-              >
-                <div className="milestone-focus__summary-header">
-                  <div className="milestone-focus__summary-title">
-                    <span className="meta-badge">{focusedMilestone.id}</span>
-                    <strong>{milestoneTitle(focusedMilestone)}</strong>
-                  </div>
-                  {focusedMilestone.status ? (
-                    <span className="status-pill" data-status={statusTone(focusedMilestone.status)}>
-                      {focusedMilestone.status}
-                    </span>
-                  ) : null}
-                </div>
-
-                <div className="milestone-focus__summary-meter" aria-hidden="true">
-                  <span style={{ width: `${focusedProgressPercent}%` }} />
-                </div>
-
-                <div className="milestone-focus__summary-meta">
-                  <span>
-                    {focusedProgress?.completed ?? 0}/{focusedProgress?.total ?? 0} {copy.labels.completed}
-                  </span>
-                  <span>{copy.formatCount(focusedMilestone.sliceCount, 'slice')}</span>
-                  <span>
-                    {focusedMilestone.completedTaskCount}/{focusedMilestone.taskCount} {copy.labels.tasks}
-                  </span>
-                </div>
-
-                <div className="milestone-focus__summary-path">
-                  <span className="stat-card__label">{copy.labels.criticalPath}</span>
-                  <strong>{focusedPath}</strong>
-                </div>
-              </article>
-
-              <div className="milestone-focus__groups">
-                {groupedSlicesByRisk(focusedMilestone.slices).map((group) => (
-                  <section
-                    className="milestone-focus__group"
-                    data-risk={group.level}
-                    key={`${focusedMilestone.id}-${group.level}`}
-                  >
-                    <div className="milestone-focus__group-header">
-                      <span className="warning-code" data-risk={group.level}>
-                        {readableRiskLabel(group.level, locale)}
+                <details
+                  className="milestone-focus__milestone"
+                  data-active={milestoneExpanded}
+                  data-status={statusTone(milestone.status)}
+                  data-testid="milestone-focus-milestone"
+                  key={milestone.id}
+                  open={milestoneExpanded}
+                >
+                  <summary className="milestone-focus__summary">
+                    <div className="milestone-focus__summary-header">
+                      <div className="milestone-focus__summary-title">
+                        <span className="meta-badge workflow-id-badge" data-level="milestone">
+                          {milestone.id}
+                        </span>
+                        <strong>{milestoneTitle(milestone)}</strong>
+                      </div>
+                      <span className="status-pill" data-status={statusTone(milestone.status)}>
+                        {milestone.status ?? copy.messages.unknown}
                       </span>
-                      <strong>{copy.formatCount(group.slices.length, 'slice')}</strong>
                     </div>
 
+                    <div className="milestone-focus__summary-meter" aria-hidden="true">
+                      <span style={{ width: `${milestoneProgressPercent}%` }} />
+                    </div>
+
+                    <div className="milestone-focus__summary-meta">
+                      <span>
+                        {milestoneProgress.completed}/{milestoneProgress.total} {copy.labels.completed}
+                      </span>
+                      <span>{copy.formatCount(milestone.sliceCount, 'slice')}</span>
+                      <span>
+                        {milestone.completedTaskCount}/{milestone.taskCount} {copy.labels.tasks}
+                      </span>
+                    </div>
+
+                    <div className="milestone-focus__summary-path">
+                      <span className="stat-card__label">{copy.labels.criticalPath}</span>
+                      <strong>{milestonePath}</strong>
+                    </div>
+                  </summary>
+
+                  {milestoneSlices.length > 0 ? (
                     <div className="milestone-focus__slice-stack">
-                      {group.slices.map((slice) => {
-                        const sliceActive =
-                          focusedMilestone.id === activeMilestoneId && slice.id === activeSliceId;
+                      {milestoneSlices.map((slice) => {
+                        const sliceActive = milestoneExpanded && focusedSlice?.id === slice.id;
                         const sliceCurrentTask = sliceActive ? activeTask : findActiveTask(slice);
                         const slicePercent = getSliceProgressPercent(slice);
-                        const dependency = dependencyLookup.get(workflowSliceKey(focusedMilestone.id, slice.id)) ?? null;
+                        const dependency = dependencyLookup.get(workflowSliceKey(milestone.id, slice.id)) ?? null;
+                        const orderedTasks = orderWorkflowTasks(
+                          slice.tasks,
+                          sliceCurrentTask?.id ?? null,
+                        );
 
                         return (
-                          <article
+                          <details
                             className="milestone-focus__slice"
                             data-active={sliceActive}
                             data-status={statusTone(slice.status)}
                             data-risk={getSliceRiskLevel(slice)}
-                            key={`${focusedMilestone.id}-${slice.id}`}
+                            data-testid="milestone-focus-slice"
+                            key={`${milestone.id}-${slice.id}`}
+                            open={sliceActive}
                           >
-                            <div className="milestone-focus__slice-header">
-                              <span className="meta-badge">{slice.id}</span>
-                              <span className="status-pill" data-status={statusTone(slice.status)}>
-                                {slice.status ?? copy.messages.unknown}
-                              </span>
-                            </div>
+                            <summary className="milestone-focus__slice-summary">
+                              <div className="milestone-focus__slice-header">
+                                <span className="meta-badge workflow-id-badge" data-level="slice">
+                                  {slice.id}
+                                </span>
+                                <span className="status-pill" data-status={statusTone(slice.status)}>
+                                  {slice.status ?? copy.messages.unknown}
+                                </span>
+                              </div>
 
-                            <strong>{sentenceCaseTitle(sliceTitle(slice))}</strong>
+                              <strong>{sentenceCaseTitle(sliceTitle(slice))}</strong>
 
-                            <div className="milestone-focus__slice-meter" aria-hidden="true">
-                              <span style={{ width: `${slicePercent}%` }} />
-                            </div>
+                              <div className="milestone-focus__slice-meter" aria-hidden="true">
+                                <span style={{ width: `${slicePercent}%` }} />
+                              </div>
 
-                            <div className="milestone-focus__slice-meta">
-                              <span>
-                                {slice.completedTaskCount}/{slice.taskCount} {copy.labels.tasks}
-                              </span>
-                              {dependency ? <span>{dependency.fromId} -&gt; {slice.id}</span> : <span>{focusedMilestone.id} -&gt; {slice.id}</span>}
-                            </div>
+                              <div className="milestone-focus__slice-meta">
+                                <span>
+                                  {slice.completedTaskCount}/{slice.taskCount} {copy.labels.tasks}
+                                </span>
+                                {dependency ? <span>{dependency.fromId} -&gt; {slice.id}</span> : <span>{milestone.id} -&gt; {slice.id}</span>}
+                              </div>
 
-                            {sliceCurrentTask ? (
-                              <span className="milestone-focus__current">
-                                {copy.labels.currentTask}: {sliceCurrentTask.id}
-                              </span>
-                            ) : null}
+                              {sliceCurrentTask ? (
+                                <span className="milestone-focus__current">
+                                  {copy.labels.currentTask}: {sliceCurrentTask.id}
+                                </span>
+                              ) : null}
+                            </summary>
 
-                            {slice.tasks.length > 0 ? (
+                            {orderedTasks.length > 0 ? (
                               <ol className="milestone-focus__task-list">
-                                {slice.tasks.map((task) => {
-                                  const taskCurrent = sliceCurrentTask !== null && task === sliceCurrentTask;
+                                {orderedTasks.map((task) => {
+                                  const taskCurrent = sliceCurrentTask?.id === task.id;
 
                                   return (
                                     <li
@@ -4030,7 +4175,9 @@ function WorkflowMilestoneRail({
                                           className="status-dot"
                                           data-status={taskCurrent ? 'active' : statusTone(task.status)}
                                         />
-                                        <strong>{task.id}</strong>
+                                        <strong className="workflow-id-badge" data-level="task">
+                                          {task.id}
+                                        </strong>
                                         <span>{taskTitle(task)}</span>
                                       </div>
                                       <span
@@ -4044,15 +4191,15 @@ function WorkflowMilestoneRail({
                                 })}
                               </ol>
                             ) : null}
-                          </article>
+                          </details>
                         );
                       })}
                     </div>
-                  </section>
-                ))}
-              </div>
-            </div>
-          ) : null}
+                  ) : null}
+                </details>
+              );
+            })}
+          </div>
         </div>
       )}
 
@@ -6285,257 +6432,6 @@ export default function App() {
                 ) : null}
               </section>
               </section>
-
-              <div className="detail-support-stack">
-              <section className="subpanel continuity-panel" data-testid="continuity-panel">
-                <div className="subpanel__header subpanel__header--actions">
-                  <div>
-                    <h4>{copy.labels.projectContinuity}</h4>
-                    <p>{copy.help.continuity}</p>
-                  </div>
-                  <div className="detail-header__meta detail-header__meta--monitor">
-                    <span className="status-pill" data-status={continuityTone(selectedContinuity!.state)}>
-                      {copy.continuityStateLabels[selectedContinuity!.state]}
-                    </span>
-                    <span className="meta-badge">ID preserved</span>
-                  </div>
-                </div>
-
-                <p className="detail-copy__lead" data-testid="continuity-summary-copy">
-                  {selectedContinuitySummary}
-                </p>
-
-                <dl className="detail-facts detail-facts--compact">
-                  <div>
-                    <dt>{copy.labels.pathLostAt}</dt>
-                    <dd data-testid="continuity-path-lost-at">
-                      {selectedContinuity!.pathLostAt ? (
-                        <time dateTime={selectedContinuity!.pathLostAt}>
-                          {formatTimestamp(selectedContinuity!.pathLostAt, locale)}
-                        </time>
-                      ) : (
-                        copy.messages.noMissingPath
-                      )}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>{copy.labels.lastRelinked}</dt>
-                    <dd data-testid="continuity-last-relinked-at">
-                      {selectedContinuity!.lastRelinkedAt ? (
-                        <time dateTime={selectedContinuity!.lastRelinkedAt}>
-                          {formatTimestamp(selectedContinuity!.lastRelinkedAt, locale)}
-                        </time>
-                      ) : (
-                        copy.messages.noRelink
-                      )}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>{copy.labels.previousPath}</dt>
-                    <dd data-testid="continuity-previous-canonical-path">
-                      {selectedContinuity!.previousCanonicalPath ?? copy.messages.noPriorPath}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>{copy.labels.continuityChecked}</dt>
-                    <dd>
-                      <time dateTime={selectedContinuity!.checkedAt}>
-                        {formatTimestamp(selectedContinuity!.checkedAt, locale)}
-                      </time>
-                    </dd>
-                  </div>
-                </dl>
-
-                {selectedContinuity!.state === 'path_lost' ? (
-                  <div className="inline-alert inline-alert--error continuity-alert" data-testid="continuity-path-lost-alert">
-                    <strong>{copy.messages.pathLostTitle}</strong>
-                    <p>{copy.messages.pathLostCopy(selectedProject.projectId)}</p>
-                  </div>
-                ) : null}
-
-                {selectedContinuity!.lastRelinkedAt ? (
-                  <div className="inline-alert inline-alert--success continuity-alert" data-testid="continuity-relinked-note">
-                    <strong>{copy.messages.relinkedTitle}</strong>
-                    <p>{copy.messages.relinkedCopy(selectedProject.projectId)}</p>
-                  </div>
-                ) : null}
-
-                {relinkError ? (
-                  <p className="inline-alert inline-alert--error" role="alert" data-testid="relink-error">
-                    {relinkError}
-                  </p>
-                ) : null}
-
-                {relinkSuccess ? (
-                  <p className="inline-alert inline-alert--success" data-testid="relink-success">
-                    {relinkSuccess}
-                  </p>
-                ) : null}
-
-                {selectedContinuity!.state === 'path_lost' ? (
-                  <form className="relink-form" data-testid="relink-form" onSubmit={handleRelinkSelected}>
-                    <label className="field" htmlFor="relink-path">
-                      <span>{copy.labels.newProjectPath}</span>
-                      <input
-                        id="relink-path"
-                        name="relink-path"
-                        type="text"
-                        autoComplete="off"
-                        spellCheck={false}
-                        data-testid="relink-path-input"
-                        placeholder={copy.placeholders.movedProjectPath}
-                        value={relinkPath}
-                        onChange={(nextEvent) => {
-                          setRelinkPath(nextEvent.target.value);
-                          setRelinkError(null);
-                          setRelinkSuccess(null);
-                        }}
-                      />
-                    </label>
-
-                    <div className="relink-form__actions">
-                      <button type="submit" className="primary-button" disabled={relinkPending}>
-                        {relinkPending ? copy.actions.relinking : copy.actions.relinkProject}
-                      </button>
-                      <button
-                        type="button"
-                        className="secondary-button"
-                        onClick={() => {
-                          setRelinkPath('');
-                          setRelinkError(null);
-                          setRelinkSuccess(null);
-                        }}
-                        disabled={relinkPending || relinkPath.length === 0}
-                      >
-                        {copy.actions.clearRelinkPath}
-                      </button>
-                    </div>
-                  </form>
-                ) : null}
-              </section>
-
-              <section className="subpanel init-panel" data-testid="init-panel">
-                <div className="subpanel__header subpanel__header--actions">
-                  <div>
-                    <h4>{copy.labels.initialization}</h4>
-                    <p>{copy.help.initialization}</p>
-                  </div>
-                  {selectedInitActionVisible ? (
-                    <button
-                      type="button"
-                      className="primary-button"
-                      data-testid="init-panel-action"
-                      onClick={() => {
-                        void handleInitializeSelected();
-                      }}
-                      disabled={selectedInitActionDisabled}
-                    >
-                      {initButtonLabel(
-                        selectedProject!,
-                        {
-                          requestPending: selectedInitRequestPending,
-                          syncingDetail: selectedInitSyncingDetail,
-                        },
-                        copy,
-                      )}
-                    </button>
-                  ) : selectedInitJob ? (
-                    <span className="status-pill status-pill--job" data-status={selectedInitJob.stage}>
-                      {copy.initStageLabels[selectedInitJob.stage]}
-                    </span>
-                  ) : null}
-                </div>
-
-                {selectedInitJob ? (
-                  <div
-                    className="init-banner"
-                    data-stage={selectedInitJob.stage}
-                    data-testid="init-stage-banner"
-                  >
-                    <div className="init-banner__meta">
-                      <span className="status-pill status-pill--job" data-status={selectedInitJob.stage}>
-                        {copy.initStageLabels[selectedInitJob.stage]}
-                      </span>
-                      <span className="meta-badge">
-                        Updated {formatTimestamp(selectedInitJob.updatedAt, locale)}
-                      </span>
-                      {selectedInitSyncingDetail ? (
-                        <span className="meta-badge" data-testid="init-refresh-syncing">
-                          {copy.actions.refreshingMonitoredDetail}
-                        </span>
-                      ) : null}
-                    </div>
-
-                    <p className="init-banner__copy" data-testid="init-stage-detail">
-                      {selectedInitSummary}
-                    </p>
-
-                    {hasActiveInitJob(selectedInitJob) && streamStatus !== 'connected' ? (
-                      <p className="init-banner__stream-note" data-testid="init-stream-note">
-                        {copy.messages.initStreamNote(copy.streamStatusLabels[streamStatus])}
-                      </p>
-                    ) : null}
-
-                    {selectedInitJob.lastErrorDetail ? (
-                      <p className="inline-alert inline-alert--error" data-testid="init-failure-detail">
-                        {selectedInitJob.lastErrorDetail}
-                      </p>
-                    ) : null}
-
-                    {selectedInitJob.refreshResult ? (
-                      <dl className="detail-facts detail-facts--compact" data-testid="init-refresh-result">
-                        <div>
-                          <dt>{copy.labels.refreshResult}</dt>
-                          <dd>{selectedInitJob.refreshResult.detail}</dd>
-                        </div>
-                        <div>
-                          <dt>{copy.labels.snapshotStatus}</dt>
-                          <dd>
-                            {selectedInitJob.refreshResult.snapshotStatus
-                              ? copy.statusLabels[selectedInitJob.refreshResult.snapshotStatus]
-                              : copy.messages.unavailable}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt>{copy.labels.warningsAfterRefresh}</dt>
-                          <dd>
-                            {selectedInitJob.refreshResult.warningCount === null
-                              ? copy.messages.unavailable
-                              : copy.formatCount(selectedInitJob.refreshResult.warningCount, 'warning')}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt>{copy.labels.refreshEvent}</dt>
-                          <dd>{selectedInitJob.refreshResult.eventId ?? copy.messages.unavailable}</dd>
-                        </div>
-                      </dl>
-                    ) : null}
-
-                    {selectedInitJob.outputExcerpt ? (
-                      <pre className="init-output" data-testid="init-output-excerpt">
-                        {selectedInitJob.outputExcerpt}
-                      </pre>
-                    ) : null}
-
-                    <ol className="init-history" data-testid="init-history">
-                      {selectedInitJob.history.map((entry) => (
-                        <li key={entry.id}>
-                          <div className="init-history__header">
-                            <span className="status-pill status-pill--job" data-status={entry.stage}>
-                              {copy.initStageLabels[entry.stage]}
-                            </span>
-                            <time dateTime={entry.emittedAt}>{formatTimestamp(entry.emittedAt, locale)}</time>
-                          </div>
-                          <p>{entry.detail}</p>
-                        </li>
-                      ))}
-                    </ol>
-                  </div>
-                ) : (
-                  <p data-testid="init-empty-state">{copy.empty.init}</p>
-                )}
-              </section>
-              </div>
 
               <section
                 className="workflow-page workflow-page--stack"
