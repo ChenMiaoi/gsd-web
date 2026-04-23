@@ -42,6 +42,10 @@ export const PROJECT_MONITOR_HEALTHS = ['healthy', 'degraded', 'read_failed', 's
 
 export type ProjectMonitorHealth = (typeof PROJECT_MONITOR_HEALTHS)[number];
 
+export const PROJECT_CONTINUITY_STATES = ['tracked', 'path_lost'] as const;
+
+export type ProjectContinuityState = (typeof PROJECT_CONTINUITY_STATES)[number];
+
 export const PROJECT_RECONCILE_TRIGGERS = [
   'register',
   'manual_refresh',
@@ -49,6 +53,7 @@ export const PROJECT_RECONCILE_TRIGGERS = [
   'monitor_boot',
   'monitor_interval',
   'watcher',
+  'relink',
 ] as const;
 
 export type ProjectReconcileTrigger = (typeof PROJECT_RECONCILE_TRIGGERS)[number];
@@ -56,6 +61,8 @@ export type ProjectReconcileTrigger = (typeof PROJECT_RECONCILE_TRIGGERS)[number
 export const PROJECT_TIMELINE_ENTRY_TYPES = [
   'registered',
   'refreshed',
+  'path_lost',
+  'relinked',
   'monitor_degraded',
   'monitor_recovered',
 ] as const;
@@ -168,6 +175,15 @@ export interface ProjectMonitorSummary {
   lastError: ProjectMonitorError | null;
 }
 
+export interface ProjectContinuitySummary {
+  state: ProjectContinuityState;
+  checkedAt: string;
+  pathLostAt: string | null;
+  lastRelinkedAt: string | null;
+  previousRegisteredPath: string | null;
+  previousCanonicalPath: string | null;
+}
+
 export interface ProjectTimelineEntry {
   id: string;
   sequence: number;
@@ -224,6 +240,7 @@ export interface ProjectRecord {
   lastEventId: string | null;
   snapshot: ProjectSnapshot;
   monitor: ProjectMonitorSummary;
+  continuity?: ProjectContinuitySummary;
   latestInitJob: ProjectInitJob | null;
 }
 
@@ -263,10 +280,15 @@ export interface RegisterProjectRequest {
   path: string;
 }
 
+export interface RelinkProjectRequest {
+  path: string;
+}
+
 export type ProjectEventType =
   | 'service.ready'
   | 'project.registered'
   | 'project.refreshed'
+  | 'project.relinked'
   | 'project.monitor.updated'
   | 'project.init.updated';
 
@@ -288,6 +310,20 @@ export interface ProjectSnapshotEventPayload {
   checkedAt: string;
   trigger: ProjectReconcileTrigger;
   monitor: ProjectMonitorSummary;
+  continuity?: ProjectContinuitySummary;
+}
+
+export interface ProjectRelinkEventPayload {
+  projectId: string;
+  registeredPath: string;
+  canonicalPath: string;
+  previousRegisteredPath: string;
+  previousCanonicalPath: string;
+  snapshotStatus: ProjectSnapshotStatus;
+  warningCount: number;
+  emittedAt: string;
+  continuity: ProjectContinuitySummary;
+  monitor: ProjectMonitorSummary;
 }
 
 export interface ProjectMonitorEventPayload {
@@ -298,6 +334,7 @@ export interface ProjectMonitorEventPayload {
   trigger: ProjectReconcileTrigger;
   previousHealth: ProjectMonitorHealth | null;
   monitor: ProjectMonitorSummary;
+  continuity?: ProjectContinuitySummary;
 }
 
 export interface ProjectInitEventPayload {
@@ -306,11 +343,13 @@ export interface ProjectInitEventPayload {
   snapshotStatus: ProjectSnapshotStatus;
   job: ProjectInitJob;
   historyEntry: ProjectInitJobHistoryEntry;
+  continuity?: ProjectContinuitySummary;
 }
 
 export type ProjectEventPayload =
   | ServiceReadyEventPayload
   | ProjectSnapshotEventPayload
+  | ProjectRelinkEventPayload
   | ProjectMonitorEventPayload
   | ProjectInitEventPayload;
 
@@ -354,6 +393,20 @@ export function createStaleProjectMonitorSummary(): ProjectMonitorSummary {
     lastSuccessfulAt: null,
     lastTrigger: null,
     lastError: null,
+  };
+}
+
+export function createTrackedProjectContinuitySummary(
+  checkedAt: string,
+  overrides: Partial<ProjectContinuitySummary> = {},
+): ProjectContinuitySummary {
+  return {
+    state: overrides.state ?? 'tracked',
+    checkedAt,
+    pathLostAt: overrides.pathLostAt ?? null,
+    lastRelinkedAt: overrides.lastRelinkedAt ?? null,
+    previousRegisteredPath: overrides.previousRegisteredPath ?? null,
+    previousCanonicalPath: overrides.previousCanonicalPath ?? null,
   };
 }
 

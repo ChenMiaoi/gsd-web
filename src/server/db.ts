@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
 import type {
+  ProjectContinuityState,
+  ProjectContinuitySummary,
   ProjectEventEnvelope,
   ProjectEventPayload,
   ProjectEventType,
@@ -16,6 +18,7 @@ import type {
   ProjectMonitorSummary,
   ProjectRecord,
   ProjectReconcileTrigger,
+  ProjectRelinkEventPayload,
   ProjectSnapshot,
   ProjectSnapshotEventPayload,
   ProjectSnapshotStatus,
@@ -26,25 +29,29 @@ import type {
   SnapshotSourceName,
 } from '../shared/contracts.js';
 import {
+  PROJECT_CONTINUITY_STATES,
   PROJECT_INIT_JOB_STAGES,
   PROJECT_MONITOR_HEALTHS,
   PROJECT_RECONCILE_TRIGGERS,
   PROJECT_TIMELINE_ENTRY_TYPES,
   SNAPSHOT_SOURCE_NAMES,
   createStaleProjectMonitorSummary,
+  createTrackedProjectContinuitySummary,
   isProjectInitJobTerminalStage,
 } from '../shared/contracts.js';
 
-export const REGISTRY_SCHEMA_VERSION = '4';
+export const REGISTRY_SCHEMA_VERSION = '5';
 
 const MAX_INIT_JOB_HISTORY_ENTRIES = 32;
 const MAX_PROJECT_TIMELINE_ENTRIES = 32;
+const MAX_RETAINED_RAW_EVENTS = 256;
 const MAX_TIMELINE_DETAIL_LENGTH = 320;
 const MAX_INIT_DETAIL_LENGTH = 320;
 const MAX_INIT_OUTPUT_EXCERPT_LENGTH = 1_200;
 const MAX_INIT_ERROR_DETAIL_LENGTH = 640;
 const MAX_MONITOR_ERROR_DETAIL_LENGTH = 320;
 const DEFAULT_MONITOR_JSON = JSON.stringify(createStaleProjectMonitorSummary()).replace(/'/g, "''");
+const DEFAULT_CONTINUITY_JSON = JSON.stringify(createTrackedProjectContinuitySummary(new Date(0).toISOString())).replace(/'/g, "''");
 
 interface ProjectRow {
   project_id: string;
@@ -52,6 +59,7 @@ interface ProjectRow {
   canonical_path: string;
   snapshot_json: string;
   monitor_json: string;
+  continuity_json: string;
   created_at: string;
   updated_at: string;
   last_event_sequence: number | null;
@@ -102,6 +110,18 @@ interface InitJobHistoryRow {
   output_excerpt: string | null;
 }
 
+export interface EventReplayWindow {
+  earliestRetainedEventId: string | null;
+  latestRetainedEventId: string | null;
+  retainedEvents: number;
+}
+
+export interface EventReplayBatch {
+  items: ProjectEventEnvelope[];
+  window: EventReplayWindow;
+  replayGapDetected: boolean;
+}
+
 export interface TimelineEntryInput {
   type: ProjectTimelineEntryType;
   emittedAt: string;
@@ -120,6 +140,7 @@ export interface RegisterProjectInput {
   canonicalPath: string;
   snapshot: ProjectSnapshot;
   monitor: ProjectMonitorSummary;
+  continuity?: ProjectContinuitySummary;
   eventPayload: ProjectSnapshotEventPayload;
   timelineEntry?: TimelineEntryInput | null;
 }
@@ -128,13 +149,25 @@ export interface RefreshProjectInput {
   projectId: string;
   snapshot: ProjectSnapshot;
   monitor: ProjectMonitorSummary;
+  continuity?: ProjectContinuitySummary;
   eventPayload: ProjectSnapshotEventPayload;
+  timelineEntry?: TimelineEntryInput | null;
+}
+
+export interface RelinkProjectInput {
+  projectId: string;
+  registeredPath: string;
+  canonicalPath: string;
+  emittedAt: string;
+  continuity?: ProjectContinuitySummary;
+  eventPayload: ProjectRelinkEventPayload;
   timelineEntry?: TimelineEntryInput | null;
 }
 
 export interface UpdateProjectMonitorInput {
   projectId: string;
   monitor: ProjectMonitorSummary;
+  continuity?: ProjectContinuitySummary;
   emittedAt: string;
   eventPayload?: ProjectMonitorEventPayload;
   timelineEntry?: TimelineEntryInput | null;
@@ -248,6 +281,14 @@ function parseProjectMonitorHealth(health: string): ProjectMonitorHealth {
   return health as ProjectMonitorHealth;
 }
 
+function parseProjectContinuityState(state: string): ProjectContinuityState {
+  if (!PROJECT_CONTINUITY_STATES.includes(state as ProjectContinuityState)) {
+    throw new Error(`Invalid persisted continuity state: ${state}`);
+  }
+
+  return state as ProjectContinuityState;
+}
+
 function parseProjectReconcileTrigger(trigger: string): ProjectReconcileTrigger {
   if (!PROJECT_RECONCILE_TRIGGERS.includes(trigger as ProjectReconcileTrigger)) {
     throw new Error(`Invalid persisted reconcile trigger: ${trigger}`);
@@ -327,6 +368,31 @@ function parseProjectMonitorSummary(raw: string): ProjectMonitorSummary {
   };
 }
 
+function parseProjectContinuitySummary(raw: string): ProjectContinuitySummary {
+  const parsed = JSON.parse(raw) as unknown;
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Invalid persisted project continuity summary.');
+  }
+
+  const record = parsed as Record<string, unknown>;
+  const checkedAt = typeof record.checkedAt === 'string' ? record.checkedAt : new Date(0).toISOString();
+
+  return createTrackedProjectContinuitySummary(checkedAt, {
+    state: parseProjectContinuityState(String(record.state ?? '')),
+    pathLostAt: expectNullableString(record.pathLostAt ?? null, 'project continuity pathLostAt'),
+    lastRelinkedAt: expectNullableString(record.lastRelinkedAt ?? null, 'project continuity lastRelinkedAt'),
+    previousRegisteredPath: expectNullableString(
+      record.previousRegisteredPath ?? null,
+      'project continuity previousRegisteredPath',
+    ),
+    previousCanonicalPath: expectNullableString(
+      record.previousCanonicalPath ?? null,
+      'project continuity previousCanonicalPath',
+    ),
+  });
+}
+
 function parseEventRow<TPayload extends ProjectEventPayload>(row: EventRow): ProjectEventEnvelope<TPayload> {
   return {
     id: `evt_${row.sequence}`,
@@ -367,6 +433,27 @@ function parseTimelineRow(row: TimelineRow): ProjectTimelineEntry {
   };
 }
 
+function mergeProjectContinuitySummary(
+  checkedAt: string,
+  existing: ProjectContinuitySummary | undefined | null,
+  overrides: Partial<ProjectContinuitySummary> = {},
+): ProjectContinuitySummary {
+  return createTrackedProjectContinuitySummary(checkedAt, {
+    state: overrides.state ?? existing?.state ?? 'tracked',
+    pathLostAt: overrides.pathLostAt !== undefined ? overrides.pathLostAt : existing?.pathLostAt ?? null,
+    lastRelinkedAt:
+      overrides.lastRelinkedAt !== undefined ? overrides.lastRelinkedAt : existing?.lastRelinkedAt ?? null,
+    previousRegisteredPath:
+      overrides.previousRegisteredPath !== undefined
+        ? overrides.previousRegisteredPath
+        : existing?.previousRegisteredPath ?? null,
+    previousCanonicalPath:
+      overrides.previousCanonicalPath !== undefined
+        ? overrides.previousCanonicalPath
+        : existing?.previousCanonicalPath ?? null,
+  });
+}
+
 export class RegistryDatabase {
   private readonly database: DatabaseSync;
 
@@ -400,6 +487,7 @@ export class RegistryDatabase {
           canonical_path,
           snapshot_json,
           monitor_json,
+          continuity_json,
           created_at,
           updated_at,
           last_event_sequence
@@ -420,6 +508,7 @@ export class RegistryDatabase {
           canonical_path,
           snapshot_json,
           monitor_json,
+          continuity_json,
           created_at,
           updated_at,
           last_event_sequence
@@ -440,6 +529,7 @@ export class RegistryDatabase {
           canonical_path,
           snapshot_json,
           monitor_json,
+          continuity_json,
           created_at,
           updated_at,
           last_event_sequence
@@ -492,6 +582,7 @@ export class RegistryDatabase {
     const projectId = input.projectId ?? createProjectId();
     const snapshotJson = JSON.stringify(input.snapshot);
     const monitorJson = JSON.stringify(input.monitor);
+    const continuityJson = JSON.stringify(input.continuity ?? createTrackedProjectContinuitySummary(now));
 
     this.begin();
 
@@ -504,12 +595,13 @@ export class RegistryDatabase {
             canonical_path,
             snapshot_json,
             monitor_json,
+            continuity_json,
             created_at,
             updated_at,
             last_event_sequence
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
         )
-        .run(projectId, input.registeredPath, input.canonicalPath, snapshotJson, monitorJson, now, now);
+        .run(projectId, input.registeredPath, input.canonicalPath, snapshotJson, monitorJson, continuityJson, now, now);
 
       const event = this.insertEvent('project.registered', projectId, now, input.eventPayload);
 
@@ -551,6 +643,9 @@ export class RegistryDatabase {
     const now = input.snapshot.checkedAt;
     const snapshotJson = JSON.stringify(input.snapshot);
     const monitorJson = JSON.stringify(input.monitor);
+    const continuityJson = JSON.stringify(
+      input.continuity ?? mergeProjectContinuitySummary(now, existing.continuity),
+    );
 
     this.begin();
 
@@ -558,10 +653,10 @@ export class RegistryDatabase {
       const updateResult = this.database
         .prepare(
           `UPDATE projects
-          SET snapshot_json = ?, monitor_json = ?, updated_at = ?
+          SET snapshot_json = ?, monitor_json = ?, continuity_json = ?, updated_at = ?
           WHERE project_id = ?`,
         )
-        .run(snapshotJson, monitorJson, now, input.projectId);
+        .run(snapshotJson, monitorJson, continuityJson, now, input.projectId);
 
       if (Number(updateResult.changes) !== 1) {
         throw new ProjectNotFoundError(input.projectId);
@@ -589,6 +684,79 @@ export class RegistryDatabase {
     }
   }
 
+  relinkProject(input: RelinkProjectInput): {
+    project: ProjectRecord;
+    event: ProjectEventEnvelope<ProjectRelinkEventPayload>;
+  } {
+    const existing = this.getProjectById(input.projectId);
+
+    if (!existing) {
+      throw new ProjectNotFoundError(input.projectId);
+    }
+
+    const duplicate = this.getProjectByCanonicalPath(input.canonicalPath);
+
+    if (duplicate && duplicate.projectId !== input.projectId) {
+      throw new DuplicateProjectError(input.canonicalPath);
+    }
+
+    const continuity = input.continuity
+      ?? mergeProjectContinuitySummary(input.emittedAt, existing.continuity, {
+        state: 'tracked',
+        pathLostAt: null,
+        lastRelinkedAt: input.emittedAt,
+        previousRegisteredPath: existing.registeredPath,
+        previousCanonicalPath: existing.canonicalPath,
+      });
+
+    this.begin();
+
+    try {
+      const updateResult = this.database
+        .prepare(
+          `UPDATE projects
+          SET registered_path = ?, canonical_path = ?, continuity_json = ?, updated_at = ?
+          WHERE project_id = ?`,
+        )
+        .run(
+          input.registeredPath,
+          input.canonicalPath,
+          JSON.stringify(continuity),
+          input.emittedAt,
+          input.projectId,
+        );
+
+      if (Number(updateResult.changes) !== 1) {
+        throw new ProjectNotFoundError(input.projectId);
+      }
+
+      const event = this.insertEvent('project.relinked', input.projectId, input.emittedAt, input.eventPayload);
+
+      if (input.timelineEntry) {
+        this.insertTimelineEntry(input.projectId, input.timelineEntry, event.sequence);
+      }
+
+      this.database
+        .prepare('UPDATE projects SET last_event_sequence = ? WHERE project_id = ?')
+        .run(event.sequence, input.projectId);
+
+      this.commit();
+
+      return {
+        project: this.requireProject(input.projectId),
+        event,
+      };
+    } catch (error) {
+      this.rollback();
+
+      if (isUniqueConstraintError(error)) {
+        throw new DuplicateProjectError(input.canonicalPath);
+      }
+
+      throw error;
+    }
+  }
+
   updateProjectMonitor(input: UpdateProjectMonitorInput): {
     project: ProjectRecord;
     event: ProjectEventEnvelope<ProjectMonitorEventPayload> | null;
@@ -597,15 +765,18 @@ export class RegistryDatabase {
     this.begin();
 
     try {
-      this.requireProject(input.projectId);
+      const existing = this.requireProject(input.projectId);
+      const continuityJson = JSON.stringify(
+        input.continuity ?? mergeProjectContinuitySummary(input.emittedAt, existing.continuity),
+      );
 
       const updateResult = this.database
         .prepare(
           `UPDATE projects
-          SET monitor_json = ?, updated_at = ?
+          SET monitor_json = ?, continuity_json = ?, updated_at = ?
           WHERE project_id = ?`,
         )
-        .run(JSON.stringify(input.monitor), input.emittedAt, input.projectId);
+        .run(JSON.stringify(input.monitor), continuityJson, input.emittedAt, input.projectId);
 
       if (Number(updateResult.changes) !== 1) {
         throw new ProjectNotFoundError(input.projectId);
@@ -816,6 +987,20 @@ export class RegistryDatabase {
     return rows.map((row) => parseEventRow(row));
   }
 
+  getEventReplayBatch(sequence: number, limit: number = 100): EventReplayBatch {
+    const items = this.listEventsAfter(sequence, limit);
+    const window = this.getEventReplayWindow();
+    const earliestSequence = window.earliestRetainedEventId === null
+      ? null
+      : Number.parseInt(window.earliestRetainedEventId.slice(4), 10);
+
+    return {
+      items,
+      window,
+      replayGapDetected: earliestSequence !== null && sequence > 0 && earliestSequence > sequence + 1,
+    };
+  }
+
   private initializeSchema() {
     this.database.exec(`
       PRAGMA foreign_keys = ON;
@@ -831,6 +1016,7 @@ export class RegistryDatabase {
         canonical_path TEXT NOT NULL UNIQUE,
         snapshot_json TEXT NOT NULL,
         monitor_json TEXT NOT NULL DEFAULT '${DEFAULT_MONITOR_JSON}',
+        continuity_json TEXT NOT NULL DEFAULT '${DEFAULT_CONTINUITY_JSON}',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         last_event_sequence INTEGER,
@@ -900,6 +1086,7 @@ export class RegistryDatabase {
     `);
 
     this.ensureProjectMonitorColumn();
+    this.ensureProjectContinuityColumn();
 
     const upsertMetadata = this.database.prepare(`
       INSERT INTO service_metadata (key, value)
@@ -927,6 +1114,22 @@ export class RegistryDatabase {
     );
   }
 
+  private ensureProjectContinuityColumn() {
+    const columns = this.database.prepare('PRAGMA table_info(projects)').all() as Array<{ name: string }>;
+
+    if (!columns.some((column) => column.name === 'continuity_json')) {
+      this.database.exec(
+        `ALTER TABLE projects ADD COLUMN continuity_json TEXT NOT NULL DEFAULT '${DEFAULT_CONTINUITY_JSON}'`,
+      );
+    }
+
+    this.database.exec(
+      `UPDATE projects
+       SET continuity_json = '${DEFAULT_CONTINUITY_JSON}'
+       WHERE continuity_json IS NULL OR TRIM(continuity_json) = ''`,
+    );
+  }
+
   private parseProjectRow(row: ProjectRow): ProjectRecord {
     return {
       projectId: row.project_id,
@@ -937,6 +1140,7 @@ export class RegistryDatabase {
       lastEventId: row.last_event_sequence === null ? null : `evt_${row.last_event_sequence}`,
       snapshot: JSON.parse(row.snapshot_json) as ProjectSnapshot,
       monitor: parseProjectMonitorSummary(row.monitor_json),
+      continuity: parseProjectContinuitySummary(row.continuity_json),
       latestInitJob: this.getLatestInitJob(row.project_id),
     };
   }
@@ -1056,6 +1260,8 @@ export class RegistryDatabase {
       )
       .run(input.jobId, MAX_INIT_JOB_HISTORY_ENTRIES);
 
+    this.pruneProjectEvents();
+
     const row = this.database
       .prepare(
         `SELECT
@@ -1121,6 +1327,8 @@ export class RegistryDatabase {
       )
       .run(projectId, MAX_PROJECT_TIMELINE_ENTRIES);
 
+    this.pruneProjectEvents();
+
     const row = this.database
       .prepare(
         `SELECT
@@ -1158,6 +1366,7 @@ export class RegistryDatabase {
       snapshotStatus: project.snapshot.status,
       job: project.latestInitJob,
       historyEntry,
+      continuity: project.continuity,
     };
   }
 
@@ -1178,6 +1387,7 @@ export class RegistryDatabase {
       )
       .run(eventType, projectId, emittedAt, JSON.stringify(payload));
 
+    this.pruneProjectEvents();
     const sequence = Number(result.lastInsertRowid);
 
     return {
@@ -1188,6 +1398,47 @@ export class RegistryDatabase {
       projectId,
       payload,
     };
+  }
+
+  private getEventReplayWindow(): EventReplayWindow {
+    const row = this.database
+      .prepare(
+        `SELECT
+          MIN(sequence) AS earliest_sequence,
+          MAX(sequence) AS latest_sequence,
+          COUNT(*) AS retained_events
+        FROM project_events`,
+      )
+      .get() as { earliest_sequence: number | null; latest_sequence: number | null; retained_events: number };
+
+    return {
+      earliestRetainedEventId: row.earliest_sequence === null ? null : `evt_${row.earliest_sequence}`,
+      latestRetainedEventId: row.latest_sequence === null ? null : `evt_${row.latest_sequence}`,
+      retainedEvents: row.retained_events,
+    };
+  }
+
+  private pruneProjectEvents() {
+    this.database
+      .prepare(
+        `DELETE FROM project_events
+         WHERE sequence IN (
+           SELECT sequence
+           FROM project_events
+           WHERE sequence NOT IN (
+             SELECT last_event_sequence FROM projects WHERE last_event_sequence IS NOT NULL
+           )
+             AND sequence NOT IN (
+               SELECT event_sequence FROM project_timeline WHERE event_sequence IS NOT NULL
+             )
+             AND sequence NOT IN (
+               SELECT last_event_sequence FROM init_jobs WHERE last_event_sequence IS NOT NULL
+             )
+           ORDER BY sequence DESC
+           LIMIT -1 OFFSET ?
+         )`,
+      )
+      .run(MAX_RETAINED_RAW_EVENTS);
   }
 
   private requireProject(projectId: string): ProjectRecord {

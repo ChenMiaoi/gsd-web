@@ -11,7 +11,9 @@ import type {
   ProjectTimelineResponse,
   ProjectsResponse,
   RegisterProjectRequest,
+  RelinkProjectRequest,
 } from '../../shared/contracts.js';
+import { createTrackedProjectContinuitySummary } from '../../shared/contracts.js';
 import {
   ActiveInitJobError,
   DuplicateProjectError,
@@ -53,7 +55,7 @@ function sendError(reply: FastifyReply, statusCode: number, message: string, cod
   });
 }
 
-function parseRegisterBody(body: unknown): RegisterProjectRequest {
+function parsePathBody(body: unknown): RegisterProjectRequest | RelinkProjectRequest {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw new Error('Request body must be a JSON object with a path field.');
   }
@@ -376,7 +378,7 @@ export async function registerProjectRoutes(
     let body: RegisterProjectRequest;
 
     try {
-      body = parseRegisterBody(request.body);
+      body = parsePathBody(request.body) as RegisterProjectRequest;
     } catch (error) {
       return sendError(
         reply,
@@ -394,13 +396,18 @@ export async function registerProjectRoutes(
       );
       const projectId = `prj_${randomUUID()}`;
       const registrationState = buildProjectRegistrationState(projectId, canonicalPath.canonicalPath, snapshot);
+      const continuity = createTrackedProjectContinuitySummary(snapshot.checkedAt);
       const result = options.registry.registerProject({
         projectId,
         registeredPath: canonicalPath.normalizedPath,
         canonicalPath: canonicalPath.canonicalPath,
         snapshot,
         monitor: registrationState.monitor,
-        eventPayload: registrationState.eventPayload,
+        continuity,
+        eventPayload: {
+          ...registrationState.eventPayload,
+          continuity,
+        },
         timelineEntry: registrationState.timelineEntry,
       });
       const response = toMutationResponse(result);
@@ -427,6 +434,87 @@ export async function registerProjectRoutes(
 
       request.log.error({ err: error }, 'Failed to register project path');
       return sendError(reply, 500, 'Failed to register project path.', 'registry_write_failed');
+    }
+  });
+
+  app.post<{ Params: { id: string }; Body: unknown }>('/api/projects/:id/relink', async (request, reply) => {
+    const existingProject = options.registry.getProjectById(request.params.id);
+
+    if (!existingProject) {
+      return sendError(reply, 404, `Project ${request.params.id} was not found.`, 'project_not_found');
+    }
+
+    let body: RelinkProjectRequest;
+
+    try {
+      body = parsePathBody(request.body) as RelinkProjectRequest;
+    } catch (error) {
+      return sendError(
+        reply,
+        400,
+        error instanceof Error ? error.message : 'Project path is required.',
+        'invalid_path',
+      );
+    }
+
+    try {
+      const canonicalPath = await canonicalizeProjectPath(body.path);
+      const emittedAt = new Date().toISOString();
+      const continuity = createTrackedProjectContinuitySummary(emittedAt, {
+        lastRelinkedAt: emittedAt,
+        previousRegisteredPath: existingProject.registeredPath,
+        previousCanonicalPath: existingProject.canonicalPath,
+      });
+      const result = options.registry.relinkProject({
+        projectId: existingProject.projectId,
+        registeredPath: canonicalPath.normalizedPath,
+        canonicalPath: canonicalPath.canonicalPath,
+        emittedAt,
+        continuity,
+        eventPayload: {
+          projectId: existingProject.projectId,
+          registeredPath: canonicalPath.normalizedPath,
+          canonicalPath: canonicalPath.canonicalPath,
+          previousRegisteredPath: existingProject.registeredPath,
+          previousCanonicalPath: existingProject.canonicalPath,
+          snapshotStatus: existingProject.snapshot.status,
+          warningCount: existingProject.snapshot.warnings.length,
+          emittedAt,
+          continuity,
+          monitor: existingProject.monitor,
+        },
+        timelineEntry: {
+          type: 'relinked',
+          emittedAt,
+          trigger: 'relink',
+          snapshotStatus: existingProject.snapshot.status,
+          monitorHealth: existingProject.monitor.health,
+          warningCount: existingProject.snapshot.warnings.length,
+          changed: false,
+          detail: `Relinked project continuity from ${existingProject.canonicalPath} to ${canonicalPath.canonicalPath} without creating a new project id.`,
+          error: null,
+        },
+      });
+      const response = toMutationResponse(result);
+
+      options.eventHub.broadcast(response.event);
+
+      return reply.code(200).send(response);
+    } catch (error) {
+      if (isProjectPathValidationError(error)) {
+        return sendError(reply, error.statusCode, error.message, error.responseCode);
+      }
+
+      if (isDuplicateRegistration(error)) {
+        return sendError(reply, 409, error.message, 'duplicate_path');
+      }
+
+      if (isNotFoundError(error)) {
+        return sendError(reply, 404, error.message, 'project_not_found');
+      }
+
+      request.log.error({ err: error, projectId: existingProject.projectId }, 'Failed to relink project path');
+      return sendError(reply, 500, 'Failed to relink project path.', 'project_relink_failed');
     }
   });
 
@@ -538,6 +626,10 @@ export async function registerProjectRoutes(
     {
       method: 'POST' as const,
       route: '/api/projects/register',
+    },
+    {
+      method: 'POST' as const,
+      route: '/api/projects/:id/relink',
     },
     {
       method: 'POST' as const,

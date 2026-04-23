@@ -279,6 +279,8 @@ test.describe('hosted dashboard inventory flow', () => {
           sourceStates: buildSourceStateMap(degradedProject.snapshot),
           changed: true,
           checkedAt: degradedProject.snapshot.checkedAt,
+          trigger: 'manual_refresh',
+          monitor: degradedProject.monitor,
         },
       },
     };
@@ -295,8 +297,27 @@ test.describe('hosted dashboard inventory flow', () => {
       { times: 1 },
     );
 
+    let interceptedDetailRefreshes = 0;
+
+    await page.route(
+      new RegExp(`/api/projects/${registeredProject.projectId}$`),
+      async (route) => {
+        interceptedDetailRefreshes += 1;
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            ...degradedProject,
+            timeline: [],
+          }),
+        });
+      },
+      { times: 1 },
+    );
+
     await page.getByRole('button', { name: 'Refresh selected project' }).click();
 
+    await expect.poll(() => interceptedDetailRefreshes).toBe(1);
     await expect(page.getByTestId('detail-status')).toContainText('Degraded');
     await expect(page.getByTestId('warning-list')).toContainText('STATE.md');
 
@@ -334,6 +355,8 @@ test.describe('hosted dashboard inventory flow', () => {
                 sourceStates: buildSourceStateMap(degradedProject.snapshot),
                 changed: true,
                 checkedAt: degradedCheckedAt,
+                trigger: 'manual_refresh',
+                monitor: degradedProject.monitor,
               },
             },
           }),
