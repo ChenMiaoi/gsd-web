@@ -202,7 +202,8 @@ export type PortfolioSummary = {
 
 export const APP_PAGES: readonly AppPage[] = ['overview', 'details'];
 export const ROUTE_BASE_PATH = '/lazy';
-export const ROUTE_OVERVIEW_PATH = `${ROUTE_BASE_PATH}/all`;
+export const ROUTE_OVERVIEW_PATH = `${ROUTE_BASE_PATH}/boss`;
+export const ROUTE_DETAIL_PREFIX = 'employee-';
 export const WORKFLOW_TABS: readonly WorkflowTab[] = [
   'progress',
   'dependencies',
@@ -264,9 +265,15 @@ export function parseAppRoute(pathname: string): AppRoute {
   }
 
   if (normalizedPath.startsWith(`${ROUTE_BASE_PATH}/`)) {
-    const projectId = safeDecodePathSegment(normalizedPath.slice(ROUTE_BASE_PATH.length + 1));
+    const routeTail = safeDecodePathSegment(normalizedPath.slice(ROUTE_BASE_PATH.length + 1));
 
-    if (projectId.length > 0 && projectId !== 'all') {
+    if (routeTail.startsWith(ROUTE_DETAIL_PREFIX)) {
+      const projectId = routeTail.slice(ROUTE_DETAIL_PREFIX.length);
+
+      if (projectId.length === 0) {
+        return { page: 'welcome' };
+      }
+
       return {
         page: 'details',
         projectId,
@@ -286,7 +293,7 @@ export function getAppRoutePath(route: AppRoute) {
     return ROUTE_OVERVIEW_PATH;
   }
 
-  return `${ROUTE_BASE_PATH}/${encodeURIComponent(route.projectId)}`;
+  return `${ROUTE_BASE_PATH}/${ROUTE_DETAIL_PREFIX}${encodeURIComponent(route.projectId)}`;
 }
 
 export class HttpError extends Error {

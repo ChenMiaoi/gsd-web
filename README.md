@@ -70,8 +70,8 @@ The dashboard keeps the last known good project information in the registry, so 
 | Route | Purpose |
 | --- | --- |
 | `/lazy` | Welcome page |
-| `/lazy/all` | Project overview |
-| `/lazy/<projectId>` | Project detail |
+| `/lazy/boss` | Project overview |
+| `/lazy/employee-<projectId>` | Project detail |
 
 The server returns the React shell for deep links, so refreshes and direct project URLs work.
 

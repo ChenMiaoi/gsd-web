@@ -11,6 +11,7 @@ import {
   APP_PAGES,
   INVENTORY_AUTO_REFRESH_MS,
   ROUTE_BASE_PATH,
+  ROUTE_DETAIL_PREFIX,
   ROUTE_OVERVIEW_PATH,
   WORKFLOW_TABS,
   AppPageIcon,
@@ -1355,7 +1356,7 @@ export default function App() {
             <span data-active="true">{ROUTE_BASE_PATH}</span>
             <span>{ROUTE_OVERVIEW_PATH}</span>
             <span>
-              {routePreviewProject ? getAppRoutePath({ page: 'details', projectId: routePreviewProject.projectId }) : `${ROUTE_BASE_PATH}/:projectId`}
+              {routePreviewProject ? getAppRoutePath({ page: 'details', projectId: routePreviewProject.projectId }) : `${ROUTE_BASE_PATH}/${ROUTE_DETAIL_PREFIX}:projectId`}
             </span>
           </div>
 

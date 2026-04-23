@@ -291,7 +291,7 @@ test.describe('project initialization dashboard flow', () => {
 
     try {
       const registration = await registerProject(harness.baseUrl, projectPath);
-      await page.goto(`${harness.baseUrl}/lazy/${registration.project.projectId}`);
+      await page.goto(`${harness.baseUrl}/lazy/employee-${registration.project.projectId}`);
 
       await expect(page.getByTestId('detail-status')).toContainText('Uninitialized');
       await expect(page.getByTestId('detail-canonical-path')).toHaveText(projectPath);
@@ -332,11 +332,11 @@ test.describe('project initialization dashboard flow', () => {
         await route.abort('failed');
       });
 
-      await page.goto(`${harness.baseUrl}/lazy/all`);
+      await page.goto(`${harness.baseUrl}/lazy/boss`);
       await expect(page.getByTestId('stream-status')).toContainText('Disconnected');
 
       const registration = await registerProject(harness.baseUrl, projectPath);
-      await page.goto(`${harness.baseUrl}/lazy/${registration.project.projectId}`);
+      await page.goto(`${harness.baseUrl}/lazy/employee-${registration.project.projectId}`);
 
       await expect(page.getByTestId('detail-status')).toContainText('Uninitialized');
       await expect(page.getByTestId('detail-canonical-path')).toHaveText(projectPath);
@@ -377,7 +377,7 @@ test.describe('project initialization dashboard flow', () => {
 
     try {
       const registration = await registerProject(harness.baseUrl, projectPath);
-      await page.goto(`${harness.baseUrl}/lazy/${registration.project.projectId}`);
+      await page.goto(`${harness.baseUrl}/lazy/employee-${registration.project.projectId}`);
 
       await expect(page.getByTestId('detail-status')).toContainText('Uninitialized');
       await expect(page.getByTestId('detail-canonical-path')).toHaveText(projectPath);

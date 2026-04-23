@@ -179,7 +179,7 @@ test.describe('project monitoring dashboard flow', () => {
 
     const registration = await registerProject(harness.baseUrl, projectPath);
 
-    await page.goto(`${harness.baseUrl}/lazy/${registration.project.projectId}`);
+    await page.goto(`${harness.baseUrl}/lazy/employee-${registration.project.projectId}`);
 
     await expect(page.getByTestId('detail-status')).toContainText('Initialized');
     await expect(page.getByTestId('detail-monitor-health')).toContainText('Healthy');
@@ -232,7 +232,7 @@ test.describe('project monitoring dashboard flow', () => {
 
     const registration = await registerProject(harness.baseUrl, projectPath);
 
-    await page.goto(`${harness.baseUrl}/lazy/${registration.project.projectId}`);
+    await page.goto(`${harness.baseUrl}/lazy/employee-${registration.project.projectId}`);
 
     const project = await getProjectByCanonicalPath(harness.baseUrl, projectPath);
 

@@ -231,7 +231,7 @@ test.describe('project continuity dashboard flow', () => {
     try {
       const registration = await registerProject(harness.baseUrl, sourceProjectPath);
 
-      await page.goto(`${harness.baseUrl}/lazy/${registration.project.projectId}`);
+      await page.goto(`${harness.baseUrl}/lazy/employee-${registration.project.projectId}`);
 
       await expect(page.getByTestId('detail-status')).toContainText('Uninitialized');
       await page.getByTestId('init-action').click();
@@ -302,7 +302,7 @@ test.describe('project continuity dashboard flow', () => {
     try {
       const registration = await registerProject(harness.baseUrl, projectPath);
 
-      await page.goto(`${harness.baseUrl}/lazy/${registration.project.projectId}`);
+      await page.goto(`${harness.baseUrl}/lazy/employee-${registration.project.projectId}`);
 
       const projectId = (await page.getByTestId('detail-project-id-value').textContent())?.trim();
       expect(projectId).toBeTruthy();
