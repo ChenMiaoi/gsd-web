@@ -4,6 +4,7 @@ import {
   buildSourceStateMap,
   createTrackedProjectContinuitySummary,
   deriveMonitorHealthFromSnapshot,
+  type ProjectContinuityState,
   type ProjectContinuitySummary,
   type ProjectEventEnvelope,
   type ProjectMonitorError,
@@ -313,7 +314,7 @@ function buildRegistrationTimelineEntry(snapshot: ProjectSnapshot, monitor: Proj
 
 function buildSuccessTimelineEntry(options: {
   previousHealth: ProjectMonitorHealth;
-  previousContinuityState: ProjectRecord['continuity']['state'] | undefined;
+  previousContinuityState: ProjectContinuityState | undefined;
   trigger: ProjectReconcileTrigger;
   snapshot: ProjectSnapshot;
   monitor: ProjectMonitorSummary;

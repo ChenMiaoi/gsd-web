@@ -446,6 +446,24 @@ pre {
   gap: 0.45rem;
 }
 
+.continuity-panel,
+.relink-form {
+  gap: 1rem;
+}
+
+.continuity-alert {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.relink-form__actions {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
 .timeline-panel {
   gap: 1rem;
 }

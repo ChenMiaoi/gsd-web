@@ -1366,7 +1366,7 @@ export class RegistryDatabase {
       snapshotStatus: project.snapshot.status,
       job: project.latestInitJob,
       historyEntry,
-      continuity: project.continuity,
+      ...(project.continuity ? { continuity: project.continuity } : {}),
     };
   }
 

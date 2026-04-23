@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import {
+  PROJECT_CONTINUITY_STATES,
   PROJECT_INIT_JOB_STAGES,
   PROJECT_INIT_REFRESH_RESULT_STATUSES,
   PROJECT_MONITOR_HEALTHS,
@@ -11,6 +12,8 @@ import {
   SNAPSHOT_SOURCE_STATES,
   isProjectInitJobTerminalStage,
   type DirectorySummary,
+  type ProjectContinuityState,
+  type ProjectContinuitySummary,
   type ProjectDetailResponse,
   type ProjectInitEventPayload,
   type ProjectInitJob,
@@ -24,6 +27,7 @@ import {
   type ProjectMonitorSummary,
   type ProjectMutationResponse,
   type ProjectRecord,
+  type ProjectRelinkEventPayload,
   type ProjectSnapshot,
   type ProjectSnapshotEventPayload,
   type ProjectSnapshotStatus,
@@ -43,6 +47,7 @@ type KnownEventType =
   | 'service.ready'
   | 'project.registered'
   | 'project.refreshed'
+  | 'project.relinked'
   | 'project.monitor.updated'
   | 'project.init.updated';
 
@@ -81,6 +86,7 @@ const KNOWN_EVENT_TYPES: ReadonlySet<KnownEventType> = new Set([
   'service.ready',
   'project.registered',
   'project.refreshed',
+  'project.relinked',
   'project.monitor.updated',
   'project.init.updated',
 ]);
@@ -112,8 +118,15 @@ const MONITOR_HEALTH_LABELS: Record<ProjectMonitorHealth, string> = {
 const TIMELINE_TYPE_LABELS: Record<ProjectTimelineEntryType, string> = {
   registered: 'Registered',
   refreshed: 'Refreshed',
+  path_lost: 'Path lost',
+  relinked: 'Relinked',
   monitor_degraded: 'Degraded',
   monitor_recovered: 'Recovered',
+};
+
+const CONTINUITY_STATE_LABELS: Record<ProjectContinuityState, string> = {
+  tracked: 'Tracked',
+  path_lost: 'Path lost',
 };
 
 const RECONCILE_TRIGGER_LABELS: Record<ProjectReconcileTrigger, string> = {
@@ -123,6 +136,7 @@ const RECONCILE_TRIGGER_LABELS: Record<ProjectReconcileTrigger, string> = {
   monitor_boot: 'Monitor boot',
   monitor_interval: 'Monitor interval',
   watcher: 'Watcher',
+  relink: 'Relink',
 };
 
 const STREAM_STATUS_LABELS: Record<StreamStatus, string> = {
@@ -249,6 +263,16 @@ function parseProjectMonitorHealth(value: unknown, label: string): ProjectMonito
   }
 
   return candidate as ProjectMonitorHealth;
+}
+
+function parseProjectContinuityState(value: unknown, label: string): ProjectContinuityState {
+  const candidate = expectString(value, label);
+
+  if (!PROJECT_CONTINUITY_STATES.includes(candidate as ProjectContinuityState)) {
+    throw new ResponseShapeError(`${label} must be one of ${PROJECT_CONTINUITY_STATES.join(', ')}.`);
+  }
+
+  return candidate as ProjectContinuityState;
 }
 
 function parseProjectReconcileTrigger(value: unknown, label: string): ProjectReconcileTrigger {
@@ -556,6 +580,31 @@ function parseProjectMonitorSummary(value: unknown, label: string): ProjectMonit
   };
 }
 
+function parseProjectContinuitySummary(value: unknown, label: string): ProjectContinuitySummary {
+  const record = expectRecord(value, label);
+
+  return {
+    state: parseProjectContinuityState(record.state, `${label}.state`),
+    checkedAt: expectString(record.checkedAt, `${label}.checkedAt`),
+    pathLostAt:
+      record.pathLostAt === null || record.pathLostAt === undefined
+        ? null
+        : expectString(record.pathLostAt, `${label}.pathLostAt`),
+    lastRelinkedAt:
+      record.lastRelinkedAt === null || record.lastRelinkedAt === undefined
+        ? null
+        : expectString(record.lastRelinkedAt, `${label}.lastRelinkedAt`),
+    previousRegisteredPath:
+      record.previousRegisteredPath === null || record.previousRegisteredPath === undefined
+        ? null
+        : expectString(record.previousRegisteredPath, `${label}.previousRegisteredPath`),
+    previousCanonicalPath:
+      record.previousCanonicalPath === null || record.previousCanonicalPath === undefined
+        ? null
+        : expectString(record.previousCanonicalPath, `${label}.previousCanonicalPath`),
+  };
+}
+
 function parseProjectTimelineEntryType(value: unknown, label: string): ProjectTimelineEntryType {
   const candidate = expectString(value, label);
 
@@ -701,6 +750,10 @@ function parseProjectRecord(value: unknown, label: string = 'project'): ProjectR
     record.latestInitJob === null || record.latestInitJob === undefined
       ? null
       : assertUiSafeInitJob(parseProjectInitJob(record.latestInitJob, `${label}.latestInitJob`), snapshot.status, `${label}.latestInitJob`);
+  const continuity =
+    record.continuity === null || record.continuity === undefined
+      ? undefined
+      : parseProjectContinuitySummary(record.continuity, `${label}.continuity`);
 
   return {
     projectId: expectString(record.projectId, `${label}.projectId`),
@@ -712,6 +765,7 @@ function parseProjectRecord(value: unknown, label: string = 'project'): ProjectR
       record.lastEventId === undefined ? null : expectNullableString(record.lastEventId, `${label}.lastEventId`),
     snapshot,
     monitor: parseProjectMonitorSummary(record.monitor, `${label}.monitor`),
+    ...(continuity ? { continuity } : {}),
     latestInitJob,
   };
 }
@@ -750,6 +804,10 @@ function parseSourceStateMap(
 
 function parseProjectSnapshotEventPayload(value: unknown, label: string): ProjectSnapshotEventPayload {
   const record = expectRecord(value, label);
+  const continuity =
+    record.continuity === null || record.continuity === undefined
+      ? undefined
+      : parseProjectContinuitySummary(record.continuity, `${label}.continuity`);
 
   return {
     projectId: expectString(record.projectId, `${label}.projectId`),
@@ -766,11 +824,16 @@ function parseProjectSnapshotEventPayload(value: unknown, label: string): Projec
     checkedAt: expectString(record.checkedAt, `${label}.checkedAt`),
     trigger: parseProjectReconcileTrigger(record.trigger, `${label}.trigger`),
     monitor: parseProjectMonitorSummary(record.monitor, `${label}.monitor`),
+    ...(continuity ? { continuity } : {}),
   };
 }
 
 function parseProjectMonitorEventPayload(value: unknown, label: string): ProjectMonitorEventPayload {
   const record = expectRecord(value, label);
+  const continuity =
+    record.continuity === null || record.continuity === undefined
+      ? undefined
+      : parseProjectContinuitySummary(record.continuity, `${label}.continuity`);
 
   return {
     projectId: expectString(record.projectId, `${label}.projectId`),
@@ -783,11 +846,33 @@ function parseProjectMonitorEventPayload(value: unknown, label: string): Project
         ? null
         : parseProjectMonitorHealth(record.previousHealth, `${label}.previousHealth`),
     monitor: parseProjectMonitorSummary(record.monitor, `${label}.monitor`),
+    ...(continuity ? { continuity } : {}),
+  };
+}
+
+function parseProjectRelinkEventPayload(value: unknown, label: string): ProjectRelinkEventPayload {
+  const record = expectRecord(value, label);
+
+  return {
+    projectId: expectString(record.projectId, `${label}.projectId`),
+    registeredPath: expectString(record.registeredPath, `${label}.registeredPath`),
+    canonicalPath: expectString(record.canonicalPath, `${label}.canonicalPath`),
+    previousRegisteredPath: expectString(record.previousRegisteredPath, `${label}.previousRegisteredPath`),
+    previousCanonicalPath: expectString(record.previousCanonicalPath, `${label}.previousCanonicalPath`),
+    snapshotStatus: parseSnapshotStatus(record.snapshotStatus, `${label}.snapshotStatus`),
+    warningCount: expectNumber(record.warningCount, `${label}.warningCount`),
+    emittedAt: expectString(record.emittedAt, `${label}.emittedAt`),
+    continuity: parseProjectContinuitySummary(record.continuity, `${label}.continuity`),
+    monitor: parseProjectMonitorSummary(record.monitor, `${label}.monitor`),
   };
 }
 
 function parseProjectInitEventPayload(value: unknown, label: string): ProjectInitEventPayload {
   const record = expectRecord(value, label);
+  const continuity =
+    record.continuity === null || record.continuity === undefined
+      ? undefined
+      : parseProjectContinuitySummary(record.continuity, `${label}.continuity`);
 
   return {
     projectId: expectString(record.projectId, `${label}.projectId`),
@@ -795,6 +880,7 @@ function parseProjectInitEventPayload(value: unknown, label: string): ProjectIni
     snapshotStatus: parseSnapshotStatus(record.snapshotStatus, `${label}.snapshotStatus`),
     job: parseProjectInitJob(record.job, `${label}.job`),
     historyEntry: parseProjectInitJobHistoryEntry(record.historyEntry, `${label}.historyEntry`),
+    ...(continuity ? { continuity } : {}),
   };
 }
 
@@ -834,7 +920,9 @@ function parseProjectMutationResponse(value: unknown): ProjectMutationResponse {
           ? parseProjectInitEventPayload(eventRecord.payload, 'project mutation response.event.payload')
           : eventType === 'project.monitor.updated'
             ? parseProjectMonitorEventPayload(eventRecord.payload, 'project mutation response.event.payload')
-            : parseProjectSnapshotEventPayload(eventRecord.payload, 'project mutation response.event.payload'),
+            : eventType === 'project.relinked'
+              ? parseProjectRelinkEventPayload(eventRecord.payload, 'project mutation response.event.payload')
+              : parseProjectSnapshotEventPayload(eventRecord.payload, 'project mutation response.event.payload'),
     },
   };
 }
@@ -955,6 +1043,37 @@ function describeProject(project: ProjectRecord) {
   );
 }
 
+function getProjectContinuity(project: ProjectRecord): ProjectContinuitySummary {
+  return (
+    project.continuity ?? {
+      state: 'tracked',
+      checkedAt: project.snapshot.checkedAt,
+      pathLostAt: null,
+      lastRelinkedAt: null,
+      previousRegisteredPath: null,
+      previousCanonicalPath: null,
+    }
+  );
+}
+
+function continuityTone(state: ProjectContinuityState) {
+  return state === 'tracked' ? 'ok' : 'warning';
+}
+
+function describeContinuityState(project: ProjectRecord) {
+  const continuity = getProjectContinuity(project);
+
+  if (continuity.state === 'path_lost') {
+    return 'The registered root is missing right now. The dashboard is preserving the last good snapshot, latest init job, and recent timeline until you relink this same project record.';
+  }
+
+  if (continuity.lastRelinkedAt) {
+    return 'This project was relinked in place. The same project id now tracks the new path while keeping prior history attached.';
+  }
+
+  return 'This project identity is still tracking its current canonical path.';
+}
+
 function sourceTone(state: SnapshotSourceState) {
   if (state === 'ok') {
     return 'ok';
@@ -1001,7 +1120,7 @@ function timelineTone(type: ProjectTimelineEntryType) {
     return 'ok';
   }
 
-  if (type === 'monitor_degraded') {
+  if (type === 'path_lost' || type === 'monitor_degraded') {
     return 'warning';
   }
 
@@ -1023,6 +1142,7 @@ function mergeProjectInitJob(project: ProjectRecord, envelope: ProjectInitEnvelo
     ...project,
     updatedAt: envelope.payload.job.updatedAt,
     lastEventId: envelope.id,
+    ...(envelope.payload.continuity ? { continuity: envelope.payload.continuity } : {}),
     latestInitJob: envelope.payload.job,
   };
 }
@@ -1096,6 +1216,10 @@ export default function App() {
   const [registerPending, setRegisterPending] = useState(false);
   const [registerError, setRegisterError] = useState<string | null>(null);
   const [registerSuccess, setRegisterSuccess] = useState<string | null>(null);
+  const [relinkPath, setRelinkPath] = useState('');
+  const [relinkPending, setRelinkPending] = useState(false);
+  const [relinkError, setRelinkError] = useState<string | null>(null);
+  const [relinkSuccess, setRelinkSuccess] = useState<string | null>(null);
   const [refreshPending, setRefreshPending] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [initPendingProjectId, setInitPendingProjectId] = useState<string | null>(null);
@@ -1130,6 +1254,12 @@ export default function App() {
   useEffect(() => {
     selectedProjectRef.current = selectedProject;
   }, [selectedProject]);
+
+  useEffect(() => {
+    setRelinkPath('');
+    setRelinkError(null);
+    setRelinkSuccess(null);
+  }, [selectedProjectId]);
 
   const loadProjectDetail = useCallback(async (projectId: string, fallbackProject?: ProjectRecord | null) => {
     const requestId = detailRequestIdRef.current + 1;
@@ -1465,6 +1595,7 @@ export default function App() {
         if (
           summary.type === 'project.registered'
           || summary.type === 'project.refreshed'
+          || summary.type === 'project.relinked'
           || summary.type === 'project.monitor.updated'
         ) {
           const activeSelectedInitJob = selectedProjectRef.current?.latestInitJob ?? null;
@@ -1506,6 +1637,7 @@ export default function App() {
     eventSource.addEventListener('service.ready', handleEnvelope as EventListener);
     eventSource.addEventListener('project.registered', handleEnvelope as EventListener);
     eventSource.addEventListener('project.refreshed', handleEnvelope as EventListener);
+    eventSource.addEventListener('project.relinked', handleEnvelope as EventListener);
     eventSource.addEventListener('project.monitor.updated', handleEnvelope as EventListener);
     eventSource.addEventListener('project.init.updated', handleEnvelope as EventListener);
 
@@ -1513,6 +1645,7 @@ export default function App() {
       eventSource.removeEventListener('service.ready', handleEnvelope as EventListener);
       eventSource.removeEventListener('project.registered', handleEnvelope as EventListener);
       eventSource.removeEventListener('project.refreshed', handleEnvelope as EventListener);
+      eventSource.removeEventListener('project.relinked', handleEnvelope as EventListener);
       eventSource.removeEventListener('project.monitor.updated', handleEnvelope as EventListener);
       eventSource.removeEventListener('project.init.updated', handleEnvelope as EventListener);
       eventSource.close();
@@ -1529,6 +1662,9 @@ export default function App() {
       setTimelineError(null);
       setRefreshError(null);
       setInitError(null);
+      setRelinkError(null);
+      setRelinkSuccess(null);
+      setRelinkPath('');
       setRegisterSuccess(null);
       void syncSelectedProjectPanels(project.projectId, project);
     },
@@ -1591,6 +1727,9 @@ export default function App() {
         setProjectTimeline({ items: [], total: 0 });
         setRegisterPath('');
         setRegisterSuccess(`Registered ${describeProject(response.project)}.`);
+        setRelinkPath('');
+        setRelinkError(null);
+        setRelinkSuccess(null);
         setDetailError(null);
         setTimelineError(null);
         setRefreshError(null);
@@ -1614,6 +1753,106 @@ export default function App() {
       }
     },
     [projects, registerPath, syncSelectedProjectPanels],
+  );
+
+  const handleRelinkSelected = useCallback(
+    async (event: React.FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+
+      const selected = selectedProjectRef.current;
+
+      if (!selected) {
+        return;
+      }
+
+      const continuity = getProjectContinuity(selected);
+
+      if (continuity.state !== 'path_lost') {
+        setRelinkError('Relink is only available after the current project path is reported missing.');
+        setRelinkSuccess(null);
+        return;
+      }
+
+      const candidatePath = relinkPath.trim();
+
+      if (candidatePath.length === 0) {
+        setRelinkError('Enter the project’s new local path before relinking it.');
+        setRelinkSuccess(null);
+        return;
+      }
+
+      const duplicateProject = projects.find((project) => {
+        if (project.projectId === selected.projectId) {
+          return false;
+        }
+
+        const normalizedCandidate = normalizePathForComparison(candidatePath);
+
+        return [project.registeredPath, project.canonicalPath].some(
+          (pathValue) => normalizePathForComparison(pathValue) === normalizedCandidate,
+        );
+      });
+
+      if (duplicateProject) {
+        setRelinkError('That path is already owned by another tracked project.');
+        setRelinkSuccess(null);
+        return;
+      }
+
+      setRelinkPending(true);
+      setRelinkError(null);
+      setRelinkSuccess(null);
+
+      try {
+        const response = await requestJson(
+          `/api/projects/${selected.projectId}/relink`,
+          {
+            method: 'POST',
+            headers: {
+              accept: 'application/json',
+              'content-type': 'application/json',
+            },
+            body: JSON.stringify({ path: candidatePath }),
+          },
+          parseProjectMutationResponse,
+          'Project relink',
+        );
+
+        if (!mountedRef.current) {
+          return;
+        }
+
+        setProjects((current) => upsertProject(current, response.project));
+        selectedProjectIdRef.current = response.project.projectId;
+        setSelectedProjectId(response.project.projectId);
+        setSelectedProject(response.project);
+        setRelinkPath('');
+        setRelinkSuccess(
+          `Relinked ${response.project.projectId} to ${response.project.canonicalPath} without creating a new project id.`,
+        );
+        setDetailError(null);
+        setTimelineError(null);
+        setRefreshError(null);
+        setInitError(null);
+        void syncSelectedProjectPanels(response.project.projectId, response.project);
+      } catch (error) {
+        if (!mountedRef.current) {
+          return;
+        }
+
+        setRelinkError(
+          formatRequestError(
+            error,
+            'Project relink timed out. The current project detail, init history, and timeline stayed visible while you retry.',
+          ),
+        );
+      } finally {
+        if (mountedRef.current) {
+          setRelinkPending(false);
+        }
+      }
+    },
+    [projects, relinkPath, syncSelectedProjectPanels],
   );
 
   const handleInitializeSelected = useCallback(async () => {
@@ -1734,6 +1973,8 @@ export default function App() {
     selectedProject === null
       ? null
       : describeMonitorState(selectedProject.monitor, selectedProject.snapshot.status);
+  const selectedContinuity = selectedProject === null ? null : getProjectContinuity(selectedProject);
+  const selectedContinuitySummary = selectedProject === null ? null : describeContinuityState(selectedProject);
   const selectedTimelineCountLabel = describeTimelineCount(projectTimeline.total);
 
   return (
@@ -1887,6 +2128,7 @@ export default function App() {
                 const warningCount = project.snapshot.warnings.length;
                 const initJob = project.latestInitJob;
                 const initSummary = summarizeInitJob(initJob);
+                const continuity = getProjectContinuity(project);
 
                 return (
                   <li key={project.projectId}>
@@ -1913,6 +2155,13 @@ export default function App() {
                           data-testid={`project-monitor-health-${project.projectId}`}
                         >
                           {MONITOR_HEALTH_LABELS[project.monitor.health]}
+                        </span>
+                        <span
+                          className="status-pill"
+                          data-status={continuityTone(continuity.state)}
+                          data-testid={`project-continuity-${project.projectId}`}
+                        >
+                          {CONTINUITY_STATE_LABELS[continuity.state]}
                         </span>
                         <span>{pluralize(warningCount, 'warning')}</span>
                       </div>
@@ -2017,6 +2266,13 @@ export default function App() {
                   <span className="status-pill" data-status={selectedProject.monitor.health} data-testid="detail-monitor-health">
                     {MONITOR_HEALTH_LABELS[selectedProject.monitor.health]}
                   </span>
+                  <span
+                    className="status-pill"
+                    data-status={continuityTone(selectedContinuity!.state)}
+                    data-testid="detail-continuity-state"
+                  >
+                    {CONTINUITY_STATE_LABELS[selectedContinuity!.state]}
+                  </span>
                   <span className="meta-badge" data-testid="detail-warning-count">
                     {pluralize(selectedProject.snapshot.warnings.length, 'warning')}
                   </span>
@@ -2111,6 +2367,139 @@ export default function App() {
                     </strong>
                     <p>{clampWarning(selectedProject.monitor.lastError.message)}</p>
                   </div>
+                ) : null}
+              </section>
+
+              <section className="subpanel continuity-panel" data-testid="continuity-panel">
+                <div className="subpanel__header subpanel__header--actions">
+                  <div>
+                    <h4>Project continuity</h4>
+                    <p>Stable identity, explicit path-loss truth, and relink stay attached to the same project record.</p>
+                  </div>
+                  <div className="detail-header__meta detail-header__meta--monitor">
+                    <span className="status-pill" data-status={continuityTone(selectedContinuity!.state)}>
+                      {CONTINUITY_STATE_LABELS[selectedContinuity!.state]}
+                    </span>
+                    <span className="meta-badge">ID preserved</span>
+                  </div>
+                </div>
+
+                <p className="detail-copy__lead" data-testid="continuity-summary-copy">
+                  {selectedContinuitySummary}
+                </p>
+
+                <dl className="detail-facts detail-facts--compact">
+                  <div>
+                    <dt>Path lost at</dt>
+                    <dd data-testid="continuity-path-lost-at">
+                      {selectedContinuity!.pathLostAt ? (
+                        <time dateTime={selectedContinuity!.pathLostAt}>
+                          {formatTimestamp(selectedContinuity!.pathLostAt)}
+                        </time>
+                      ) : (
+                        'No missing-path state recorded.'
+                      )}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Last relinked</dt>
+                    <dd data-testid="continuity-last-relinked-at">
+                      {selectedContinuity!.lastRelinkedAt ? (
+                        <time dateTime={selectedContinuity!.lastRelinkedAt}>
+                          {formatTimestamp(selectedContinuity!.lastRelinkedAt)}
+                        </time>
+                      ) : (
+                        'No relink recorded yet.'
+                      )}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Previous path</dt>
+                    <dd data-testid="continuity-previous-canonical-path">
+                      {selectedContinuity!.previousCanonicalPath ?? 'No prior path recorded.'}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Continuity checked</dt>
+                    <dd>
+                      <time dateTime={selectedContinuity!.checkedAt}>
+                        {formatTimestamp(selectedContinuity!.checkedAt)}
+                      </time>
+                    </dd>
+                  </div>
+                </dl>
+
+                {selectedContinuity!.state === 'path_lost' ? (
+                  <div className="inline-alert inline-alert--error continuity-alert" data-testid="continuity-path-lost-alert">
+                    <strong>The registered project root is missing.</strong>
+                    <p>
+                      The dashboard is preserving the last good snapshot, latest init job, and recent timeline for{' '}
+                      {selectedProject.projectId} until you relink the project to its new path.
+                    </p>
+                  </div>
+                ) : null}
+
+                {selectedContinuity!.lastRelinkedAt ? (
+                  <div className="inline-alert inline-alert--success continuity-alert" data-testid="continuity-relinked-note">
+                    <strong>This project was relinked without changing identity.</strong>
+                    <p>
+                      The current snapshot, init history, and persisted timeline remain attached to project id{' '}
+                      {selectedProject.projectId}.
+                    </p>
+                  </div>
+                ) : null}
+
+                {relinkError ? (
+                  <p className="inline-alert inline-alert--error" role="alert" data-testid="relink-error">
+                    {relinkError}
+                  </p>
+                ) : null}
+
+                {relinkSuccess ? (
+                  <p className="inline-alert inline-alert--success" data-testid="relink-success">
+                    {relinkSuccess}
+                  </p>
+                ) : null}
+
+                {selectedContinuity!.state === 'path_lost' ? (
+                  <form className="relink-form" data-testid="relink-form" onSubmit={handleRelinkSelected}>
+                    <label className="field" htmlFor="relink-path">
+                      <span>New project path</span>
+                      <input
+                        id="relink-path"
+                        name="relink-path"
+                        type="text"
+                        autoComplete="off"
+                        spellCheck={false}
+                        data-testid="relink-path-input"
+                        placeholder="/absolute/path/to/moved/project"
+                        value={relinkPath}
+                        onChange={(nextEvent) => {
+                          setRelinkPath(nextEvent.target.value);
+                          setRelinkError(null);
+                          setRelinkSuccess(null);
+                        }}
+                      />
+                    </label>
+
+                    <div className="relink-form__actions">
+                      <button type="submit" className="primary-button" disabled={relinkPending}>
+                        {relinkPending ? 'Relinking…' : 'Relink project'}
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => {
+                          setRelinkPath('');
+                          setRelinkError(null);
+                          setRelinkSuccess(null);
+                        }}
+                        disabled={relinkPending || relinkPath.length === 0}
+                      >
+                        Clear relink path
+                      </button>
+                    </div>
+                  </form>
                 ) : null}
               </section>
 
