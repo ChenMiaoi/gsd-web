@@ -1,7 +1,0 @@
-{
-  "name": "s02-pty-init-probe",
-  "scripts": {
-    "test": "echo ok",
-    "build": "echo build"
-  }
-}

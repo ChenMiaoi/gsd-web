@@ -1,8 +1,0 @@
-{
-  "name": "s02-rpc-init-probe",
-  "version": "0.0.0",
-  "scripts": {
-    "test": "echo ok",
-    "build": "echo build"
-  }
-}

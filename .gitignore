@@ -2,6 +2,9 @@
 # ── GSD baseline (auto-generated) ──
 .gsd
 .gsd-id
+.artifacts/
+artifacts/
+.tmp/
 .mcp.json
 .bg-shell/
 .DS_Store
