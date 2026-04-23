@@ -47,6 +47,10 @@ async function postJson(url: string, body?: unknown) {
   });
 }
 
+async function refreshProject(baseUrl: string, projectId: string) {
+  await postJson(`${baseUrl}/api/projects/${projectId}/refresh`);
+}
+
 async function getProject(baseUrl: string, projectId: string): Promise<ProjectDetailResponse> {
   const response = await fetch(`${baseUrl}/api/projects/${projectId}`);
 
@@ -160,6 +164,7 @@ async function startContinuityService(options: {
   clientDistDir: string;
   databasePath: string;
   port?: number;
+  monitorIntervalMs?: number;
   initRunner?: ProjectInitRunner;
 }) {
   const app = await startServer({
@@ -168,7 +173,7 @@ async function startContinuityService(options: {
     databasePath: options.databasePath,
     clientDistDir: options.clientDistDir,
     logger: false,
-    monitorIntervalMs: 50,
+    monitorIntervalMs: options.monitorIntervalMs ?? 60_000,
     watchersEnabled: false,
     ...(options.initRunner === undefined ? {} : { initRunner: options.initRunner }),
   });
@@ -220,11 +225,15 @@ describe('project continuity monitor recovery', () => {
 
     const movedProjectRoot = path.join(workspace.root, 'continuity-monitor-moved');
     await moveProjectRoot(projectRoot, movedProjectRoot);
+    await refreshProject(service.baseUrl, projectId);
 
     const pathLostProject = await waitForProject(
       service.baseUrl,
       projectId,
-      (project) => project.continuity?.state === 'path_lost' && project.monitor.health === 'read_failed',
+      (project) =>
+        project.continuity?.state === 'path_lost'
+        && project.monitor.health === 'read_failed'
+        && project.snapshot.status === 'initialized',
     );
 
     expect(pathLostProject.projectId).toBe(projectId);
@@ -240,13 +249,17 @@ describe('project continuity monitor recovery', () => {
       clientDistDir,
       databasePath,
       port: originalPort,
+      monitorIntervalMs: 60_000,
       initRunner,
     });
 
     const restartedProject = await waitForProject(
       service.baseUrl,
       projectId,
-      (project) => project.continuity?.state === 'path_lost' && project.latestInitJob?.stage === 'succeeded',
+      (project) =>
+        project.continuity?.state === 'path_lost'
+        && project.latestInitJob?.stage === 'succeeded'
+        && project.snapshot.status === 'initialized',
     );
 
     expect(restartedProject.projectId).toBe(projectId);

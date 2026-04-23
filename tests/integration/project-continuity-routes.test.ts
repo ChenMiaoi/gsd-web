@@ -79,6 +79,10 @@ async function postJson(url: string, body?: unknown) {
   });
 }
 
+async function refreshProject(baseUrl: string, projectId: string) {
+  await postJson(`${baseUrl}/api/projects/${projectId}/refresh`);
+}
+
 async function getProject(baseUrl: string, projectId: string): Promise<ProjectRecord> {
   const response = await fetch(`${baseUrl}/api/projects/${projectId}`);
 
@@ -191,7 +195,7 @@ describe('project continuity routes', () => {
   test('relinks the existing project id after path loss and retains init history and continuity timeline', async () => {
     const service = await bootService({
       initRunner: createSuccessfulInitRunner(),
-      monitorIntervalMs: 50,
+      monitorIntervalMs: 60_000,
     });
     const projectRoot = await createEmptyProject(service.workspace.root, 'continuity-route-source');
 
@@ -214,6 +218,7 @@ describe('project continuity routes', () => {
 
     const movedProjectRoot = path.join(service.workspace.root, 'continuity-route-moved');
     await moveProjectRoot(projectRoot, movedProjectRoot);
+    await refreshProject(service.baseUrl, projectId);
 
     const pathLostProject = await waitForProject(
       service.baseUrl,
