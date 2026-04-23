@@ -1,9 +1,19 @@
 #!/usr/bin/env node
 
+import { spawn } from 'node:child_process';
+import { realpathSync } from 'node:fs';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import type { AddressInfo } from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { createApp, type CreateAppOptions, type GsdWebApp, type RuntimeSignal } from './app.js';
+import {
+  createApp,
+  resolveDefaultPaths,
+  type CreateAppOptions,
+  type GsdWebApp,
+  type RuntimeSignal,
+} from './app.js';
 
 export interface StartServerOptions extends CreateAppOptions {
   host?: string;
@@ -11,8 +21,34 @@ export interface StartServerOptions extends CreateAppOptions {
   printBanner?: boolean;
 }
 
+interface DaemonState {
+  pid: number;
+  address: string;
+  startedAt: string;
+  runtimeDir: string;
+  databasePath: string;
+  logFilePath: string | null;
+}
+
+interface DaemonPaths {
+  runtimeDir: string;
+  pidFilePath: string;
+}
+
+const DAEMON_CHILD_FLAG = '--daemon-child';
+const STOP_TIMEOUT_MS = 8_000;
+const START_TIMEOUT_MS = 8_000;
+
 function isEntrypoint() {
-  return process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+  if (process.argv[1] === undefined) {
+    return false;
+  }
+
+  try {
+    return realpathSync(path.resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+  }
 }
 
 function resolvePort(candidate: number | string | undefined): number {
@@ -51,6 +87,186 @@ function printStartBanner(app: GsdWebApp, address: string) {
   }
 }
 
+function printHelp() {
+  console.info(`Usage: gsd-web [command]
+
+Commands:
+  start       Start gsd-web in the background (default)
+  stop        Stop the background gsd-web process
+  reload      Restart the background gsd-web process
+  restart     Alias for reload
+  status      Show whether the background process is running
+  serve       Run in the foreground
+  help        Show this help
+
+Environment:
+  HOST, PORT, GSD_WEB_HOME, GSD_WEB_DATABASE_PATH, GSD_WEB_LOG_DIR,
+  GSD_WEB_LOG_FILE, GSD_WEB_CLIENT_DIST_DIR, GSD_BIN_PATH`);
+}
+
+function getDaemonPaths(): DaemonPaths {
+  const defaults = resolveDefaultPaths(import.meta.url);
+
+  return {
+    runtimeDir: defaults.runtimeDir,
+    pidFilePath: path.join(defaults.runtimeDir, 'gsd-web.pid'),
+  };
+}
+
+function isProcessRunning(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+
+    return code === 'EPERM';
+  }
+}
+
+async function readDaemonState(pidFilePath: string): Promise<DaemonState | null> {
+  try {
+    const rawState = (await readFile(pidFilePath, 'utf8')).trim();
+
+    if (rawState.length === 0) {
+      return null;
+    }
+
+    const parsed = JSON.parse(rawState) as Partial<DaemonState>;
+
+    const pid = parsed.pid;
+
+    if (!Number.isInteger(pid)) {
+      return null;
+    }
+
+    return {
+      pid: pid!,
+      address: typeof parsed.address === 'string' ? parsed.address : 'unknown',
+      startedAt: typeof parsed.startedAt === 'string' ? parsed.startedAt : 'unknown',
+      runtimeDir: typeof parsed.runtimeDir === 'string' ? parsed.runtimeDir : path.dirname(pidFilePath),
+      databasePath: typeof parsed.databasePath === 'string' ? parsed.databasePath : 'unknown',
+      logFilePath: typeof parsed.logFilePath === 'string' ? parsed.logFilePath : null,
+    };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+
+    if (code === 'ENOENT') {
+      return null;
+    }
+
+    throw error;
+  }
+}
+
+async function removeDaemonState(pidFilePath: string) {
+  await rm(pidFilePath, { force: true });
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function waitForDaemonState(pidFilePath: string, timeoutMs: number): Promise<DaemonState | null> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const state = await readDaemonState(pidFilePath);
+
+    if (state && isProcessRunning(state.pid)) {
+      return state;
+    }
+
+    await sleep(100);
+  }
+
+  return null;
+}
+
+async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (!isProcessRunning(pid)) {
+      return true;
+    }
+
+    await sleep(100);
+  }
+
+  return !isProcessRunning(pid);
+}
+
+function getListeningAddress(app: GsdWebApp): string {
+  const address = app.server.address() as AddressInfo | string | null;
+
+  if (typeof address === 'string') {
+    return address;
+  }
+
+  if (!address) {
+    return 'unknown';
+  }
+
+  const host = address.address.includes(':') ? `[${address.address}]` : address.address;
+
+  return `http://${host}:${address.port}`;
+}
+
+async function writeDaemonState(app: GsdWebApp, address: string, pidFilePath: string) {
+  const paths = app.gsdWebPaths;
+  const state: DaemonState = {
+    pid: process.pid,
+    address,
+    startedAt: new Date().toISOString(),
+    runtimeDir: paths.runtimeDir,
+    databasePath: paths.databasePath,
+    logFilePath: paths.activeLogFilePath,
+  };
+
+  await mkdir(path.dirname(pidFilePath), { recursive: true });
+  await writeFile(pidFilePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+}
+
+function installShutdownHandlers(app: GsdWebApp, pidFilePath: string | null) {
+  let shuttingDown = false;
+
+  const shutdown = async (signal: NodeJS.Signals) => {
+    if (shuttingDown) {
+      return;
+    }
+
+    shuttingDown = true;
+
+    try {
+      await app.close();
+
+      if (pidFilePath) {
+        await removeDaemonState(pidFilePath);
+      }
+    } catch (error) {
+      console.error(`Failed to stop gsd-web after ${signal}.`);
+      console.error(error);
+      process.exitCode = 1;
+    } finally {
+      process.exit();
+    }
+  };
+
+  process.once('SIGTERM', () => {
+    void shutdown('SIGTERM');
+  });
+  process.once('SIGINT', () => {
+    void shutdown('SIGINT');
+  });
+}
+
 export async function startServer(options: StartServerOptions = {}) {
   const app = (await createApp(options)) as GsdWebApp;
   const host = options.host ?? process.env.HOST ?? '127.0.0.1';
@@ -76,10 +292,163 @@ export async function startServer(options: StartServerOptions = {}) {
   }
 }
 
-if (isEntrypoint()) {
-  startServer({ printBanner: true }).catch((error) => {
-    console.error('Failed to start gsd-web service shell.');
+async function runForeground(options: { daemonChild?: boolean } = {}) {
+  const daemonPaths = options.daemonChild ? getDaemonPaths() : null;
+  const app = await startServer({ printBanner: !options.daemonChild });
+  const address = getListeningAddress(app);
+
+  installShutdownHandlers(app, daemonPaths?.pidFilePath ?? null);
+
+  if (daemonPaths) {
+    await writeDaemonState(app, address, daemonPaths.pidFilePath);
+  }
+}
+
+async function startDaemon(): Promise<number> {
+  const daemonPaths = getDaemonPaths();
+  const existingState = await readDaemonState(daemonPaths.pidFilePath);
+
+  if (existingState && isProcessRunning(existingState.pid)) {
+    console.info(`gsd-web is already running (pid ${existingState.pid}) at ${existingState.address}`);
+    return 0;
+  }
+
+  if (existingState) {
+    await removeDaemonState(daemonPaths.pidFilePath);
+  }
+
+  await mkdir(daemonPaths.runtimeDir, { recursive: true });
+
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'serve', DAEMON_CHILD_FLAG], {
+    detached: true,
+    env: process.env,
+    stdio: 'ignore',
+  });
+
+  child.unref();
+
+  const state = await waitForDaemonState(daemonPaths.pidFilePath, START_TIMEOUT_MS);
+
+  if (!state) {
+    console.error('Timed out waiting for gsd-web to start in the background.');
+    console.error(`Check logs under ${daemonPaths.runtimeDir}.`);
+    return 1;
+  }
+
+  console.info(`gsd-web started in the background (pid ${state.pid}) at ${state.address}`);
+  console.info(`data: ${state.databasePath}`);
+
+  if (state.logFilePath) {
+    console.info(`logs: ${state.logFilePath}`);
+  }
+
+  return 0;
+}
+
+async function stopDaemon(options: { quiet?: boolean } = {}): Promise<number> {
+  const daemonPaths = getDaemonPaths();
+  const state = await readDaemonState(daemonPaths.pidFilePath);
+
+  if (!state || !isProcessRunning(state.pid)) {
+    await removeDaemonState(daemonPaths.pidFilePath);
+
+    if (!options.quiet) {
+      console.info('gsd-web is not running.');
+    }
+
+    return 0;
+  }
+
+  if (state.pid === process.pid) {
+    console.error('Refusing to stop the current gsd-web CLI process from its own pid file.');
+    return 1;
+  }
+
+  process.kill(state.pid, 'SIGTERM');
+
+  if (!(await waitForProcessExit(state.pid, STOP_TIMEOUT_MS))) {
+    console.error(`Timed out waiting for gsd-web pid ${state.pid} to stop.`);
+    return 1;
+  }
+
+  await removeDaemonState(daemonPaths.pidFilePath);
+
+  if (!options.quiet) {
+    console.info(`gsd-web stopped (pid ${state.pid}).`);
+  }
+
+  return 0;
+}
+
+async function reloadDaemon(): Promise<number> {
+  const stopCode = await stopDaemon({ quiet: true });
+
+  if (stopCode !== 0) {
+    return stopCode;
+  }
+
+  return startDaemon();
+}
+
+async function printStatus(): Promise<number> {
+  const daemonPaths = getDaemonPaths();
+  const state = await readDaemonState(daemonPaths.pidFilePath);
+
+  if (!state || !isProcessRunning(state.pid)) {
+    await removeDaemonState(daemonPaths.pidFilePath);
+    console.info('gsd-web is stopped.');
+    return 1;
+  }
+
+  console.info(`gsd-web is running (pid ${state.pid}) at ${state.address}`);
+  console.info(`started: ${state.startedAt}`);
+  console.info(`data: ${state.databasePath}`);
+
+  if (state.logFilePath) {
+    console.info(`logs: ${state.logFilePath}`);
+  }
+
+  return 0;
+}
+
+async function runCli(argv: string[]): Promise<number> {
+  const args = argv.filter((arg) => arg !== DAEMON_CHILD_FLAG);
+  const command = args[0] ?? 'start';
+  const daemonChild = argv.includes(DAEMON_CHILD_FLAG);
+
+  try {
+    switch (command) {
+      case 'start':
+        return daemonChild ? (await runForeground({ daemonChild: true }), 0) : startDaemon();
+      case 'serve':
+        await runForeground({ daemonChild });
+        return 0;
+      case 'stop':
+        return stopDaemon();
+      case 'reload':
+      case 'restart':
+        return reloadDaemon();
+      case 'status':
+        return printStatus();
+      case 'help':
+      case '--help':
+      case '-h':
+        printHelp();
+        return 0;
+      default:
+        console.error(`Unknown gsd-web command: ${command}`);
+        printHelp();
+        return 1;
+    }
+  } catch (error) {
+    console.error('gsd-web command failed.');
     console.error(error);
-    process.exitCode = 1;
+    return 1;
+  }
+}
+
+if (isEntrypoint()) {
+  runCli(process.argv.slice(2)).then((exitCode) => {
+    process.exitCode = exitCode;
   });
 }

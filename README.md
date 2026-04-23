@@ -1,8 +1,30 @@
 # gsd-web
 
+[![npm version](https://img.shields.io/npm/v/gsd-web?style=for-the-badge&logo=npm&logoColor=white&color=CB3837)](https://www.npmjs.com/package/gsd-web)
+[![npm downloads](https://img.shields.io/npm/dm/gsd-web?style=for-the-badge&logo=npm&logoColor=white&color=CB3837)](https://www.npmjs.com/package/gsd-web)
+[![GitHub stars](https://img.shields.io/github/stars/ChenMiaoi/gsd-web?style=for-the-badge&logo=github&color=181717)](https://github.com/ChenMiaoi/gsd-web)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](LICENSE)
+
 `gsd-web` is a local-first dashboard for GSD workspaces. It registers projects on your machine, watches their `.gsd` state, keeps a durable SQLite registry, and renders a React interface for project inventory, continuity, initialization, workflow progress, metrics, and timeline events.
 
+## Screenshots
+
+<table>
+  <tr>
+    <td><img src="docs/assets/gsd-web-overview-01.png" alt="gsd-web overview screenshot" width="420"></td>
+    <td><img src="docs/assets/gsd-web-overview-02.png" alt="gsd-web overview screenshot, alternate locale" width="420"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/assets/gsd-web-detail-01.png" alt="gsd-web project detail screenshot" width="420"></td>
+    <td><img src="docs/assets/gsd-web-detail-02.png" alt="gsd-web project detail screenshot, alternate locale" width="420"></td>
+  </tr>
+</table>
+
 The project is designed for contributors who need to run the service locally, inspect project state safely, and extend the dashboard without changing the GSD workspace format.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=ChenMiaoi/gsd-web&type=Date)](https://www.star-history.com/#ChenMiaoi/gsd-web&Date)
 
 ## What It Does
 
@@ -27,18 +49,39 @@ Node 24 is required because the server uses modern Node APIs, including the buil
 
 ## Quick Start
 
-Install dependencies and build both the browser and server bundles:
+Run the published CLI without installing it globally:
 
 ```bash
-npm install
-npm run build
-npm run start
+npx gsd-web
+```
+
+Or install it as a global tool:
+
+```bash
+npm install --global gsd-web
+gsd-web
+```
+
+`gsd-web` starts the service in the background by default. Use the process commands to inspect or manage it:
+
+```bash
+gsd-web status
+gsd-web reload
+gsd-web stop
 ```
 
 Then open:
 
 ```text
 http://127.0.0.1:3000
+```
+
+For repository development, install dependencies and build both the browser and server bundles:
+
+```bash
+npm install
+npm run build
+npm run start
 ```
 
 For local development, run the TypeScript server directly:
@@ -55,11 +98,25 @@ When installed as a package, the CLI entrypoint is:
 gsd-web
 ```
 
+## CLI
+
+| Command | Purpose |
+| --- | --- |
+| `gsd-web` | Start the service in the background |
+| `gsd-web start` | Start the service in the background |
+| `gsd-web stop` | Stop the background service |
+| `gsd-web reload` | Stop and start the background service |
+| `gsd-web restart` | Alias for `reload` |
+| `gsd-web status` | Show pid, URL, data path, and log path |
+| `gsd-web serve` | Run in the foreground |
+
+The daemon pid file is written to `GSD_WEB_HOME` as `gsd-web.pid`. By default, runtime data lives under `~/.gsd-web`.
+
 ## Using The Dashboard
 
 1. Open the welcome page.
 2. Enter the project overview.
-3. Register an absolute local project path.
+3. Use the directory picker to register a server-side project directory.
 4. Select a project to inspect its snapshot, monitor state, continuity, initialization job, workspace notes, source health, workflow data, metrics, and event history.
 5. If a project path moves or disappears, use the relink flow to point the existing project record at the new path.
 
@@ -172,6 +229,31 @@ npm run test:e2e
 ```
 
 GitHub Actions runs the same build, integration test, and browser test checks on pushes and pull requests.
+
+## Publishing
+
+The package is prepared for public npm publishing under the `gsd-web` name. The npm package contains only the compiled server, shared contracts, browser bundle, README, package manifest, and license.
+
+Before publishing, verify the package contents:
+
+```bash
+npm run verify:publish
+```
+
+To inspect the tarball contents without publishing:
+
+```bash
+npm pack --dry-run
+```
+
+To publish:
+
+```bash
+npm login
+npm publish
+```
+
+`prepublishOnly` runs the production build and package-content check, so an accidental source/test-heavy tarball should fail before upload.
 
 ## Contribution Notes
 

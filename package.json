@@ -1,18 +1,47 @@
 {
   "name": "gsd-web",
-  "version": "0.1.0",
+  "version": "0.0.1",
+  "description": "Local-first web dashboard for inspecting and monitoring GSD workspaces.",
+  "keywords": [
+    "gsd",
+    "dashboard",
+    "project-monitoring",
+    "workflow",
+    "fastify",
+    "react",
+    "sqlite"
+  ],
+  "license": "MIT",
+  "author": "Chen Miao <chenmiao.ku@gmail.com>",
+  "homepage": "https://github.com/ChenMiaoi/gsd-web#readme",
+  "bugs": {
+    "url": "https://github.com/ChenMiaoi/gsd-web/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ChenMiaoi/gsd-web.git"
+  },
   "type": "module",
   "main": "./dist/server/server/index.js",
+  "types": "./dist/server/server/index.d.ts",
   "exports": {
-    ".": "./dist/server/server/index.js"
+    ".": {
+      "types": "./dist/server/server/index.d.ts",
+      "default": "./dist/server/server/index.js"
+    }
   },
   "bin": {
     "gsd-web": "./dist/server/server/index.js"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "dist/server/server",
     "dist/server/shared",
     "dist/web",
+    "docs/assets",
+    "LICENSE",
     "README.md"
   ],
   "engines": {
@@ -23,15 +52,18 @@
     "build": "npm run clean && npm run build:web && npm run build:server",
     "build:web": "vite build",
     "build:server": "tsc --project tsconfig.json",
+    "pack:check": "node scripts/check-npm-package.mjs",
     "prepack": "npm run build",
+    "prepublishOnly": "npm run build && npm run pack:check",
+    "verify:publish": "npm run build && npm run pack:check",
     "dev": "tsx src/server/index.ts",
-    "cli": "npm run build && node dist/server/server/index.js",
-    "start": "node dist/server/server/index.js",
-    "test": "vitest run",
+    "cli": "npm run build && node dist/server/server/index.js serve",
+    "start": "node dist/server/server/index.js serve",
+    "test": "vitest run --no-file-parallelism",
     "test:e2e": "playwright test"
   },
   "dependencies": {
-    "@fastify/static": "^8.3.0",
+    "@fastify/static": "^9.1.3",
     "chokidar": "^4.0.3",
     "fastify": "^5.6.1",
     "react": "^19.1.0",
