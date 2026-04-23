@@ -200,7 +200,7 @@ test.describe('project continuity dashboard flow', () => {
     let activeApp: FastifyInstance | null = harness.app;
 
     try {
-      await page.goto(harness.baseUrl);
+      await page.goto(`${harness.baseUrl}/hello/all`);
 
       await page.getByLabel('Project path').fill(sourceProjectPath);
       await page.getByRole('button', { name: 'Register project' }).click();
@@ -271,7 +271,7 @@ test.describe('project continuity dashboard flow', () => {
     let activeApp: FastifyInstance | null = harness.app;
 
     try {
-      await page.goto(harness.baseUrl);
+      await page.goto(`${harness.baseUrl}/hello/all`);
 
       await page.getByLabel('Project path').fill(projectPath);
       await page.getByRole('button', { name: 'Register project' }).click();

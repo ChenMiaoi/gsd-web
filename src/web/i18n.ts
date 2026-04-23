@@ -24,6 +24,9 @@ export interface UiCopy {
     lede: string;
     healthRailLabel: string;
     healthRailCopy: string;
+    welcomeEyebrow: string;
+    welcomeLead: string;
+    welcomePreview: string;
   };
   stats: {
     registered: string;
@@ -169,6 +172,8 @@ export interface UiCopy {
     openParentFolder: string;
     refreshFolders: string;
     loadingFolders: string;
+    enterOverview: string;
+    openSelectedProject: string;
   };
   placeholders: {
     projectPath: string;
@@ -251,6 +256,7 @@ export interface UiCopy {
     initTimeout: string;
     refreshTimeout: string;
     folderBrowserTimeout: string;
+    projectRouteNotFound: (projectId: string) => string;
   };
   initStageLabels: Record<ProjectInitJobStage, string>;
   sourceLabels: Record<SnapshotSourceName, string>;
@@ -308,6 +314,10 @@ export const UI_COPY: Record<Locale, UiCopy> = {
         'Register local paths, inspect truthful snapshot health, and watch live refresh events land from the same hosted Fastify process.',
       healthRailLabel: 'Operations overview',
       healthRailCopy: 'A dense local console for bootstrap state, continuity, and monitor freshness.',
+      welcomeEyebrow: 'Open-source project console',
+      welcomeLead:
+        'A local-first welcome gate for the GSD project inventory. Enter the overview, then open each project through its own route-backed detail page.',
+      welcomePreview: 'Route-backed inventory, live events, and project detail stay shareable from the address bar.',
     },
     stats: {
       registered: 'Registered',
@@ -426,8 +436,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       monitor: 'Service-owned reconcile health that stays distinct from the current snapshot state.',
       continuity: 'Stable identity, explicit path-loss truth, and relink stay attached to the same project record.',
       initialization: 'Explicitly run the supported `/gsd init` flow without leaving this project detail.',
-      timeline:
-        'GSD milestone, slice, and task timing inferred from .gsd/metrics.json, with a remaining-time forecast.',
+      timeline: 'Persisted project events from registration, refresh, monitoring, path loss, and relink activity.',
       sources: 'Per-source truth from the backend snapshot adapter.',
     },
     actions: {
@@ -456,6 +465,8 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       openParentFolder: 'Parent',
       refreshFolders: 'Refresh folders',
       loadingFolders: 'Loading folders...',
+      enterOverview: 'Enter overview',
+      openSelectedProject: 'Open selected project',
     },
     placeholders: {
       projectPath: '/absolute/path/to/project',
@@ -547,6 +558,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
         'Project initialization timed out. The current project detail stayed visible, and you can retry when the request resolves.',
       refreshTimeout: 'Project refresh timed out. The last visible snapshot is still shown while you retry.',
       folderBrowserTimeout: 'Server directory browsing timed out. The current path input was not changed.',
+      projectRouteNotFound: (projectId) => `No registered project matches route id ${projectId}.`,
     },
     initStageLabels: {
       queued: 'Queued',
@@ -627,6 +639,9 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       lede: '登记本机项目路径，查看真实快照健康度，并在同一个 Fastify 服务中接收实时刷新事件。',
       healthRailLabel: '运行概览',
       healthRailCopy: '面向本地 GSD 工作区的状态、连续性和监控新鲜度控制台。',
+      welcomeEyebrow: '开源项目控制台',
+      welcomeLead: '本地优先的 GSD 项目清单入口。进入总览后，每个项目都会通过自己的路由打开详情页。',
+      welcomePreview: '清单、实时事件和项目详情都绑定到地址栏，刷新或分享链接时仍能回到对应页面。',
     },
     stats: {
       registered: '已登记',
@@ -743,7 +758,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       monitor: '服务侧 reconcile 健康度，与当前快照状态分开呈现。',
       continuity: '稳定身份、路径丢失事实和重连记录都会保留在同一个项目记录上。',
       initialization: '无需离开详情页，即可显式运行受支持的 `/gsd init` 流程。',
-      timeline: '根据 .gsd/metrics.json 推断 GSD 里程碑、切片和任务耗时，并估算剩余时间。',
+      timeline: '展示登记、刷新、监控、路径丢失与重连等已持久化项目事件。',
       sources: '后端快照适配器返回的逐来源事实。',
     },
     actions: {
@@ -772,6 +787,8 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       openParentFolder: '上一级',
       refreshFolders: '刷新目录',
       loadingFolders: '正在读取目录...',
+      enterOverview: '进入总览',
+      openSelectedProject: '打开选中项目',
     },
     placeholders: {
       projectPath: '/absolute/path/to/project',
@@ -856,6 +873,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       initTimeout: '项目初始化请求超时。当前项目详情会保持可见，请求完成后可以重试。',
       refreshTimeout: '项目刷新请求超时。重试期间仍会显示最近可见快照。',
       folderBrowserTimeout: '服务端目录浏览超时。当前路径输入不会改变。',
+      projectRouteNotFound: (projectId) => `没有已登记项目匹配路由 ID ${projectId}。`,
     },
     initStageLabels: {
       queued: '已排队',

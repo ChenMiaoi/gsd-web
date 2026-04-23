@@ -100,6 +100,36 @@ const test = base.extend<{ harness: Harness }>({
 });
 
 test.describe('hosted dashboard inventory flow', () => {
+  test('starts on the welcome page and routes into the overview', async ({ page, harness }) => {
+    await page.goto(harness.baseUrl);
+
+    await expect(page.getByTestId('welcome-page')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'gsd-web' })).toBeVisible();
+
+    await page.getByRole('button', { name: /Enter overview|进入总览/ }).click();
+
+    await expect(page).toHaveURL(`${harness.baseUrl}/hello/all`);
+    await expect(page.getByRole('heading', { name: /Project overview|项目概览/ })).toBeVisible();
+  });
+
+  test('opens project detail through the overview route', async ({ page, harness }) => {
+    const initializedProjectPath = await createInitializedProject(harness.workspace.root, 'routed-project');
+
+    await page.goto(`${harness.baseUrl}/hello/all`);
+    await page.getByLabel('Project path').fill(initializedProjectPath);
+    await page.getByRole('button', { name: 'Register project' }).click();
+    await expect(page.getByTestId('register-success')).toContainText('Registered');
+
+    const registeredProject = await getProjectByCanonicalPath(harness.baseUrl, initializedProjectPath);
+
+    await expect(page).toHaveURL(`${harness.baseUrl}/hello/${registeredProject.projectId}`);
+    await page.goto(`${harness.baseUrl}/hello/all`);
+    await page.getByTestId(`overview-project-card-${registeredProject.projectId}`).click();
+
+    await expect(page).toHaveURL(`${harness.baseUrl}/hello/${registeredProject.projectId}`);
+    await expect(page.getByTestId('detail-project-id-value')).toContainText(registeredProject.projectId);
+  });
+
   test('registers empty and degraded projects, then refreshes live detail', async ({ page, harness }) => {
     const emptyProjectPath = await createEmptyProject(harness.workspace.root, 'empty-project');
     const partialProjectPath = await createInitializedProject(harness.workspace.root, 'partial-project', {
@@ -109,7 +139,7 @@ test.describe('hosted dashboard inventory flow', () => {
       gsdDbMode: 'corrupt',
     });
 
-    await page.goto(harness.baseUrl);
+    await page.goto(`${harness.baseUrl}/hello/all`);
 
     await expect(page.getByRole('heading', { name: 'Project inventory' })).toBeVisible();
     await expect(page.getByTestId('inventory-empty')).toContainText('No registered projects yet');
@@ -171,7 +201,7 @@ test.describe('hosted dashboard inventory flow', () => {
     const registeredProjectPath = await createEmptyProject(harness.workspace.root, 'registered-project');
     const failingProjectPath = await createEmptyProject(harness.workspace.root, 'server-error-project');
 
-    await page.goto(harness.baseUrl);
+    await page.goto(`${harness.baseUrl}/hello/all`);
 
     await page.getByRole('button', { name: 'Register project' }).click();
     await expect(page.getByTestId('register-error')).toContainText('Enter a local path');
@@ -225,7 +255,7 @@ test.describe('hosted dashboard inventory flow', () => {
       ['Export', 'export-panel'],
     ] as const;
 
-    await page.goto(harness.baseUrl);
+    await page.goto(`${harness.baseUrl}/hello/all`);
     await page.getByLabel('Project path').fill(initializedProjectPath);
     await page.getByRole('button', { name: 'Register project' }).click();
 
@@ -254,7 +284,7 @@ test.describe('hosted dashboard inventory flow', () => {
       await route.abort('failed');
     });
 
-    await page.goto(harness.baseUrl);
+    await page.goto(`${harness.baseUrl}/hello/all`);
 
     await expect(page.getByTestId('stream-status')).toContainText('Disconnected');
 

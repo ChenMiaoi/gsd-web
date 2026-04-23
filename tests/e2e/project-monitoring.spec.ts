@@ -158,7 +158,7 @@ test.describe('project monitoring dashboard flow', () => {
       dirty: false,
     };
 
-    await page.goto(harness.baseUrl);
+    await page.goto(`${harness.baseUrl}/hello/all`);
 
     await page.getByLabel('Project path').fill(projectPath);
     await page.getByRole('button', { name: 'Register project' }).click();
@@ -212,7 +212,7 @@ test.describe('project monitoring dashboard flow', () => {
   test('resyncs inventory, detail, and timeline after EventSource reconnect without manual refresh', async ({ page, harness }) => {
     const projectPath = await createInitializedProject(harness.workspace.root, 'browser-monitor-reconnect');
 
-    await page.goto(harness.baseUrl);
+    await page.goto(`${harness.baseUrl}/hello/all`);
 
     await page.getByLabel('Project path').fill(projectPath);
     await page.getByRole('button', { name: 'Register project' }).click();

@@ -61,6 +61,17 @@ import {
 type StreamStatus = UiStreamStatus;
 type StreamResyncStatus = 'idle' | 'syncing' | 'failed';
 type AppPage = 'overview' | 'details';
+type AppRoute =
+  | {
+      page: 'welcome';
+    }
+  | {
+      page: 'overview';
+    }
+  | {
+      page: 'details';
+      projectId: string;
+    };
 type KnownEventType =
   | 'service.ready'
   | 'project.registered'
@@ -170,6 +181,8 @@ type PortfolioSummary = {
 };
 
 const APP_PAGES: readonly AppPage[] = ['overview', 'details'];
+const ROUTE_BASE_PATH = '/hello';
+const ROUTE_OVERVIEW_PATH = `${ROUTE_BASE_PATH}/all`;
 const WORKFLOW_TABS: readonly WorkflowTab[] = [
   'progress',
   'dependencies',
@@ -195,6 +208,57 @@ const KNOWN_EVENT_TYPES: ReadonlySet<KnownEventType> = new Set([
   'project.monitor.updated',
   'project.init.updated',
 ]);
+
+function stripTrailingSlashes(pathname: string) {
+  const stripped = pathname.replace(/\/+$/, '');
+
+  return stripped.length === 0 ? '/' : stripped;
+}
+
+function safeDecodePathSegment(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function parseAppRoute(pathname: string): AppRoute {
+  const normalizedPath = stripTrailingSlashes(pathname);
+
+  if (normalizedPath === '/' || normalizedPath === ROUTE_BASE_PATH) {
+    return { page: 'welcome' };
+  }
+
+  if (normalizedPath === ROUTE_OVERVIEW_PATH) {
+    return { page: 'overview' };
+  }
+
+  if (normalizedPath.startsWith(`${ROUTE_BASE_PATH}/`)) {
+    const projectId = safeDecodePathSegment(normalizedPath.slice(ROUTE_BASE_PATH.length + 1));
+
+    if (projectId.length > 0 && projectId !== 'all') {
+      return {
+        page: 'details',
+        projectId,
+      };
+    }
+  }
+
+  return { page: 'welcome' };
+}
+
+function getAppRoutePath(route: AppRoute) {
+  if (route.page === 'welcome') {
+    return ROUTE_BASE_PATH;
+  }
+
+  if (route.page === 'overview') {
+    return ROUTE_OVERVIEW_PATH;
+  }
+
+  return `${ROUTE_BASE_PATH}/${encodeURIComponent(route.projectId)}`;
+}
 
 class HttpError extends Error {
   readonly statusCode: number;
@@ -1363,10 +1427,10 @@ function describeProject(project: ProjectRecord) {
   const gsdId = trimDisplayName(project.snapshot.identityHints.gsdId);
 
   return (
-    (hintedName && !isGenericDisplayName(hintedName) ? hintedName : null)
+    (projectTitle && !isGenericDisplayName(projectTitle) ? projectTitle : null)
+    ?? (hintedName && !isGenericDisplayName(hintedName) ? hintedName : null)
     ?? (repoName && !isGenericDisplayName(repoName) ? repoName : null)
     ?? directoryName
-    ?? (projectTitle && !isGenericDisplayName(projectTitle) ? projectTitle : null)
     ?? gsdId
     ?? project.canonicalPath
   );
@@ -2830,7 +2894,7 @@ function WorkflowMilestoneRail({
 export default function App() {
   const [locale, setLocale] = useState<Locale>(() => getInitialLocale());
   const copy = UI_COPY[locale];
-  const [activeAppPage, setActiveAppPage] = useState<AppPage>('overview');
+  const [appRoute, setAppRoute] = useState<AppRoute>(() => parseAppRoute(window.location.pathname));
   const [activeWorkflowTab, setActiveWorkflowTab] = useState<WorkflowTab>('progress');
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
@@ -2875,6 +2939,23 @@ export default function App() {
   const detailRequestIdRef = useRef(0);
   const timelineRequestIdRef = useRef(0);
   const shouldResyncOnOpenRef = useRef(false);
+  const initialRouteRef = useRef(appRoute);
+
+  const activeAppPage: AppPage | null = appRoute.page === 'welcome' ? null : appRoute.page;
+
+  const navigateToRoute = useCallback((nextRoute: AppRoute, options: { replace?: boolean } = {}) => {
+    const nextPath = getAppRoutePath(nextRoute);
+
+    if (window.location.pathname !== nextPath || window.location.search.length > 0 || window.location.hash.length > 0) {
+      if (options.replace) {
+        window.history.replaceState(null, '', nextPath);
+      } else {
+        window.history.pushState(null, '', nextPath);
+      }
+    }
+
+    setAppRoute(nextRoute);
+  }, []);
 
   const handleWorkflowTabSelect = useCallback((tab: WorkflowTab) => {
     setActiveWorkflowTab(tab);
@@ -2911,6 +2992,18 @@ export default function App() {
 
     return () => {
       mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      setAppRoute(parseAppRoute(window.location.pathname));
+    };
+
+    window.addEventListener('popstate', handlePopState);
+
+    return () => {
+      window.removeEventListener('popstate', handlePopState);
     };
   }, []);
 
@@ -3097,6 +3190,7 @@ export default function App() {
     async (
       selectionHint?: string | null,
       options: {
+        fallbackToFirstProject?: boolean;
         preserveSelectedDetail?: boolean;
       } = {},
     ) => {
@@ -3135,10 +3229,18 @@ export default function App() {
 
         const preferredProjectId = selectionHint ?? selectedProjectIdRef.current;
         const nextProject =
-          response.items.find((project) => project.projectId === preferredProjectId) ?? response.items[0] ?? null;
+          response.items.find((project) => project.projectId === preferredProjectId)
+          ?? (options.fallbackToFirstProject === false ? null : response.items[0])
+          ?? null;
 
         if (!nextProject) {
-          return false;
+          selectedProjectIdRef.current = null;
+          setSelectedProjectId(null);
+          setSelectedProject(null);
+          setProjectTimeline({ items: [], total: 0 });
+          setDetailError(null);
+          setTimelineError(null);
+          return true;
         }
 
         const selectionChanged = selectedProjectIdRef.current !== nextProject.projectId;
@@ -3225,7 +3327,12 @@ export default function App() {
   ]);
 
   useEffect(() => {
-    void syncInventory();
+    const initialRoute = initialRouteRef.current;
+    const initialProjectId = initialRoute.page === 'details' ? initialRoute.projectId : null;
+
+    void syncInventory(initialProjectId, {
+      fallbackToFirstProject: initialProjectId === null,
+    });
   }, [syncInventory]);
 
   useEffect(() => {
@@ -3332,8 +3439,14 @@ export default function App() {
   }, [resyncAfterReconnect, syncInitDetailAfterSuccess, syncInventory]);
 
   const selectProject = useCallback(
-    (project: ProjectRecord) => {
-      setActiveAppPage('details');
+    (project: ProjectRecord, options: { updateRoute?: boolean } = {}) => {
+      if (options.updateRoute !== false) {
+        navigateToRoute({
+          page: 'details',
+          projectId: project.projectId,
+        });
+      }
+
       selectedProjectIdRef.current = project.projectId;
       setSelectedProjectId(project.projectId);
       setSelectedProject(project);
@@ -3348,8 +3461,31 @@ export default function App() {
       setRegisterSuccess(null);
       void syncSelectedProjectPanels(project.projectId, project);
     },
-    [syncSelectedProjectPanels],
+    [navigateToRoute, syncSelectedProjectPanels],
   );
+
+  useEffect(() => {
+    if (appRoute.page !== 'details' || inventoryLoading) {
+      return;
+    }
+
+    const routeProject = projects.find((project) => project.projectId === appRoute.projectId) ?? null;
+
+    if (routeProject) {
+      if (selectedProjectIdRef.current !== routeProject.projectId) {
+        selectProject(routeProject, { updateRoute: false });
+      }
+
+      return;
+    }
+
+    selectedProjectIdRef.current = null;
+    setSelectedProjectId(null);
+    setSelectedProject(null);
+    setProjectTimeline({ items: [], total: 0 });
+    setDetailError(copy.errors.projectRouteNotFound(appRoute.projectId));
+    setTimelineError(null);
+  }, [appRoute, copy.errors, inventoryLoading, projects, selectProject]);
 
   const loadDirectoryPicker = useCallback(
     async (pathHint?: string | null) => {
@@ -3444,7 +3580,10 @@ export default function App() {
         }
 
         setProjects((current) => upsertProject(current, response.project));
-        setActiveAppPage('details');
+        navigateToRoute({
+          page: 'details',
+          projectId: response.project.projectId,
+        });
         if (options.closeDirectoryPickerOnSuccess) {
           setDirectoryPickerOpen(false);
         }
@@ -3486,6 +3625,7 @@ export default function App() {
       copy.errors.registerTimeout,
       copy.errors.unexpected,
       copy.notices,
+      navigateToRoute,
       projects,
       syncSelectedProjectPanels,
     ],
@@ -3792,6 +3932,24 @@ export default function App() {
   const selectedRecentExecutionUnits = (selectedMetrics?.recentUnits ?? []).map(toExecutionUnit);
   const primaryModel = selectedExecutionStats.modelUsage[0]?.model ?? copy.messages.notRecorded;
   const averageUnitDurationMs = averageDuration(selectedExecutionStats.units);
+  const routePreviewProject = selectedProject ?? projects.find((project) => project.projectId === selectedProjectId) ?? projects[0] ?? null;
+  const renderLocaleSwitch = () => (
+    <div className="locale-switch" role="group" aria-label={copy.languageToggleLabel}>
+      {(['en', 'zh'] as Locale[]).map((option) => (
+        <button
+          key={option}
+          type="button"
+          className="locale-switch__option"
+          aria-pressed={locale === option}
+          onClick={() => {
+            setLocale(option);
+          }}
+        >
+          {copy.localeOptions[option]}
+        </button>
+      ))}
+    </div>
+  );
   const renderRegisterPanel = (inputId: string) => (
     <form className="register-panel" onSubmit={handleRegister}>
       <div>
@@ -3894,9 +4052,90 @@ export default function App() {
       </div>
     </div>
   );
+  const renderWelcomePage = () => (
+    <section className="welcome-page" aria-labelledby="welcome-heading" data-testid="welcome-page">
+      <header className="welcome-nav">
+        <div>
+          <span>{copy.app.eyebrow}</span>
+          <strong>gsd-web</strong>
+        </div>
+        {renderLocaleSwitch()}
+      </header>
+
+      <section className="welcome-hero">
+        <div className="welcome-copy">
+          <p className="eyebrow">{copy.app.welcomeEyebrow}</p>
+          <h1 id="welcome-heading">gsd-web</h1>
+          <p>{copy.app.welcomeLead}</p>
+          <div className="welcome-actions">
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() => {
+                navigateToRoute({ page: 'overview' });
+              }}
+            >
+              {copy.actions.enterOverview}
+            </button>
+            {routePreviewProject ? (
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => {
+                  selectProject(routePreviewProject);
+                }}
+              >
+                {copy.actions.openSelectedProject}
+              </button>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="welcome-visual" aria-label={copy.labels.workspacePages}>
+          <div className="welcome-route-map">
+            <span data-active="true">{ROUTE_BASE_PATH}</span>
+            <span>{ROUTE_OVERVIEW_PATH}</span>
+            <span>
+              {routePreviewProject ? getAppRoutePath({ page: 'details', projectId: routePreviewProject.projectId }) : `${ROUTE_BASE_PATH}/:projectId`}
+            </span>
+          </div>
+
+          <div className="welcome-stat-grid">
+            <div>
+              <span className="stat-card__label">{copy.stats.registered}</span>
+              <strong>{totalProjectsLabel}</strong>
+            </div>
+            <div>
+              <span className="stat-card__label">{copy.stats.initialized}</span>
+              <strong>{initializedCount}</strong>
+            </div>
+            <div>
+              <span className="stat-card__label">{copy.labels.totalCost}</span>
+              <strong>{formatCost(portfolioSummary.totalCost, locale)}</strong>
+            </div>
+            <div data-stream-status={streamStatus}>
+              <span className="stat-card__label">{copy.stats.liveStream}</span>
+              <strong>{copy.streamStatusLabels[streamStatus]}</strong>
+            </div>
+          </div>
+
+          <div className="welcome-preview">
+            <div>
+              <span className="status-pill" data-status="initialized">{initializedCount} {copy.stats.initialized}</span>
+              <span className="status-pill" data-status="degraded">{degradedCount} {copy.stats.degraded}</span>
+              <span className="status-pill" data-status="uninitialized">{uninitializedCount} {copy.stats.uninitialized}</span>
+            </div>
+            <strong>{copy.labels.projectOverview}</strong>
+            <p>{copy.app.welcomePreview}</p>
+          </div>
+        </div>
+      </section>
+    </section>
+  );
 
   return (
     <main className="app-shell" data-locale={locale}>
+      {appRoute.page === 'welcome' ? renderWelcomePage() : (
       <section className="app-frame">
         <header className="app-topbar panel">
           <div className="app-topbar__title">
@@ -3916,7 +4155,17 @@ export default function App() {
                 aria-controls={`app-page-${page}`}
                 data-active={activeAppPage === page}
                 onClick={() => {
-                  setActiveAppPage(page);
+                  if (page === 'overview') {
+                    navigateToRoute({ page: 'overview' });
+                    return;
+                  }
+
+                  if (routePreviewProject) {
+                    selectProject(routePreviewProject);
+                    return;
+                  }
+
+                  navigateToRoute({ page: 'overview' });
                 }}
               >
                 <AppPageIcon page={page} />
@@ -3925,21 +4174,7 @@ export default function App() {
             ))}
           </div>
 
-          <div className="locale-switch" role="group" aria-label={copy.languageToggleLabel}>
-            {(['en', 'zh'] as Locale[]).map((option) => (
-              <button
-                key={option}
-                type="button"
-                className="locale-switch__option"
-                aria-pressed={locale === option}
-                onClick={() => {
-                  setLocale(option);
-                }}
-              >
-                {copy.localeOptions[option]}
-              </button>
-            ))}
-          </div>
+          {renderLocaleSwitch()}
         </header>
 
         {activeAppPage === 'overview' ? (
@@ -4289,9 +4524,29 @@ export default function App() {
               >
                 {detailLoading || timelineLoading ? copy.actions.reloading : copy.actions.reloadDetail}
               </button>
+              {selectedInitActionVisible ? (
+                <button
+                  type="button"
+                  className="primary-button"
+                  data-testid="init-action"
+                  onClick={() => {
+                    void handleInitializeSelected();
+                  }}
+                  disabled={selectedInitActionDisabled}
+                >
+                  {initButtonLabel(
+                    selectedProject!,
+                    {
+                      requestPending: selectedInitRequestPending,
+                      syncingDetail: selectedInitSyncingDetail,
+                    },
+                    copy,
+                  )}
+                </button>
+              ) : null}
               <button
                 type="button"
-                className="primary-button"
+                className={selectedInitActionVisible ? 'secondary-button' : 'primary-button'}
                 onClick={() => {
                   void handleRefreshSelected();
                 }}
@@ -4760,7 +5015,7 @@ export default function App() {
                   </div>
                   <div className="panel-header__actions">
                     <span className="meta-badge" data-testid="timeline-total">
-                      {copy.formatCount(selectedExecutionStats.remainingTasks, 'task')}
+                      {selectedTimelineCountLabel}
                     </span>
                     <button
                       type="button"
@@ -4777,172 +5032,52 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="execution-summary-grid">
-                  <div>
-                    <span className="stat-card__label">{copy.labels.elapsed}</span>
-                    <strong>
-                      {formatDuration(selectedExecutionStats.elapsedMs, locale, copy.messages.notRecorded)}
-                    </strong>
-                  </div>
-                  <div>
-                    <span className="stat-card__label">{copy.labels.averageTaskDuration}</span>
-                    <strong>
-                      {formatDuration(
-                        selectedExecutionStats.averageTaskDurationMs,
-                        locale,
-                        copy.messages.estimateUnavailable,
-                      )}
-                    </strong>
-                  </div>
-                  <div>
-                    <span className="stat-card__label">{copy.labels.remainingTasks}</span>
-                    <strong>{selectedExecutionStats.remainingTasks}</strong>
-                  </div>
-                  <div>
-                    <span className="stat-card__label">{copy.labels.estimatedRemaining}</span>
-                    <strong>
-                      {formatDuration(
-                        selectedExecutionStats.estimatedRemainingMs,
-                        locale,
-                        copy.messages.estimateUnavailable,
-                      )}
-                    </strong>
-                  </div>
-                  <div>
-                    <span className="stat-card__label">{copy.labels.estimatedFinish}</span>
-                    <strong>
-                      {formatMetricTimestamp(
-                        selectedExecutionStats.estimatedFinishAtMs,
-                        locale,
-                        copy.messages.estimateUnavailable,
-                      )}
-                    </strong>
-                  </div>
-                </div>
-
-                {selectedExecutionStats.units.length === 0 ? (
-                  <p data-testid="timeline-empty">{copy.messages.noExecutionUnits}</p>
+                {projectTimeline.items.length === 0 ? (
+                  <p data-testid="timeline-empty">{copy.empty.timeline}</p>
                 ) : null}
 
-                {selectedMilestones.length === 0 ? (
-                  <p>{copy.messages.noMilestones}</p>
-                ) : (
-                  <div className="execution-tree" data-testid="timeline-list">
-                    {selectedMilestones.map((milestone) => {
-                      const milestoneEstimate =
-                        selectedExecutionStats.milestoneEstimatedRemainingMs.get(milestone.id) ?? null;
-                      const milestoneActive = milestone.id === selectedActiveMilestone?.id;
+                {projectTimeline.items.length > 0 ? (
+                  <ol className="timeline-list" data-testid="timeline-list">
+                    {projectTimeline.items.map((entry) => (
+                      <li className="timeline-item" data-type={entry.type} key={entry.id}>
+                        <div className="timeline-item__header">
+                          <strong>{copy.timelineTypeLabels[entry.type]}</strong>
+                          <time dateTime={entry.emittedAt}>{formatTimestamp(entry.emittedAt, locale)}</time>
+                        </div>
 
-                      return (
-                        <details
-                          className="execution-milestone"
-                          data-active={milestoneActive}
-                          key={milestone.id}
-                          open={milestoneActive || undefined}
-                        >
-                          <summary className="execution-milestone__summary">
-                            <div className="execution-row execution-row--milestone">
-                              <span className="meta-badge">{milestone.id}</span>
-                              <strong>{milestoneTitle(milestone)}</strong>
-                              <span>
-                                {formatDuration(
-                                  getMilestoneDisplayDuration(
-                                    selectedExecutionStats.milestoneStats,
-                                    selectedExecutionStats.sliceStats,
-                                    selectedExecutionStats.taskStats,
-                                    milestone,
-                                  ),
-                                  locale,
-                                  copy.messages.notRecorded,
-                                )}
-                              </span>
-                              <span>{formatDuration(milestoneEstimate, locale, copy.messages.estimateUnavailable)}</span>
-                            </div>
-                            <div className="execution-row__labels">
-                              <span>{copy.labels.actualDuration}</span>
-                              <span>{copy.labels.estimatedRemaining}</span>
-                            </div>
-                          </summary>
-                          <div className="execution-slice-list">
-                            {milestone.slices.map((slice) => {
-                              const sliceKey = `${milestone.id}/${slice.id}`;
-                              const sliceActive =
-                                milestone.id === selectedActiveMilestone?.id && slice.id === selectedActiveSlice?.id;
-                              const sliceCurrentTask = sliceActive ? selectedActiveTask : null;
-                              const sliceEstimate =
-                                selectedExecutionStats.sliceEstimatedRemainingMs.get(sliceKey) ?? null;
+                        <div className="timeline-item__badges">
+                          <span className="status-pill" data-status={timelineTone(entry.type)}>
+                            {copy.timelineTypeLabels[entry.type]}
+                          </span>
+                          <span className="status-pill" data-status={entry.snapshotStatus}>
+                            {copy.statusLabels[entry.snapshotStatus]}
+                          </span>
+                          <span className="status-pill" data-status={entry.monitorHealth}>
+                            {copy.monitorHealthLabels[entry.monitorHealth]}
+                          </span>
+                          <span className="meta-badge">
+                            {copy.reconcileTriggerLabels[entry.trigger]}
+                          </span>
+                          <span className="meta-badge">
+                            {copy.formatCount(entry.warningCount, 'warning')}
+                          </span>
+                        </div>
 
-                              return (
-                                <details className="execution-slice" open={sliceActive || undefined} key={sliceKey}>
-                                  <summary>
-                                    <span className="warning-code" data-risk={getSliceRiskLevel(slice)}>
-                                      {readableRiskLabel(getSliceRiskLevel(slice), locale)}
-                                    </span>
-                                    <strong>{slice.id}</strong>
-                                    <span>{sentenceCaseTitle(sliceTitle(slice))}</span>
-                                    <span>
-                                      {formatDuration(
-                                        getSliceDisplayDuration(
-                                          selectedExecutionStats.sliceStats,
-                                          selectedExecutionStats.taskStats,
-                                          milestone.id,
-                                          slice,
-                                        ),
-                                        locale,
-                                        copy.messages.notRecorded,
-                                      )}
-                                    </span>
-                                    <span>{formatDuration(sliceEstimate, locale, copy.messages.estimateUnavailable)}</span>
-                                  </summary>
+                        <p className="timeline-item__detail">{entry.detail}</p>
 
-                                  {slice.tasks.length === 0 ? null : (
-                                    <div className="execution-task-grid">
-                                      {slice.tasks.map((task) => {
-                                        const taskKey = `${milestone.id}/${slice.id}/${task.id}`;
-                                        const taskCurrent =
-                                          sliceCurrentTask !== null && task === sliceCurrentTask;
-                                        const taskEstimate =
-                                          selectedExecutionStats.taskEstimatedRemainingMs.get(taskKey) ?? null;
-
-                                        return (
-                                          <div className="execution-task" data-current={taskCurrent} key={taskKey}>
-                                            <span
-                                              className="status-dot"
-                                              data-status={taskCurrent ? 'active' : statusTone(task.status)}
-                                            />
-                                            <strong>{task.id}</strong>
-                                            <span>
-                                              {taskTitle(task)}
-                                              {taskCurrent ? ` · ${copy.labels.currentTask}` : ''}
-                                            </span>
-                                            <span>
-                                              {formatDuration(
-                                                getTaskDisplayDuration(
-                                                  selectedExecutionStats.taskStats,
-                                                  milestone.id,
-                                                  slice.id,
-                                                  task,
-                                                ),
-                                                locale,
-                                                copy.messages.notRecorded,
-                                              )}
-                                            </span>
-                                            <span>
-                                              {formatDuration(taskEstimate, locale, copy.messages.estimateUnavailable)}
-                                            </span>
-                                          </div>
-                                        );
-                                      })}
-                                    </div>
-                                  )}
-                                </details>
-                              );
-                            })}
+                        {entry.error ? (
+                          <div className="timeline-item__error inline-alert inline-alert--error">
+                            <strong>
+                              {entry.error.scope} · {formatTimestamp(entry.error.at, locale)}
+                            </strong>
+                            <p>{clampWarning(entry.error.message)}</p>
                           </div>
-                        </details>
-                      );
-                    })}
-                  </div>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <p data-testid="timeline-empty">{copy.empty.timeline}</p>
                 )}
               </section>
 
@@ -5061,7 +5196,9 @@ export default function App() {
                   </div>
                 ) : null}
               </section>
+              </section>
 
+              <div className="detail-support-stack">
               <section className="subpanel continuity-panel" data-testid="continuity-panel">
                 <div className="subpanel__header subpanel__header--actions">
                   <div>
@@ -5199,14 +5336,14 @@ export default function App() {
                     <button
                       type="button"
                       className="primary-button"
-                      data-testid="init-action"
+                      data-testid="init-panel-action"
                       onClick={() => {
                         void handleInitializeSelected();
                       }}
                       disabled={selectedInitActionDisabled}
                     >
                       {initButtonLabel(
-                        selectedProject,
+                        selectedProject!,
                         {
                           requestPending: selectedInitRequestPending,
                           syncingDetail: selectedInitSyncingDetail,
@@ -5310,7 +5447,7 @@ export default function App() {
                   <p data-testid="init-empty-state">{copy.empty.init}</p>
                 )}
               </section>
-              </section>
+              </div>
 
               <section
                 className="workflow-page workflow-page--stack"
@@ -5504,6 +5641,7 @@ export default function App() {
         </section>
         ) : null}
       </section>
+      )}
 
       {directoryPickerOpen ? (
         <div className="directory-picker-backdrop" role="presentation">

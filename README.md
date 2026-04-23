@@ -52,10 +52,11 @@ npm run dev
 
 ## 使用面板
 
-1. 打开 `http://127.0.0.1:3000`
-2. 在 `Project path` 输入一个本机项目的绝对路径
-3. 点击 `Register project`
-4. 在左侧清单选择项目，右侧查看：
+1. 打开 `http://127.0.0.1:3000` 或 `http://127.0.0.1:3000/hello` 进入欢迎页
+2. 点击进入总览，或直接打开 `http://127.0.0.1:3000/hello/all`
+3. 在 `Project path` 输入一个本机项目的绝对路径
+4. 点击 `Register project`
+5. 在总览中选择项目，进入 `/hello/<projectId>` 项目详情页查看：
    - 快照状态
    - 监控健康度
    - 项目连续性
@@ -66,6 +67,14 @@ npm run dev
    - 最近时间线
 
 如果项目路径被移动或删除，面板会保留最近一次良好快照，并在项目进入 `path_lost` 状态时提供重连入口。
+
+## 前端路由
+
+前端使用浏览器 History API 管理 URL，后端会通过 SPA fallback 返回同一个 React 入口，因此刷新或直接打开深链都可用：
+
+- `/hello`：gsd-web 欢迎页
+- `/hello/all`：项目总览
+- `/hello/<projectId>`：项目详情
 
 ## i18n
 
