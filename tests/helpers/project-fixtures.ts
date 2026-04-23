@@ -15,6 +15,7 @@ export interface InitializedProjectOptions {
   repoMetaContent?: Record<string, unknown> | string | Uint8Array | null;
   autoLockContent?: Record<string, unknown> | string | Uint8Array | null;
   stateMdContent?: string | Uint8Array | null;
+  metricsJsonContent?: Record<string, unknown> | string | Uint8Array | null;
   gsdDbMode?: 'valid' | 'corrupt' | 'missing';
 }
 
@@ -36,14 +37,49 @@ async function createValidGsdDb(filePath: string) {
 
   try {
     database.exec(`
-      CREATE TABLE milestones (id TEXT PRIMARY KEY, status TEXT NOT NULL);
-      CREATE TABLE slices (id TEXT PRIMARY KEY, milestone_id TEXT NOT NULL, status TEXT NOT NULL);
-      CREATE TABLE tasks (id TEXT PRIMARY KEY, slice_id TEXT NOT NULL, status TEXT NOT NULL);
+      CREATE TABLE artifacts (id TEXT PRIMARY KEY);
+      CREATE TABLE assessments (id TEXT PRIMARY KEY);
+      CREATE TABLE audit_events (id TEXT PRIMARY KEY);
+      CREATE TABLE audit_turn_index (id TEXT PRIMARY KEY);
+      CREATE TABLE decisions (id TEXT PRIMARY KEY);
+      CREATE TABLE gate_runs (id TEXT PRIMARY KEY);
+      CREATE TABLE memories (id TEXT PRIMARY KEY);
+      CREATE TABLE memories_fts (id TEXT PRIMARY KEY);
+      CREATE TABLE memories_fts_config (id TEXT PRIMARY KEY);
+      CREATE TABLE memories_fts_data (id TEXT PRIMARY KEY);
+      CREATE TABLE memory_sources (id TEXT PRIMARY KEY);
 
-      INSERT INTO milestones (id, status) VALUES ('M001', 'active');
-      INSERT INTO slices (id, milestone_id, status) VALUES ('S01', 'M001', 'active');
-      INSERT INTO tasks (id, slice_id, status) VALUES ('T01', 'S01', 'complete');
-      INSERT INTO tasks (id, slice_id, status) VALUES ('T02', 'S01', 'active');
+      CREATE TABLE milestones (id TEXT PRIMARY KEY, title TEXT, status TEXT NOT NULL);
+      CREATE TABLE slices (
+        id TEXT PRIMARY KEY,
+        milestone_id TEXT NOT NULL,
+        title TEXT,
+        status TEXT NOT NULL,
+        risk TEXT,
+        depends TEXT,
+        sequence INTEGER
+      );
+      CREATE TABLE slice_dependencies (
+        milestone_id TEXT NOT NULL,
+        slice_id TEXT NOT NULL,
+        depends_on_slice_id TEXT NOT NULL
+      );
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        slice_id TEXT NOT NULL,
+        title TEXT,
+        status TEXT NOT NULL
+      );
+
+      INSERT INTO milestones (id, title, status) VALUES ('M001', 'Fixture milestone', 'active');
+      INSERT INTO slices (id, milestone_id, title, status, risk, depends, sequence)
+        VALUES ('S01', 'M001', 'Fixture setup', 'complete', 'low', '[]', 1);
+      INSERT INTO slices (id, milestone_id, title, status, risk, depends, sequence)
+        VALUES ('S02', 'M001', 'Fixture follow-up', 'active', 'medium', '["S01"]', 2);
+      INSERT INTO slice_dependencies (milestone_id, slice_id, depends_on_slice_id)
+        VALUES ('M001', 'S02', 'S01');
+      INSERT INTO tasks (id, slice_id, title, status) VALUES ('T01', 'S01', 'Completed task', 'complete');
+      INSERT INTO tasks (id, slice_id, title, status) VALUES ('T02', 'S02', 'Active task', 'active');
     `);
   } finally {
     database.close();
@@ -171,6 +207,36 @@ export async function createInitializedProject(
     options.stateMdContent === undefined
       ? '# State\n\nHealthy fixture state for integration coverage.\n'
       : options.stateMdContent;
+  const metricsJsonContent =
+    options.metricsJsonContent === undefined
+      ? {
+          version: 1,
+          projectStartedAt: 1776865480139,
+          units: [
+            {
+              type: 'execute-task',
+              id: 'M001/S01/T01',
+              model: 'gpt-5.4',
+              startedAt: 1776865480211,
+              finishedAt: 1776866181711,
+              tokens: {
+                input: 100,
+                output: 25,
+                cacheRead: 300,
+                cacheWrite: 0,
+                total: 425,
+              },
+              cost: 0.125,
+              toolCalls: 7,
+              assistantMessages: 3,
+              userMessages: 1,
+              apiRequests: 3,
+              promptCharCount: 1400,
+              baselineCharCount: 200,
+            },
+          ],
+        }
+      : options.metricsJsonContent;
   const gsdDbMode = options.gsdDbMode ?? 'valid';
 
   await mkdir(projectRoot, { recursive: true });
@@ -201,6 +267,14 @@ export async function createInitializedProject(
   }
 
   await writeMaybeFile(path.join(gsdRoot, 'STATE.md'), stateMdContent);
+  if (metricsJsonContent !== null) {
+    await writeMaybeFile(
+      path.join(gsdRoot, 'metrics.json'),
+      typeof metricsJsonContent === 'string' || metricsJsonContent instanceof Uint8Array
+        ? metricsJsonContent
+        : toJsonString(metricsJsonContent),
+    );
+  }
 
   if (gsdDbMode === 'valid') {
     await createValidGsdDb(path.join(gsdRoot, 'gsd.db'));

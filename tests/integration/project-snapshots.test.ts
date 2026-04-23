@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { TextDecoder } from 'node:util';
 import type { AddressInfo } from 'node:net';
 
@@ -287,6 +288,158 @@ describe('project registry and snapshot contracts', () => {
     expect(health.projects.total).toBe(2);
 
     await events.close();
+  });
+
+  test('reads rich gsd database progress, slice dependencies, and metrics sources', async () => {
+    const service = await bootService();
+    const projectPath = await createInitializedProject(service.workspace.root, 'rich-project');
+    const registerResponse = await postJson(`${service.baseUrl}/api/projects/register`, {
+      path: projectPath,
+    });
+
+    expect(registerResponse.status).toBe(201);
+
+    const mutation = (await registerResponse.json()) as ProjectMutationResponse;
+    const gsdDb = mutation.project.snapshot.sources.gsdDb.value;
+    const metrics = mutation.project.snapshot.sources.metricsJson.value;
+
+    expect(mutation.project.snapshot.sources.gsdDb.state).toBe('ok');
+    expect(mutation.project.snapshot.sources.metricsJson.state).toBe('ok');
+    expect(gsdDb?.tables).toEqual(expect.arrayContaining(['milestones', 'slices', 'tasks', 'slice_dependencies']));
+    expect(gsdDb?.counts).toMatchObject({
+      milestones: 1,
+      slices: 2,
+      tasks: 2,
+      sliceDependencies: 1,
+    });
+    expect(gsdDb?.milestones).toEqual([
+      expect.objectContaining({
+        id: 'M001',
+        title: 'Fixture milestone',
+        sliceCount: 2,
+        taskCount: 2,
+        completedTaskCount: 1,
+        slices: expect.arrayContaining([
+          expect.objectContaining({
+            id: 'S01',
+            taskCount: 1,
+            completedTaskCount: 1,
+          }),
+          expect.objectContaining({
+            id: 'S02',
+            taskCount: 1,
+            completedTaskCount: 0,
+          }),
+        ]),
+      }),
+    ]);
+    expect(gsdDb?.dependencies).toEqual([
+      {
+        milestoneId: 'M001',
+        sliceId: 'S02',
+        dependsOnSliceId: 'S01',
+      },
+    ]);
+    expect(metrics).toMatchObject({
+      version: 1,
+      unitCount: 1,
+      units: [
+        expect.objectContaining({
+          id: 'M001/S01/T01',
+          startedAt: 1776865480211,
+          finishedAt: 1776866181711,
+        }),
+      ],
+      recentUnits: [
+        expect.objectContaining({
+          id: 'M001/S01/T01',
+          startedAt: 1776865480211,
+          finishedAt: 1776866181711,
+        }),
+      ],
+      totals: {
+        totalTokens: 425,
+        cost: 0.125,
+        toolCalls: 7,
+        apiRequests: 3,
+      },
+    });
+  });
+
+  test('keeps tasks scoped to their milestone when slice ids repeat', async () => {
+    const service = await bootService();
+    const projectPath = await createInitializedProject(service.workspace.root, 'repeated-slice-project', {
+      gsdDbMode: 'missing',
+      metricsJsonContent: null,
+    });
+    const database = new DatabaseSync(path.join(projectPath, '.gsd', 'gsd.db'));
+
+    try {
+      database.exec(`
+        CREATE TABLE milestones (id TEXT PRIMARY KEY, title TEXT, status TEXT NOT NULL);
+        CREATE TABLE slices (
+          milestone_id TEXT NOT NULL,
+          id TEXT NOT NULL,
+          title TEXT,
+          status TEXT NOT NULL,
+          risk TEXT,
+          depends TEXT,
+          sequence INTEGER,
+          PRIMARY KEY (milestone_id, id)
+        );
+        CREATE TABLE tasks (
+          milestone_id TEXT NOT NULL,
+          slice_id TEXT NOT NULL,
+          id TEXT NOT NULL,
+          title TEXT,
+          status TEXT NOT NULL,
+          PRIMARY KEY (milestone_id, slice_id, id)
+        );
+        CREATE TABLE slice_dependencies (
+          milestone_id TEXT NOT NULL,
+          slice_id TEXT NOT NULL,
+          depends_on_slice_id TEXT NOT NULL
+        );
+
+        INSERT INTO milestones (id, title, status) VALUES ('M001', 'First milestone', 'complete');
+        INSERT INTO milestones (id, title, status) VALUES ('M002', 'Second milestone', 'active');
+        INSERT INTO slices (milestone_id, id, title, status, risk, depends, sequence)
+          VALUES ('M001', 'S01', 'First S01', 'complete', 'low', '[]', 1);
+        INSERT INTO slices (milestone_id, id, title, status, risk, depends, sequence)
+          VALUES ('M002', 'S01', 'Second S01', 'pending', 'high', '[]', 1);
+        INSERT INTO tasks (milestone_id, slice_id, id, title, status)
+          VALUES ('M001', 'S01', 'T01', 'Completed first task', 'complete');
+        INSERT INTO tasks (milestone_id, slice_id, id, title, status)
+          VALUES ('M002', 'S01', 'T01', 'Active second task', 'active');
+      `);
+    } finally {
+      database.close();
+    }
+
+    const registerResponse = await postJson(`${service.baseUrl}/api/projects/register`, {
+      path: projectPath,
+    });
+
+    expect(registerResponse.status).toBe(201);
+
+    const mutation = (await registerResponse.json()) as ProjectMutationResponse;
+    const milestones = mutation.project.snapshot.sources.gsdDb.value?.milestones ?? [];
+    const firstSlice = milestones.find((milestone) => milestone.id === 'M001')?.slices[0];
+    const secondSlice = milestones.find((milestone) => milestone.id === 'M002')?.slices[0];
+
+    expect(firstSlice).toMatchObject({
+      id: 'S01',
+      taskCount: 1,
+      completedTaskCount: 1,
+      tasks: [expect.objectContaining({ id: 'T01', title: 'Completed first task', status: 'complete' })],
+    });
+    expect(secondSlice).toMatchObject({
+      id: 'S01',
+      status: 'pending',
+      taskCount: 1,
+      completedTaskCount: 0,
+      tasks: [expect.objectContaining({ id: 'T01', title: 'Active second task', status: 'active' })],
+    });
   });
 
   test('rejects malformed registrations and keeps the registry stable', async () => {

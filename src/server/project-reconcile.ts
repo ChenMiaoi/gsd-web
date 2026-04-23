@@ -17,6 +17,7 @@ import {
   type ProjectSnapshotEventPayload,
 } from '../shared/contracts.js';
 import {
+  StaleProjectRefreshError,
   type RefreshProjectInput,
   type RegistryDatabase,
   type TimelineEntryInput,
@@ -647,6 +648,24 @@ export class ProjectReconciler {
         () => buildProjectSnapshot(project.canonicalPath),
         this.options.snapshotTimeoutMs ?? DEFAULT_SNAPSHOT_TIMEOUT_MS,
       );
+      const latestProject = this.registry.getProjectById(projectId);
+      const latestProjectChanged =
+        latestProject !== null && latestProject.updatedAt !== project.updatedAt;
+
+      if (
+        latestProject
+        && latestProjectChanged
+        && Date.parse(latestProject.updatedAt) >= Date.parse(snapshot.checkedAt)
+      ) {
+        return {
+          status: 'success',
+          project: latestProject,
+          event: null,
+          changed: false,
+          healthChanged: false,
+        };
+      }
+
       const monitor = buildSuccessfulMonitorSummary(snapshot, options.trigger, project.monitor);
       const continuity = buildTrackedContinuitySummary(project, snapshot.checkedAt);
       const changed = isChangedSnapshot(project.snapshot, snapshot);
@@ -662,8 +681,27 @@ export class ProjectReconciler {
       });
 
       if (changed || options.emitRefreshEventOnNoChange) {
+        const preWriteProject = this.registry.getProjectById(projectId);
+        const preWriteChanged =
+          preWriteProject !== null && preWriteProject.updatedAt !== project.updatedAt;
+
+        if (
+          preWriteProject
+          && preWriteChanged
+          && Date.parse(preWriteProject.updatedAt) >= Date.parse(snapshot.checkedAt)
+        ) {
+          return {
+            status: 'success',
+            project: preWriteProject,
+            event: null,
+            changed: false,
+            healthChanged: false,
+          };
+        }
+
         const input: RefreshProjectInput = {
           projectId: project.projectId,
+          previousUpdatedAt: project.updatedAt,
           snapshot,
           monitor,
           continuity,
@@ -678,7 +716,27 @@ export class ProjectReconciler {
           ),
           timelineEntry,
         };
-        const result = this.registry.refreshProject(input);
+        let result: ReturnType<RegistryDatabase['refreshProject']>;
+
+        try {
+          result = this.registry.refreshProject(input);
+        } catch (error) {
+          if (error instanceof StaleProjectRefreshError) {
+            const currentProject = this.registry.getProjectById(projectId);
+
+            if (currentProject) {
+              return {
+                status: 'success',
+                project: currentProject,
+                event: null,
+                changed: false,
+                healthChanged: false,
+              };
+            }
+          }
+
+          throw error;
+        }
 
         this.eventHub.broadcast(result.event);
 
@@ -736,49 +794,50 @@ export class ProjectReconciler {
       };
     } catch (error) {
       const failure = error instanceof Error ? error : new Error('Project reconcile failed.');
+      const failureProject = this.registry.getProjectById(projectId) ?? project;
       const attemptedAt = new Date().toISOString();
-      const monitor = buildFailedMonitorSummary(project.monitor, options.trigger, attemptedAt, failure);
+      const monitor = buildFailedMonitorSummary(failureProject.monitor, options.trigger, attemptedAt, failure);
       const continuity = isMissingProjectRootError(failure)
-        ? buildPathLostContinuitySummary(project, attemptedAt)
+        ? buildPathLostContinuitySummary(failureProject, attemptedAt)
         : createTrackedProjectContinuitySummary(attemptedAt, {
-            state: project.continuity?.state ?? 'tracked',
-            pathLostAt: project.continuity?.pathLostAt ?? null,
-            lastRelinkedAt: project.continuity?.lastRelinkedAt ?? null,
-            previousRegisteredPath: project.continuity?.previousRegisteredPath ?? null,
-            previousCanonicalPath: project.continuity?.previousCanonicalPath ?? null,
+            state: failureProject.continuity?.state ?? 'tracked',
+            pathLostAt: failureProject.continuity?.pathLostAt ?? null,
+            lastRelinkedAt: failureProject.continuity?.lastRelinkedAt ?? null,
+            previousRegisteredPath: failureProject.continuity?.previousRegisteredPath ?? null,
+            previousCanonicalPath: failureProject.continuity?.previousCanonicalPath ?? null,
           });
-      const healthChanged = monitor.health !== project.monitor.health;
+      const healthChanged = monitor.health !== failureProject.monitor.health;
       const continuityChanged =
-        continuity.state !== (project.continuity?.state ?? 'tracked')
-        || continuity.pathLostAt !== (project.continuity?.pathLostAt ?? null);
+        continuity.state !== (failureProject.continuity?.state ?? 'tracked')
+        || continuity.pathLostAt !== (failureProject.continuity?.pathLostAt ?? null);
       const timelineEntry = isMissingProjectRootError(failure)
         ? (continuityChanged
           ? buildPathLostTimelineEntry({
               trigger: options.trigger,
-              snapshot: project.snapshot,
+              snapshot: failureProject.snapshot,
               monitor,
             })
           : null)
         : (healthChanged
           ? buildFailureTimelineEntry({
               trigger: options.trigger,
-              snapshot: project.snapshot,
+              snapshot: failureProject.snapshot,
               monitor,
             })
           : null);
 
       try {
         const result = this.registry.updateProjectMonitor({
-          projectId: project.projectId,
+          projectId: failureProject.projectId,
           monitor,
           continuity,
           emittedAt: attemptedAt,
           ...(healthChanged || continuityChanged
             ? {
                 eventPayload: buildProjectMonitorEventPayload(
-                  project,
+                  failureProject,
                   monitor,
-                  project.monitor.health,
+                  failureProject.monitor.health,
                   options.trigger,
                   continuity,
                 ),
@@ -800,7 +859,7 @@ export class ProjectReconciler {
         };
       } catch (persistError) {
         this.options.log?.error?.(
-          { err: persistError, projectId: project.projectId, trigger: options.trigger },
+          { err: persistError, projectId: failureProject.projectId, trigger: options.trigger },
           'Failed to persist reconcile monitor failure state',
         );
 

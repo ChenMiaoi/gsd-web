@@ -7,6 +7,7 @@ import { afterEach, describe, expect, test } from 'vitest';
 
 import type { ProjectEventEnvelope } from '../../src/shared/contracts.js';
 import { createApp, type RuntimeSignal } from '../../src/server/app.js';
+import { REGISTRY_SCHEMA_VERSION } from '../../src/server/db.js';
 import { startServer } from '../../src/server/index.js';
 import { createTempWorkspace, writeClientShell } from '../helpers/project-fixtures.js';
 
@@ -147,7 +148,7 @@ describe('service shell bootstrap', () => {
       database: {
         connected: true,
         fileName: 'gsd-web.sqlite',
-        schemaVersion: '4',
+        schemaVersion: REGISTRY_SCHEMA_VERSION,
       },
       assets: {
         available: true,
@@ -163,6 +164,21 @@ describe('service shell bootstrap', () => {
     expect(await projectsResponse.json()).toEqual({
       items: [],
       total: 0,
+    });
+
+    const directoryResponse = await fetch(
+      `${baseUrl}/api/filesystem/directories?path=${encodeURIComponent(workspace.root)}`,
+    );
+    expect(directoryResponse.status).toBe(200);
+    expect(await directoryResponse.json()).toMatchObject({
+      path: workspace.root,
+      entries: expect.arrayContaining([
+        expect.objectContaining({
+          name: 'web-dist',
+          path: clientDistDir,
+          hidden: false,
+        }),
+      ]),
     });
 
     const readyEvent = await readFirstSseEvent(`${baseUrl}/api/events`);
@@ -210,6 +226,7 @@ describe('service shell bootstrap', () => {
     ).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ method: 'GET', route: '/api/health' }),
+        expect.objectContaining({ method: 'GET', route: '/api/filesystem/directories' }),
         expect.objectContaining({ method: 'GET', route: '/api/projects' }),
         expect.objectContaining({ method: 'GET', route: '/api/projects/:id' }),
         expect.objectContaining({ method: 'GET', route: '/api/projects/:id/timeline' }),

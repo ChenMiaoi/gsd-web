@@ -6,7 +6,12 @@ import { TextDecoder } from 'node:util';
 import type {
   AutoLockValue,
   DirectorySummary,
+  GsdDbSliceDependencySummary,
   GsdDbSummaryValue,
+  GsdDbMilestoneSummary,
+  GsdDbSliceSummary,
+  GsdDbTaskSummary,
+  GsdMetricsSummaryValue,
   ProjectMarkdownValue,
   ProjectSnapshot,
   ProjectSnapshotSources,
@@ -201,6 +206,26 @@ function pickString(record: Record<string, unknown>, keys: string[]): string | n
   return null;
 }
 
+function pickStringOrNumber(record: Record<string, unknown>, keys: string[]): string | number | null {
+  for (const key of keys) {
+    const value = record[key];
+
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
+
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+
+      if (trimmed.length > 0) {
+        return trimmed;
+      }
+    }
+  }
+
+  return null;
+}
+
 function pickBoolean(record: Record<string, unknown>, keys: string[]): boolean | null {
   for (const key of keys) {
     const value = record[key];
@@ -213,6 +238,34 @@ function pickBoolean(record: Record<string, unknown>, keys: string[]): boolean |
   return null;
 }
 
+function pickWorkflowTimestamp(record: Record<string, unknown>, prefix: 'started' | 'finished') {
+  if (prefix === 'started') {
+    return pickStringOrNumber(record, [
+      'startedAt',
+      'startAt',
+      'started_at',
+      'start_at',
+      'started',
+      'startedOn',
+      'createdAt',
+      'created_at',
+    ]);
+  }
+
+  return pickStringOrNumber(record, [
+    'finishedAt',
+    'finishAt',
+    'completedAt',
+    'endedAt',
+    'finished_at',
+    'finish_at',
+    'completed_at',
+    'ended_at',
+    'finished',
+    'completed',
+  ]);
+}
+
 function pickNumber(record: Record<string, unknown>, keys: string[]): number | null {
   for (const key of keys) {
     const value = record[key];
@@ -223,6 +276,26 @@ function pickNumber(record: Record<string, unknown>, keys: string[]): number | n
 
     if (typeof value === 'string' && /^\d+$/.test(value.trim())) {
       return Number.parseInt(value.trim(), 10);
+    }
+  }
+
+  return null;
+}
+
+function pickFiniteNumber(record: Record<string, unknown>, keys: string[]): number | null {
+  for (const key of keys) {
+    const value = record[key];
+
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
+
+    if (typeof value === 'string' && value.trim().length > 0) {
+      const parsed = Number(value.trim());
+
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
     }
   }
 
@@ -359,6 +432,283 @@ async function readJsonSource<T>(
   }
 }
 
+function isCompletedStatus(status: string | null) {
+  return status !== null && /^(complete|completed|done|succeeded|success)$/iu.test(status.trim());
+}
+
+function parseStringList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean);
+  }
+
+  if (typeof value !== 'string') {
+    return [];
+  }
+
+  const trimmed = value.trim();
+
+  if (trimmed.length === 0) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+
+    if (Array.isArray(parsed)) {
+      return parsed
+        .filter((item): item is string => typeof item === 'string')
+        .map((item) => item.trim())
+        .filter(Boolean);
+    }
+  } catch {
+    // Fall back to the older comma-separated shape below.
+  }
+
+  return trimmed
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function summarizeGsdTask(row: Record<string, unknown>, fallbackId: string): GsdDbTaskSummary {
+  return {
+    id: pickString(row, ['id', 'taskId', 'task_id', 'key', 'slug']) ?? fallbackId,
+    title: pickString(row, ['title', 'name', 'summary', 'description']),
+    status: pickString(row, ['status', 'state', 'phase']),
+    risk: pickString(row, ['risk', 'priority', 'severity']),
+    startedAt: pickWorkflowTimestamp(row, 'started'),
+    finishedAt: pickWorkflowTimestamp(row, 'finished'),
+  };
+}
+
+function workflowParentKey(milestoneId: string | null, sliceId: string) {
+  return `${milestoneId ?? ''}\u0000${sliceId}`;
+}
+
+function summarizeGsdMilestones(input: {
+  milestones: Array<Record<string, unknown>>;
+  slices: Array<Record<string, unknown>>;
+  tasks: Array<Record<string, unknown>>;
+}): GsdDbMilestoneSummary[] {
+  const tasksBySlice = new Map<string, GsdDbTaskSummary[]>();
+
+  for (const [index, row] of input.tasks.entries()) {
+    const milestoneId = pickString(row, ['milestone_id', 'milestoneId', 'milestone', 'parentMilestoneId']);
+    const sliceId = pickString(row, ['slice_id', 'sliceId', 'slice', 'parentSliceId']);
+
+    if (!sliceId) {
+      continue;
+    }
+
+    const key = workflowParentKey(milestoneId, sliceId);
+    const tasks = tasksBySlice.get(key) ?? [];
+    tasks.push(summarizeGsdTask(row, `T${String(index + 1).padStart(2, '0')}`));
+    tasksBySlice.set(key, tasks);
+  }
+
+  const slicesByMilestone = new Map<string, GsdDbSliceSummary[]>();
+
+  for (const [index, row] of input.slices.entries()) {
+    const milestoneId = pickString(row, ['milestone_id', 'milestoneId', 'milestone', 'parentMilestoneId']);
+
+    if (!milestoneId) {
+      continue;
+    }
+
+    const sliceId = pickString(row, ['id', 'sliceId', 'slice_id', 'key', 'slug']) ?? `S${String(index + 1).padStart(2, '0')}`;
+    const tasks = tasksBySlice.get(workflowParentKey(milestoneId, sliceId))
+      ?? tasksBySlice.get(workflowParentKey(null, sliceId))
+      ?? [];
+    const slices = slicesByMilestone.get(milestoneId) ?? [];
+
+    slices.push({
+      id: sliceId,
+      title: pickString(row, ['title', 'name', 'summary', 'description']),
+      status: pickString(row, ['status', 'state', 'phase']),
+      risk: pickString(row, ['risk', 'priority', 'severity']),
+      startedAt: pickWorkflowTimestamp(row, 'started'),
+      finishedAt: pickWorkflowTimestamp(row, 'finished'),
+      taskCount: tasks.length,
+      completedTaskCount: tasks.filter((task) => isCompletedStatus(task.status)).length,
+      tasks,
+    });
+    slicesByMilestone.set(milestoneId, slices);
+  }
+
+  return input.milestones.map((row, index) => {
+    const milestoneId =
+      pickString(row, ['id', 'milestoneId', 'milestone_id', 'key', 'slug']) ?? `M${String(index + 1).padStart(3, '0')}`;
+    const slices = slicesByMilestone.get(milestoneId) ?? [];
+    const taskCount = slices.reduce((total, slice) => total + slice.taskCount, 0);
+    const completedTaskCount = slices.reduce((total, slice) => total + slice.completedTaskCount, 0);
+
+    return {
+      id: milestoneId,
+      title: pickString(row, ['title', 'name', 'summary', 'description']),
+      status: pickString(row, ['status', 'state', 'phase']),
+      startedAt: pickWorkflowTimestamp(row, 'started'),
+      finishedAt: pickWorkflowTimestamp(row, 'finished'),
+      sliceCount: slices.length,
+      taskCount,
+      completedTaskCount,
+      slices,
+    };
+  });
+}
+
+function addGsdSliceDependency(
+  dependencies: GsdDbSliceDependencySummary[],
+  seen: Set<string>,
+  dependency: GsdDbSliceDependencySummary,
+) {
+  const key = `${dependency.milestoneId}\u0000${dependency.sliceId}\u0000${dependency.dependsOnSliceId}`;
+
+  if (seen.has(key)) {
+    return;
+  }
+
+  seen.add(key);
+  dependencies.push(dependency);
+}
+
+function summarizeGsdSliceDependencies(input: {
+  slices: Array<Record<string, unknown>>;
+  dependencyRows: Array<Record<string, unknown>>;
+}): GsdDbSliceDependencySummary[] {
+  const dependencies: GsdDbSliceDependencySummary[] = [];
+  const seen = new Set<string>();
+
+  for (const row of input.dependencyRows) {
+    const milestoneId = pickString(row, ['milestone_id', 'milestoneId', 'milestone', 'parentMilestoneId']);
+    const sliceId = pickString(row, ['slice_id', 'sliceId', 'slice', 'id']);
+    const dependsOnSliceId = pickString(row, [
+      'depends_on_slice_id',
+      'dependsOnSliceId',
+      'depends_on',
+      'dependsOn',
+      'dependency_id',
+      'dependencyId',
+      'from_slice_id',
+      'fromSliceId',
+    ]);
+
+    if (!milestoneId || !sliceId || !dependsOnSliceId) {
+      continue;
+    }
+
+    addGsdSliceDependency(dependencies, seen, {
+      milestoneId,
+      sliceId,
+      dependsOnSliceId,
+    });
+  }
+
+  for (const row of input.slices) {
+    const milestoneId = pickString(row, ['milestone_id', 'milestoneId', 'milestone', 'parentMilestoneId']);
+    const sliceId = pickString(row, ['id', 'sliceId', 'slice_id', 'key', 'slug']);
+
+    if (!milestoneId || !sliceId) {
+      continue;
+    }
+
+    for (const dependsOnSliceId of parseStringList(row.depends ?? row.dependencies ?? row.depends_on ?? row.dependsOn)) {
+      addGsdSliceDependency(dependencies, seen, {
+        milestoneId,
+        sliceId,
+        dependsOnSliceId,
+      });
+    }
+  }
+
+  return dependencies;
+}
+
+function createEmptyMetricsTotals(): GsdMetricsSummaryValue['totals'] {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    totalTokens: 0,
+    cost: 0,
+    toolCalls: 0,
+    assistantMessages: 0,
+    userMessages: 0,
+    apiRequests: 0,
+    promptCharCount: 0,
+    baselineCharCount: 0,
+  };
+}
+
+function summarizeGsdMetrics(record: Record<string, unknown>): GsdMetricsSummaryValue {
+  const units = Array.isArray(record.units)
+    ? record.units.filter((unit): unit is Record<string, unknown> => Boolean(unit) && typeof unit === 'object' && !Array.isArray(unit))
+    : [];
+  const totals = createEmptyMetricsTotals();
+  const unitSummaries = units.map((unit) => {
+    const tokens = unit.tokens && typeof unit.tokens === 'object' && !Array.isArray(unit.tokens)
+      ? unit.tokens as Record<string, unknown>
+      : {};
+    const inputTokens = pickFiniteNumber(tokens, ['input', 'inputTokens']) ?? 0;
+    const outputTokens = pickFiniteNumber(tokens, ['output', 'outputTokens']) ?? 0;
+    const cacheReadTokens = pickFiniteNumber(tokens, ['cacheRead', 'cacheReadTokens']) ?? 0;
+    const cacheWriteTokens = pickFiniteNumber(tokens, ['cacheWrite', 'cacheWriteTokens']) ?? 0;
+    const totalTokens =
+      pickFiniteNumber(tokens, ['total', 'totalTokens'])
+      ?? inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+    const cost = pickFiniteNumber(unit, ['cost', 'totalCost']) ?? 0;
+    const toolCalls = pickFiniteNumber(unit, ['toolCalls']) ?? 0;
+    const assistantMessages = pickFiniteNumber(unit, ['assistantMessages']) ?? 0;
+    const userMessages = pickFiniteNumber(unit, ['userMessages']) ?? 0;
+    const apiRequests = pickFiniteNumber(unit, ['apiRequests']) ?? 0;
+    const promptCharCount = pickFiniteNumber(unit, ['promptCharCount']) ?? 0;
+    const baselineCharCount = pickFiniteNumber(unit, ['baselineCharCount']) ?? 0;
+
+    totals.inputTokens += inputTokens;
+    totals.outputTokens += outputTokens;
+    totals.cacheReadTokens += cacheReadTokens;
+    totals.cacheWriteTokens += cacheWriteTokens;
+    totals.totalTokens += totalTokens;
+    totals.cost += cost;
+    totals.toolCalls += toolCalls;
+    totals.assistantMessages += assistantMessages;
+    totals.userMessages += userMessages;
+    totals.apiRequests += apiRequests;
+    totals.promptCharCount += promptCharCount;
+    totals.baselineCharCount += baselineCharCount;
+
+    return {
+      type: pickString(unit, ['type', 'unitType']),
+      id: pickString(unit, ['id', 'unitId']),
+      model: pickString(unit, ['model']),
+      startedAt: pickFiniteNumber(unit, ['startedAt', 'startAt', 'started_at', 'start_at']),
+      finishedAt: pickFiniteNumber(unit, [
+        'finishedAt',
+        'finishAt',
+        'completedAt',
+        'endedAt',
+        'finished_at',
+        'finish_at',
+        'completed_at',
+        'ended_at',
+      ]),
+      totalTokens,
+      cost,
+      toolCalls,
+      apiRequests,
+    };
+  });
+
+  return {
+    version: pickFiniteNumber(record, ['version']),
+    projectStartedAt: pickFiniteNumber(record, ['projectStartedAt', 'projectStartAt', 'startedAt', 'startAt']),
+    unitCount: units.length,
+    totals,
+    units: unitSummaries,
+    recentUnits: unitSummaries.slice(-8).reverse(),
+  };
+}
+
 async function readGsdDbSummary(filePath: string, warnOnMissing: boolean): Promise<SourceReadResult<GsdDbSummaryValue>> {
   try {
     await access(filePath, constants.R_OK);
@@ -387,14 +737,14 @@ async function readGsdDbSummary(filePath: string, warnOnMissing: boolean): Promi
           `SELECT name
            FROM sqlite_master
            WHERE type = 'table'
-           ORDER BY name ASC
-           LIMIT 10`,
+           ORDER BY name ASC`,
         )
         .all() as unknown as Array<{ name: string }>;
 
       const tableNames = tableRows.map((row) => row.name);
+      const tableNameSet = new Set(tableNames);
       const countIfPresent = (tableName: string) => {
-        if (!tableNames.includes(tableName)) {
+        if (!tableNameSet.has(tableName)) {
           return null;
         }
 
@@ -404,6 +754,15 @@ async function readGsdDbSummary(filePath: string, warnOnMissing: boolean): Promi
 
         return row.total;
       };
+      const rowsIfPresent = (tableName: 'milestones' | 'slices' | 'tasks' | 'slice_dependencies') => {
+        if (!tableNameSet.has(tableName)) {
+          return [] as Array<Record<string, unknown>>;
+        }
+
+        return database.prepare(`SELECT * FROM ${tableName} LIMIT 80`).all() as unknown as Array<
+          Record<string, unknown>
+        >;
+      };
 
       return {
         source: createSource('ok', {
@@ -412,8 +771,18 @@ async function readGsdDbSummary(filePath: string, warnOnMissing: boolean): Promi
             milestones: countIfPresent('milestones'),
             slices: countIfPresent('slices'),
             tasks: countIfPresent('tasks'),
+            sliceDependencies: countIfPresent('slice_dependencies'),
             projects: countIfPresent('projects'),
           },
+          milestones: summarizeGsdMilestones({
+            milestones: rowsIfPresent('milestones'),
+            slices: rowsIfPresent('slices'),
+            tasks: rowsIfPresent('tasks'),
+          }),
+          dependencies: summarizeGsdSliceDependencies({
+            slices: rowsIfPresent('slices'),
+            dependencyRows: rowsIfPresent('slice_dependencies'),
+          }),
         }),
       };
     } finally {
@@ -780,6 +1149,10 @@ export async function buildProjectSnapshot(projectRoot: string): Promise<Project
         'not_applicable',
         'STATE.md is not checked without .gsd.',
       ),
+      metricsJson: createEmptySource<GsdMetricsSummaryValue>(
+        'not_applicable',
+        'metrics.json is not checked without .gsd.',
+      ),
       gsdDb: createEmptySource<GsdDbSummaryValue>(
         'not_applicable',
         'gsd.db is not checked without .gsd.',
@@ -835,6 +1208,15 @@ export async function buildProjectSnapshot(projectRoot: string): Promise<Project
       warnOnMissing: true,
     },
   );
+  const metricsJsonResult = await readJsonSource(
+    path.join(gsdDirectoryPath, 'metrics.json'),
+    'metricsJson',
+    summarizeGsdMetrics,
+    {
+      detailLabel: '.gsd/metrics.json',
+      warnOnMissing: false,
+    },
+  );
   const gsdDbResult = await readGsdDbSummary(path.join(gsdDirectoryPath, 'gsd.db'), true);
 
   const warnings = collectWarnings([
@@ -843,6 +1225,7 @@ export async function buildProjectSnapshot(projectRoot: string): Promise<Project
     repoMetaResult,
     autoLockResult,
     stateMdResult,
+    metricsJsonResult,
     gsdDbResult,
   ]);
 
@@ -854,6 +1237,7 @@ export async function buildProjectSnapshot(projectRoot: string): Promise<Project
     repoMeta: repoMetaResult.source,
     autoLock: autoLockResult.source,
     stateMd: stateMdResult.source,
+    metricsJson: metricsJsonResult.source,
     gsdDb: gsdDbResult.source,
   };
 

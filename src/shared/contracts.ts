@@ -8,6 +8,7 @@ export const SNAPSHOT_SOURCE_NAMES = [
   'repoMeta',
   'autoLock',
   'stateMd',
+  'metricsJson',
   'gsdDb',
 ] as const;
 
@@ -128,8 +129,88 @@ export interface GsdDbSummaryValue {
     milestones: number | null;
     slices: number | null;
     tasks: number | null;
+    sliceDependencies: number | null;
     projects: number | null;
   };
+  milestones: GsdDbMilestoneSummary[];
+  dependencies: GsdDbSliceDependencySummary[];
+}
+
+export type GsdWorkflowTimestampValue = string | number | null;
+
+export interface GsdDbTaskSummary {
+  id: string;
+  title: string | null;
+  status: string | null;
+  risk: string | null;
+  startedAt: GsdWorkflowTimestampValue;
+  finishedAt: GsdWorkflowTimestampValue;
+}
+
+export interface GsdDbSliceSummary {
+  id: string;
+  title: string | null;
+  status: string | null;
+  risk: string | null;
+  startedAt: GsdWorkflowTimestampValue;
+  finishedAt: GsdWorkflowTimestampValue;
+  taskCount: number;
+  completedTaskCount: number;
+  tasks: GsdDbTaskSummary[];
+}
+
+export interface GsdDbMilestoneSummary {
+  id: string;
+  title: string | null;
+  status: string | null;
+  startedAt: GsdWorkflowTimestampValue;
+  finishedAt: GsdWorkflowTimestampValue;
+  sliceCount: number;
+  taskCount: number;
+  completedTaskCount: number;
+  slices: GsdDbSliceSummary[];
+}
+
+export interface GsdDbSliceDependencySummary {
+  milestoneId: string;
+  sliceId: string;
+  dependsOnSliceId: string;
+}
+
+export interface GsdMetricsTotals {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  cost: number;
+  toolCalls: number;
+  assistantMessages: number;
+  userMessages: number;
+  apiRequests: number;
+  promptCharCount: number;
+  baselineCharCount: number;
+}
+
+export interface GsdMetricsUnitSummary {
+  type: string | null;
+  id: string | null;
+  model: string | null;
+  startedAt: number | null;
+  finishedAt: number | null;
+  totalTokens: number;
+  cost: number;
+  toolCalls: number;
+  apiRequests: number;
+}
+
+export interface GsdMetricsSummaryValue {
+  version: number | null;
+  projectStartedAt: number | null;
+  unitCount: number;
+  totals: GsdMetricsTotals;
+  units: GsdMetricsUnitSummary[];
+  recentUnits: GsdMetricsUnitSummary[];
 }
 
 export interface SnapshotSource<T> {
@@ -146,6 +227,7 @@ export interface ProjectSnapshotSources {
   repoMeta: SnapshotSource<RepoMetaValue>;
   autoLock: SnapshotSource<AutoLockValue>;
   stateMd: SnapshotSource<StateMarkdownValue>;
+  metricsJson: SnapshotSource<GsdMetricsSummaryValue>;
   gsdDb: SnapshotSource<GsdDbSummaryValue>;
 }
 
@@ -182,6 +264,14 @@ export interface ProjectContinuitySummary {
   lastRelinkedAt: string | null;
   previousRegisteredPath: string | null;
   previousCanonicalPath: string | null;
+}
+
+export interface ProjectDataLocation {
+  projectRoot: string;
+  gsdRootPath: string;
+  gsdDbPath: string;
+  statePath: string;
+  persistenceScope: 'project';
 }
 
 export interface ProjectTimelineEntry {
@@ -241,6 +331,7 @@ export interface ProjectRecord {
   snapshot: ProjectSnapshot;
   monitor: ProjectMonitorSummary;
   continuity?: ProjectContinuitySummary;
+  dataLocation: ProjectDataLocation;
   latestInitJob: ProjectInitJob | null;
 }
 
@@ -251,6 +342,19 @@ export interface ProjectDetailResponse extends ProjectRecord {
 export interface ProjectTimelineResponse {
   items: ProjectTimelineEntry[];
   total: number;
+}
+
+export interface FilesystemDirectoryEntry {
+  name: string;
+  path: string;
+  hidden: boolean;
+}
+
+export interface FilesystemDirectoryResponse {
+  path: string;
+  parentPath: string | null;
+  entries: FilesystemDirectoryEntry[];
+  truncated: boolean;
 }
 
 export interface HealthResponse {
@@ -378,6 +482,7 @@ export function buildSourceStateMap(
     repoMeta: snapshot.sources.repoMeta.state,
     autoLock: snapshot.sources.autoLock.state,
     stateMd: snapshot.sources.stateMd.state,
+    metricsJson: snapshot.sources.metricsJson?.state ?? 'missing',
     gsdDb: snapshot.sources.gsdDb.state,
   };
 }

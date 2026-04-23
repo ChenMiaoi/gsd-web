@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import path from 'node:path';
 
 import type {
+  ProjectDataLocation,
   ProjectContinuityState,
   ProjectContinuitySummary,
   ProjectEventEnvelope,
@@ -147,6 +149,7 @@ export interface RegisterProjectInput {
 
 export interface RefreshProjectInput {
   projectId: string;
+  previousUpdatedAt?: string;
   snapshot: ProjectSnapshot;
   monitor: ProjectMonitorSummary;
   continuity?: ProjectContinuitySummary;
@@ -211,6 +214,16 @@ export class ProjectNotFoundError extends Error {
   }
 }
 
+export class StaleProjectRefreshError extends Error {
+  readonly projectId: string;
+
+  constructor(projectId: string) {
+    super(`Project ${projectId} was updated before this refresh could be persisted.`);
+    this.name = 'StaleProjectRefreshError';
+    this.projectId = projectId;
+  }
+}
+
 export class ActiveInitJobError extends Error {
   readonly projectId: string;
   readonly jobId: string;
@@ -241,6 +254,18 @@ function createProjectId() {
 
 function createInitJobId() {
   return `init_${randomUUID()}`;
+}
+
+function buildProjectDataLocation(projectRoot: string): ProjectDataLocation {
+  const gsdRootPath = path.join(projectRoot, '.gsd');
+
+  return {
+    projectRoot,
+    gsdRootPath,
+    gsdDbPath: path.join(gsdRootPath, 'gsd.db'),
+    statePath: path.join(gsdRootPath, 'STATE.md'),
+    persistenceScope: 'project',
+  };
 }
 
 function isUniqueConstraintError(error: unknown): boolean {
@@ -650,15 +675,28 @@ export class RegistryDatabase {
     this.begin();
 
     try {
-      const updateResult = this.database
-        .prepare(
-          `UPDATE projects
-          SET snapshot_json = ?, monitor_json = ?, continuity_json = ?, updated_at = ?
-          WHERE project_id = ?`,
-        )
-        .run(snapshotJson, monitorJson, continuityJson, now, input.projectId);
+      const updateResult =
+        input.previousUpdatedAt === undefined
+          ? this.database
+              .prepare(
+                `UPDATE projects
+                SET snapshot_json = ?, monitor_json = ?, continuity_json = ?, updated_at = ?
+                WHERE project_id = ?`,
+              )
+              .run(snapshotJson, monitorJson, continuityJson, now, input.projectId)
+          : this.database
+              .prepare(
+                `UPDATE projects
+                SET snapshot_json = ?, monitor_json = ?, continuity_json = ?, updated_at = ?
+                WHERE project_id = ? AND updated_at = ?`,
+              )
+              .run(snapshotJson, monitorJson, continuityJson, now, input.projectId, input.previousUpdatedAt);
 
       if (Number(updateResult.changes) !== 1) {
+        if (input.previousUpdatedAt !== undefined && this.getProjectById(input.projectId)) {
+          throw new StaleProjectRefreshError(input.projectId);
+        }
+
         throw new ProjectNotFoundError(input.projectId);
       }
 
@@ -1141,6 +1179,7 @@ export class RegistryDatabase {
       snapshot: JSON.parse(row.snapshot_json) as ProjectSnapshot,
       monitor: parseProjectMonitorSummary(row.monitor_json),
       continuity: parseProjectContinuitySummary(row.continuity_json),
+      dataLocation: buildProjectDataLocation(row.canonical_path),
       latestInitJob: this.getLatestInitJob(row.project_id),
     };
   }

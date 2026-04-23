@@ -1,8 +1,13 @@
 import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
+import path from 'node:path';
+import { readdir, realpath, stat } from 'node:fs/promises';
 
 import type { FastifyInstance, FastifyReply } from 'fastify';
 
 import type {
+  FilesystemDirectoryEntry,
+  FilesystemDirectoryResponse,
   ProjectDetailResponse,
   ProjectInitJobStage,
   ProjectInitRefreshResult,
@@ -46,6 +51,20 @@ export type ProjectInitRunner = (
   options?: RunOfficialInitOptions,
 ) => Promise<InitRunResult>;
 
+const DIRECTORY_BROWSER_ENTRY_LIMIT = 250;
+
+class DirectoryBrowserError extends Error {
+  readonly statusCode: number;
+  readonly code: string;
+
+  constructor(message: string, statusCode: number, code: string) {
+    super(message);
+    this.name = 'DirectoryBrowserError';
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
 function sendError(reply: FastifyReply, statusCode: number, message: string, code?: string) {
   return reply.code(statusCode).send({
     error: statusCode >= 500 ? 'Internal Server Error' : 'Bad Request',
@@ -53,6 +72,100 @@ function sendError(reply: FastifyReply, statusCode: number, message: string, cod
     statusCode,
     code,
   });
+}
+
+function toDirectoryBrowserError(error: unknown): DirectoryBrowserError {
+  if (error instanceof DirectoryBrowserError) {
+    return error;
+  }
+
+  if (error && typeof error === 'object' && 'code' in error) {
+    const code = String(error.code);
+
+    if (code === 'ENOENT') {
+      return new DirectoryBrowserError('Directory does not exist.', 404, 'directory_not_found');
+    }
+
+    if (code === 'ENOTDIR') {
+      return new DirectoryBrowserError('Path is not a directory.', 400, 'not_a_directory');
+    }
+
+    if (code === 'EACCES' || code === 'EPERM') {
+      return new DirectoryBrowserError('Directory is not readable by the service process.', 403, 'directory_unreadable');
+    }
+  }
+
+  return new DirectoryBrowserError('Directory could not be read.', 500, 'directory_read_failed');
+}
+
+function pickDirectoryBrowserPath(value: unknown): string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    return homedir();
+  }
+
+  return value;
+}
+
+async function toDirectoryEntry(parentPath: string, name: string): Promise<FilesystemDirectoryEntry | null> {
+  const entryPath = path.join(parentPath, name);
+
+  try {
+    const entryStat = await stat(entryPath);
+
+    if (!entryStat.isDirectory()) {
+      return null;
+    }
+
+    return {
+      name,
+      path: entryPath,
+      hidden: name.startsWith('.'),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function readDirectoryBrowserPath(candidatePath: string): Promise<FilesystemDirectoryResponse> {
+  const resolvedPath = path.resolve(candidatePath);
+  const canonicalPath = await realpath(resolvedPath);
+  const directoryStat = await stat(canonicalPath);
+
+  if (!directoryStat.isDirectory()) {
+    throw new DirectoryBrowserError('Path is not a directory.', 400, 'not_a_directory');
+  }
+
+  const names = await readdir(canonicalPath);
+  const entries: FilesystemDirectoryEntry[] = [];
+
+  for (const name of names) {
+    if (entries.length >= DIRECTORY_BROWSER_ENTRY_LIMIT) {
+      break;
+    }
+
+    const entry = await toDirectoryEntry(canonicalPath, name);
+
+    if (entry) {
+      entries.push(entry);
+    }
+  }
+
+  entries.sort((first, second) => {
+    if (first.hidden !== second.hidden) {
+      return first.hidden ? 1 : -1;
+    }
+
+    return first.name.localeCompare(second.name, undefined, { sensitivity: 'base' });
+  });
+
+  const parentPath = path.dirname(canonicalPath);
+
+  return {
+    path: canonicalPath,
+    parentPath: parentPath === canonicalPath ? null : parentPath,
+    entries,
+    truncated: names.length > DIRECTORY_BROWSER_ENTRY_LIMIT,
+  };
 }
 
 function parsePathBody(body: unknown): RegisterProjectRequest | RelinkProjectRequest {
@@ -340,6 +453,16 @@ export async function registerProjectRoutes(
   const snapshotTimeoutMs = options.snapshotTimeoutMs ?? DEFAULT_SNAPSHOT_TIMEOUT_MS;
   const initRunner = options.initRunner ?? runOfficialGsdInit;
 
+  app.get<{ Querystring: { path?: string } }>('/api/filesystem/directories', async (request, reply) => {
+    try {
+      return await readDirectoryBrowserPath(pickDirectoryBrowserPath(request.query.path));
+    } catch (error) {
+      const browserError = toDirectoryBrowserError(error);
+
+      return sendError(reply, browserError.statusCode, browserError.message, browserError.code);
+    }
+  });
+
   app.get('/api/projects', async (): Promise<ProjectsResponse> => {
     const items = options.registry.listProjects();
 
@@ -611,6 +734,10 @@ export async function registerProjectRoutes(
   });
 
   return [
+    {
+      method: 'GET' as const,
+      route: '/api/filesystem/directories',
+    },
     {
       method: 'GET' as const,
       route: '/api/projects',

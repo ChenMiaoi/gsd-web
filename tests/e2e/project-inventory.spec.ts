@@ -213,6 +213,37 @@ test.describe('hosted dashboard inventory flow', () => {
     await expect(page.getByTestId('inventory-count')).toContainText('1 project');
   });
 
+  test('switches each workflow tab to the matching panel', async ({ page, harness }) => {
+    const initializedProjectPath = await createInitializedProject(harness.workspace.root, 'tabbed-project');
+    const panels = [
+      ['Progress', 'milestones-panel'],
+      ['Dependencies', 'dependencies-panel'],
+      ['Metrics', 'metrics-panel'],
+      ['Recent timeline', 'timeline-panel'],
+      ['Agent', 'monitor-panel'],
+      ['Changes', 'source-grid'],
+      ['Export', 'export-panel'],
+    ] as const;
+
+    await page.goto(harness.baseUrl);
+    await page.getByLabel('Project path').fill(initializedProjectPath);
+    await page.getByRole('button', { name: 'Register project' }).click();
+
+    await expect(page.getByTestId('detail-status')).toContainText('Initialized');
+
+    for (const [tabName, panelTestId] of panels) {
+      await page.getByRole('tab', { name: tabName }).click();
+      await expect(page.getByRole('tab', { name: tabName })).toHaveAttribute('aria-selected', 'true');
+      await expect(page.getByTestId(panelTestId)).toBeVisible();
+
+      for (const [_otherTabName, otherPanelTestId] of panels) {
+        if (otherPanelTestId !== panelTestId) {
+          await expect(page.getByTestId(otherPanelTestId)).toBeHidden();
+        }
+      }
+    }
+  });
+
   test('surfaces disconnected SSE state, truncates oversized warnings, and fails fast on malformed refresh payloads', async ({
     page,
     harness,
