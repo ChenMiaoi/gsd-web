@@ -361,14 +361,20 @@ export interface HealthResponse {
   service: typeof SERVICE_NAME;
   status: 'ok';
   checkedAt: string;
+  runtime: {
+    directory: string;
+    logFile: string | null;
+  };
   database: {
     connected: true;
     fileName: string;
+    path: string;
     schemaVersion: string;
   };
   assets: {
     available: true;
     directoryName: string;
+    path: string;
   };
   projects: {
     total: number;

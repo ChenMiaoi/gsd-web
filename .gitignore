@@ -19,6 +19,10 @@ node_modules/
 .next/
 dist/
 build/
+data/
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
 __pycache__/
 *.pyc
 .venv/

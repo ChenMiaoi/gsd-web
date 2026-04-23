@@ -22,6 +22,14 @@
 
 ## 快速开始
 
+作为 npm 包安装后，用户只需要运行：
+
+```bash
+gsd-web
+```
+
+本地开发时：
+
 ```bash
 npm install
 npm run build
@@ -88,6 +96,7 @@ npm run build       # 构建前端和后端
 npm run build:web   # 只构建 React/Vite 前端
 npm run build:server# 只编译 TypeScript 后端
 npm run dev         # 运行源码后端
+npm run cli         # 构建后用 gsd-web CLI 入口运行
 npm run start       # 运行 dist 后端
 npm test            # 运行 Vitest 集成测试
 npm run test:e2e    # 运行 Playwright 端到端测试
@@ -101,24 +110,36 @@ npm run test:e2e    # 运行 Playwright 端到端测试
 | --- | --- | --- |
 | `HOST` | `127.0.0.1` | 服务监听地址 |
 | `PORT` | `3000` | 服务监听端口 |
+| `GSD_WEB_HOME` | `~/.gsd-web` | gsd-web 运行时目录 |
+| `GSD_WEB_DATABASE_PATH` | `~/.gsd-web/data/gsd-web.sqlite` | 项目注册表 SQLite 路径 |
+| `GSD_WEB_LOG_DIR` | `~/.gsd-web/logs` | 默认日志目录 |
+| `GSD_WEB_LOG_FILE` | `~/.gsd-web/logs/gsd-web.log` | Fastify/Pino JSONL 日志文件 |
+| `GSD_WEB_LOG_LEVEL` | `info` | 服务日志等级 |
+| `GSD_WEB_CLIENT_DIST_DIR` | 包内 `dist/web` | 前端静态资源目录 |
 | `GSD_BIN_PATH` | `gsd` | `/gsd init` 驱动使用的 GSD 可执行文件 |
 
 示例：
 
 ```bash
-PORT=3001 GSD_BIN_PATH=/path/to/gsd npm run start
+PORT=3001 GSD_BIN_PATH=/path/to/gsd gsd-web
 ```
 
 默认数据库路径：
 
 ```text
-data/gsd-web.sqlite
+~/.gsd-web/data/gsd-web.sqlite
+```
+
+默认服务日志路径：
+
+```text
+~/.gsd-web/logs/gsd-web.log
 ```
 
 默认前端静态资源目录：
 
 ```text
-dist/web
+<npm package>/dist/web
 ```
 
 ## API 参考

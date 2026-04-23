@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { TextDecoder } from 'node:util';
 import type { AddressInfo } from 'node:net';
 
@@ -6,7 +7,7 @@ import type { FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, test } from 'vitest';
 
 import type { ProjectEventEnvelope } from '../../src/shared/contracts.js';
-import { createApp, type RuntimeSignal } from '../../src/server/app.js';
+import { createApp, resolveDefaultPaths, type RuntimeSignal } from '../../src/server/app.js';
 import { REGISTRY_SCHEMA_VERSION } from '../../src/server/db.js';
 import { startServer } from '../../src/server/index.js';
 import { createTempWorkspace, writeClientShell } from '../helpers/project-fixtures.js';
@@ -85,6 +86,22 @@ async function readFirstSseEvent(url: string) {
 }
 
 describe('service shell bootstrap', () => {
+  test('resolves npm runtime defaults under the user home directory', async () => {
+    const workspace = await createTempWorkspace('gsd-web-runtime-');
+
+    cleanupTasks.push(workspace.cleanup);
+
+    const paths = resolveDefaultPaths(import.meta.url, {
+      env: {},
+      homeDirectory: workspace.root,
+    });
+
+    expect(paths.runtimeDir).toBe(path.join(workspace.root, '.gsd-web'));
+    expect(paths.databasePath).toBe(path.join(workspace.root, '.gsd-web', 'data', 'gsd-web.sqlite'));
+    expect(paths.logFilePath).toBe(path.join(workspace.root, '.gsd-web', 'logs', 'gsd-web.log'));
+    expect(paths.clientDistDir).toMatch(/dist[/\\]web$/);
+  });
+
   test('rejects an empty database path', async () => {
     const workspace = await createTempWorkspace('gsd-web-shell-');
     const clientDistDir = await writeClientShell(workspace.root);
@@ -112,6 +129,36 @@ describe('service shell bootstrap', () => {
         logger: false,
       }),
     ).rejects.toThrow(/missing its shell index\.html/i);
+  });
+
+  test('creates runtime data and log files below the configured runtime directory', async () => {
+    const workspace = await createTempWorkspace('gsd-web-runtime-');
+    const clientDistDir = await writeClientShell(workspace.root);
+    const runtimeDir = path.join(workspace.root, '.gsd-web');
+
+    cleanupTasks.push(workspace.cleanup);
+
+    const app = await createApp({
+      runtimeDir,
+      clientDistDir,
+    });
+
+    cleanupTasks.push(async () => {
+      await app.close();
+    });
+
+    const paths = app.gsdWebPaths;
+
+    expect(paths.databasePath).toBe(path.join(runtimeDir, 'data', 'gsd-web.sqlite'));
+    expect(paths.activeLogFilePath).toBe(path.join(runtimeDir, 'logs', 'gsd-web.log'));
+    expect(await readFile(paths.databasePath)).toBeInstanceOf(Buffer);
+
+    await app.close();
+    cleanupTasks.pop();
+
+    const logText = await readFile(paths.activeLogFilePath!, 'utf8');
+    expect(logText).toContain('"event":"runtime_paths"');
+    expect(logText).toContain('"event":"database_open"');
   });
 
   test('serves health JSON, registry contracts, SSE backlog, and SPA fallback from one process', async () => {
@@ -145,14 +192,20 @@ describe('service shell bootstrap', () => {
     expect(await healthResponse.json()).toMatchObject({
       service: 'gsd-web',
       status: 'ok',
+      runtime: {
+        directory: expect.stringMatching(/\.gsd-web$/),
+        logFile: null,
+      },
       database: {
         connected: true,
         fileName: 'gsd-web.sqlite',
+        path: databasePath,
         schemaVersion: REGISTRY_SCHEMA_VERSION,
       },
       assets: {
         available: true,
         directoryName: 'web-dist',
+        path: clientDistDir,
       },
       projects: {
         total: 0,

@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyStatic from '@fastify/static';
 import { existsSync } from 'node:fs';
 import { access, constants, mkdir, readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -18,8 +19,16 @@ import { registerProjectRoutes, type ProjectInitRunner } from './routes/projects
 
 export type RuntimeSignal =
   | {
+      event: 'runtime_paths';
+      runtimeDir: string;
+      databasePath: string;
+      clientDistDir: string;
+      logFilePath: string | null;
+    }
+  | {
       event: 'database_open';
       databasePath: string;
+      runtimeDir: string;
     }
   | {
       event: 'route_registration';
@@ -50,14 +59,38 @@ export type RuntimeSignal =
     };
 
 export interface CreateAppOptions {
+  runtimeDir?: string;
   databasePath?: string;
   clientDistDir?: string;
+  logDir?: string;
+  logFilePath?: string;
   logger?: boolean;
   logSink?: (signal: RuntimeSignal) => void;
   snapshotTimeoutMs?: number;
   monitorIntervalMs?: number;
   watchersEnabled?: boolean;
   initRunner?: ProjectInitRunner;
+}
+
+export interface ResolvedRuntimePaths {
+  packageRoot: string;
+  runtimeDir: string;
+  dataDir: string;
+  databasePath: string;
+  clientDistDir: string;
+  logDir: string;
+  logFilePath: string;
+}
+
+export type GsdWebApp = FastifyInstance & {
+  gsdWebPaths: ResolvedRuntimePaths & {
+    activeLogFilePath: string | null;
+  };
+};
+
+export interface ResolveDefaultPathsOptions {
+  env?: NodeJS.ProcessEnv;
+  homeDirectory?: string;
 }
 
 function resolveConfiguredPath(label: string, candidate: string): string {
@@ -68,6 +101,12 @@ function resolveConfiguredPath(label: string, candidate: string): string {
   }
 
   return path.resolve(trimmed);
+}
+
+function resolveOptionalEnvPath(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const value = env[name]?.trim();
+
+  return value ? path.resolve(value) : undefined;
 }
 
 async function assertReadableFile(filePath: string, message: string) {
@@ -105,13 +144,26 @@ export function resolveProjectRoot(fromMetaUrl: string = import.meta.url): strin
   }
 }
 
-export function resolveDefaultPaths(fromMetaUrl: string = import.meta.url) {
-  const projectRoot = resolveProjectRoot(fromMetaUrl);
+export function resolveDefaultPaths(
+  fromMetaUrl: string = import.meta.url,
+  options: ResolveDefaultPathsOptions = {},
+): ResolvedRuntimePaths {
+  const env = options.env ?? process.env;
+  const packageRoot = resolveProjectRoot(fromMetaUrl);
+  const runtimeDir =
+    resolveOptionalEnvPath(env, 'GSD_WEB_HOME')
+    ?? path.resolve(options.homeDirectory ?? homedir(), '.gsd-web');
+  const dataDir = path.join(runtimeDir, 'data');
+  const logDir = resolveOptionalEnvPath(env, 'GSD_WEB_LOG_DIR') ?? path.join(runtimeDir, 'logs');
 
   return {
-    projectRoot,
-    databasePath: path.join(projectRoot, 'data', 'gsd-web.sqlite'),
-    clientDistDir: path.join(projectRoot, 'dist', 'web'),
+    packageRoot,
+    runtimeDir,
+    dataDir,
+    databasePath: resolveOptionalEnvPath(env, 'GSD_WEB_DATABASE_PATH') ?? path.join(dataDir, 'gsd-web.sqlite'),
+    clientDistDir: resolveOptionalEnvPath(env, 'GSD_WEB_CLIENT_DIST_DIR') ?? path.join(packageRoot, 'dist', 'web'),
+    logDir,
+    logFilePath: resolveOptionalEnvPath(env, 'GSD_WEB_LOG_FILE') ?? path.join(logDir, 'gsd-web.log'),
   };
 }
 
@@ -170,22 +222,30 @@ function emitProjectEvent(
 }
 
 function buildHealthResponse(
+  runtimeDir: string,
   databasePath: string,
   clientDistDir: string,
+  logFilePath: string | null,
   projectTotal: number,
 ): HealthResponse {
   return {
     service: SERVICE_NAME,
     status: 'ok',
     checkedAt: new Date().toISOString(),
+    runtime: {
+      directory: runtimeDir,
+      logFile: logFilePath,
+    },
     database: {
       connected: true,
       fileName: path.basename(databasePath),
+      path: databasePath,
       schemaVersion: REGISTRY_SCHEMA_VERSION,
     },
     assets: {
       available: true,
       directoryName: path.basename(clientDistDir),
+      path: clientDistDir,
     },
     projects: {
       total: projectTotal,
@@ -215,16 +275,30 @@ function toSafeRelativePath(requestPath: string): string | null {
   return normalizedPath;
 }
 
-export async function createApp(options: CreateAppOptions = {}): Promise<FastifyInstance> {
+export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebApp> {
   const defaults = resolveDefaultPaths(import.meta.url);
+  const runtimeDir = resolveConfiguredPath(
+    'GSD web runtime directory',
+    options.runtimeDir ?? defaults.runtimeDir,
+  );
+  const defaultDatabasePath = options.runtimeDir === undefined
+    ? defaults.databasePath
+    : path.join(runtimeDir, 'data', 'gsd-web.sqlite');
+  const defaultLogDir = options.runtimeDir === undefined ? defaults.logDir : path.join(runtimeDir, 'logs');
   const databasePath = resolveConfiguredPath(
     'GSD web database',
-    options.databasePath ?? defaults.databasePath,
+    options.databasePath ?? defaultDatabasePath,
   );
   const clientDistDir = resolveConfiguredPath(
     'Client build directory',
     options.clientDistDir ?? defaults.clientDistDir,
   );
+  const logDir = resolveConfiguredPath('GSD web log directory', options.logDir ?? defaultLogDir);
+  const defaultLogFilePath = options.logDir === undefined && options.runtimeDir === undefined
+    ? defaults.logFilePath
+    : path.join(logDir, 'gsd-web.log');
+  const logFilePath = resolveConfiguredPath('GSD web log file', options.logFilePath ?? defaultLogFilePath);
+  const activeLogFilePath = options.logger === false ? null : logFilePath;
   const indexHtmlPath = path.join(clientDistDir, 'index.html');
 
   await assertReadableFile(
@@ -232,16 +306,47 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     `Client build directory is missing its shell index.html: ${indexHtmlPath}`,
   );
   await mkdir(path.dirname(databasePath), { recursive: true });
+  if (activeLogFilePath !== null) {
+    await mkdir(path.dirname(activeLogFilePath), { recursive: true });
+  }
 
   const app = Fastify({
-    logger: options.logger ?? true,
+    logger: options.logger === false
+      ? false
+      : {
+          level: process.env.GSD_WEB_LOG_LEVEL?.trim() || process.env.LOG_LEVEL?.trim() || 'info',
+          file: activeLogFilePath ?? path.join(logDir, 'gsd-web.log'),
+        },
     forceCloseConnections: true,
-  });
+  }) as unknown as GsdWebApp;
+  app.gsdWebPaths = {
+    ...defaults,
+    runtimeDir,
+    dataDir: path.dirname(databasePath),
+    databasePath,
+    clientDistDir,
+    logDir,
+    logFilePath,
+    activeLogFilePath,
+  };
   let registry: RegistryDatabase | undefined;
   let eventHub: EventHub | undefined;
   let monitorManager: ProjectMonitorManager | undefined;
 
   try {
+    emitSignal(
+      app,
+      options.logSink,
+      {
+        event: 'runtime_paths',
+        runtimeDir,
+        databasePath,
+        clientDistDir,
+        logFilePath: activeLogFilePath,
+      },
+      'Resolved gsd-web runtime paths',
+    );
+
     const registryInstance = new RegistryDatabase(databasePath);
     const eventHubInstance = new EventHub(registryInstance);
     const reconciler = new ProjectReconciler(registryInstance, eventHubInstance, {
@@ -266,6 +371,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       {
         event: 'database_open',
         databasePath,
+        runtimeDir,
       },
       'Opened gsd-web SQLite database',
     );
@@ -311,7 +417,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     });
 
     app.get('/api/health', async () =>
-      buildHealthResponse(databasePath, clientDistDir, registryInstance.getProjectCount()),
+      buildHealthResponse(runtimeDir, databasePath, clientDistDir, activeLogFilePath, registryInstance.getProjectCount()),
     );
     emitSignal(
       app,

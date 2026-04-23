@@ -1,8 +1,20 @@
 {
   "name": "gsd-web",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
+  "main": "./dist/server/server/index.js",
+  "exports": {
+    ".": "./dist/server/server/index.js"
+  },
+  "bin": {
+    "gsd-web": "./dist/server/server/index.js"
+  },
+  "files": [
+    "dist/server/server",
+    "dist/server/shared",
+    "dist/web",
+    "README.md"
+  ],
   "engines": {
     "node": ">=24.0.0"
   },
@@ -11,7 +23,9 @@
     "build": "npm run clean && npm run build:web && npm run build:server",
     "build:web": "vite build",
     "build:server": "tsc --project tsconfig.json",
+    "prepack": "npm run build",
     "dev": "tsx src/server/index.ts",
+    "cli": "npm run build && node dist/server/server/index.js",
     "start": "node dist/server/server/index.js",
     "test": "vitest run",
     "test:e2e": "playwright test"
