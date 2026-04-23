@@ -285,13 +285,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       }
 
       if (event.projectId && event.type === 'project.relinked') {
-        void monitorManagerInstance
-          .syncProject(event.projectId)
-          .then(() =>
-            reconciler.reconcileProject(event.projectId!, {
-              trigger: 'relink',
-              emitRefreshEventOnNoChange: true,
-            }))
+        void reconciler
+          .reconcileProject(event.projectId, {
+            trigger: 'relink',
+            emitRefreshEventOnNoChange: true,
+          })
           .catch((error) => {
             app.log.warn(
               { err: error, projectId: event.projectId, trigger: 'relink' },

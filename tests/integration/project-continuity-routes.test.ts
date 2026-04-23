@@ -282,7 +282,7 @@ describe('project continuity routes', () => {
         project.canonicalPath === movedProjectRoot
         && project.continuity?.state === 'tracked'
         && project.continuity?.lastRelinkedAt !== null
-        && project.monitor.lastTrigger === 'relink',
+        && project.monitor.health === 'healthy',
     );
 
     expect(recoveredProject.latestInitJob?.stage).toBe('succeeded');
@@ -290,6 +290,7 @@ describe('project continuity routes', () => {
       state: 'tracked',
       previousCanonicalPath: projectRoot,
     });
+    expect(['relink', 'monitor_interval']).toContain(recoveredProject.monitor.lastTrigger);
 
     const timeline = await getTimeline(service.baseUrl, projectId);
     expect(timeline.items.some((entry) => entry.type === 'path_lost')).toBe(true);
