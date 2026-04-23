@@ -81,16 +81,29 @@ export async function registerEventsRoute(
       });
     }
 
-    reply.hijack();
-    reply.raw.writeHead(200, {
+    const replay = options.registry.getEventReplayBatch(parsedLastEventSequence);
+    const headers: Record<string, string> = {
       'cache-control': 'no-cache, no-transform',
       connection: 'keep-alive',
       'content-type': 'text/event-stream; charset=utf-8',
       'x-accel-buffering': 'no',
-    });
+      'x-gsd-replay-gap-detected': replay.replayGapDetected ? '1' : '0',
+      'x-gsd-retained-events': String(replay.window.retainedEvents),
+    };
+
+    if (replay.window.earliestRetainedEventId) {
+      headers['x-gsd-earliest-retained-event-id'] = replay.window.earliestRetainedEventId;
+    }
+
+    if (replay.window.latestRetainedEventId) {
+      headers['x-gsd-latest-retained-event-id'] = replay.window.latestRetainedEventId;
+    }
+
+    reply.hijack();
+    reply.raw.writeHead(200, headers);
     reply.raw.flushHeaders?.();
 
-    for (const event of options.eventHub.listEventsAfter(parsedLastEventSequence)) {
+    for (const event of replay.items) {
       reply.raw.write(serializeSseEvent(event));
     }
 

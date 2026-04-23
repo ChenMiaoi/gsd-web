@@ -2,7 +2,9 @@ import type { FastifyBaseLogger } from 'fastify';
 
 import {
   buildSourceStateMap,
+  createTrackedProjectContinuitySummary,
   deriveMonitorHealthFromSnapshot,
+  type ProjectContinuitySummary,
   type ProjectEventEnvelope,
   type ProjectMonitorError,
   type ProjectMonitorEventPayload,
@@ -118,6 +120,8 @@ function summarizeWarningCount(snapshot: ProjectSnapshot) {
 
 function triggerPriority(trigger: ProjectReconcileTrigger) {
   switch (trigger) {
+    case 'relink':
+      return 6;
     case 'init_refresh':
       return 5;
     case 'manual_refresh':
@@ -222,6 +226,34 @@ function buildFailedMonitorSummary(
   };
 }
 
+function isMissingProjectRootError(error: Error) {
+  return (
+    error instanceof ProjectSnapshotReadError
+    && error.scope === 'projectRoot'
+    && /no longer available|no longer resolves to a directory/i.test(error.message)
+  );
+}
+
+function buildTrackedContinuitySummary(project: ProjectRecord, checkedAt: string): ProjectContinuitySummary {
+  return createTrackedProjectContinuitySummary(checkedAt, {
+    state: 'tracked',
+    pathLostAt: null,
+    lastRelinkedAt: project.continuity?.lastRelinkedAt ?? null,
+    previousRegisteredPath: project.continuity?.previousRegisteredPath ?? null,
+    previousCanonicalPath: project.continuity?.previousCanonicalPath ?? null,
+  });
+}
+
+function buildPathLostContinuitySummary(project: ProjectRecord, checkedAt: string): ProjectContinuitySummary {
+  return createTrackedProjectContinuitySummary(checkedAt, {
+    state: 'path_lost',
+    pathLostAt: project.continuity?.pathLostAt ?? checkedAt,
+    lastRelinkedAt: project.continuity?.lastRelinkedAt ?? null,
+    previousRegisteredPath: project.continuity?.previousRegisteredPath ?? project.registeredPath,
+    previousCanonicalPath: project.continuity?.previousCanonicalPath ?? project.canonicalPath,
+  });
+}
+
 function buildProjectSnapshotEventPayload(
   projectId: string,
   canonicalPath: string,
@@ -229,6 +261,7 @@ function buildProjectSnapshotEventPayload(
   changed: boolean,
   trigger: ProjectReconcileTrigger,
   monitor: ProjectMonitorSummary,
+  continuity: ProjectContinuitySummary,
 ): ProjectSnapshotEventPayload {
   return {
     projectId,
@@ -241,6 +274,7 @@ function buildProjectSnapshotEventPayload(
     checkedAt: snapshot.checkedAt,
     trigger,
     monitor,
+    continuity,
   };
 }
 
@@ -249,6 +283,7 @@ function buildProjectMonitorEventPayload(
   monitor: ProjectMonitorSummary,
   previousHealth: ProjectMonitorHealth,
   trigger: ProjectReconcileTrigger,
+  continuity: ProjectContinuitySummary,
 ): ProjectMonitorEventPayload {
   return {
     projectId: project.projectId,
@@ -258,6 +293,7 @@ function buildProjectMonitorEventPayload(
     trigger,
     previousHealth,
     monitor,
+    continuity,
   };
 }
 
@@ -277,15 +313,17 @@ function buildRegistrationTimelineEntry(snapshot: ProjectSnapshot, monitor: Proj
 
 function buildSuccessTimelineEntry(options: {
   previousHealth: ProjectMonitorHealth;
+  previousContinuityState: ProjectRecord['continuity']['state'] | undefined;
   trigger: ProjectReconcileTrigger;
   snapshot: ProjectSnapshot;
   monitor: ProjectMonitorSummary;
   changed: boolean;
 }): TimelineEntryInput | null {
-  const { previousHealth, trigger, snapshot, monitor, changed } = options;
+  const { previousHealth, previousContinuityState, trigger, snapshot, monitor, changed } = options;
+  const recoveredFromPathLost = previousContinuityState === 'path_lost';
 
-  if (monitor.health !== previousHealth) {
-    if (monitor.health === 'healthy' && previousHealth !== 'healthy') {
+  if (monitor.health !== previousHealth || recoveredFromPathLost) {
+    if (monitor.health === 'healthy' && (previousHealth !== 'healthy' || recoveredFromPathLost)) {
       return {
         type: 'monitor_recovered',
         emittedAt: snapshot.checkedAt,
@@ -294,7 +332,9 @@ function buildSuccessTimelineEntry(options: {
         monitorHealth: monitor.health,
         warningCount: summarizeWarningCount(snapshot),
         changed,
-        detail: `Monitor recovered via ${summarizeTrigger(trigger)}; snapshot is now ${snapshot.status}.`,
+        detail: recoveredFromPathLost
+          ? `Project continuity recovered from a path-lost state via ${summarizeTrigger(trigger)}; snapshot is now ${snapshot.status}.`
+          : `Monitor recovered via ${summarizeTrigger(trigger)}; snapshot is now ${snapshot.status}.`,
         error: null,
       };
     }
@@ -350,6 +390,24 @@ function buildFailureTimelineEntry(options: {
   };
 }
 
+function buildPathLostTimelineEntry(options: {
+  trigger: ProjectReconcileTrigger;
+  snapshot: ProjectSnapshot;
+  monitor: ProjectMonitorSummary;
+}): TimelineEntryInput {
+  return {
+    type: 'path_lost',
+    emittedAt: options.monitor.lastAttemptedAt ?? new Date().toISOString(),
+    trigger: options.trigger,
+    snapshotStatus: options.snapshot.status,
+    monitorHealth: options.monitor.health,
+    warningCount: summarizeWarningCount(options.snapshot),
+    changed: false,
+    detail: `Project root is unavailable via ${summarizeTrigger(options.trigger)}; preserving the last known ${options.snapshot.status} snapshot until relink or recovery.`,
+    error: options.monitor.lastError,
+  };
+}
+
 export function createWatcherMonitorError(message: string, attemptedAt: string): ProjectMonitorError {
   const normalized = message.startsWith(WATCHER_MONITOR_ERROR_PREFIX)
     ? message
@@ -374,10 +432,19 @@ export function buildProjectRegistrationState(
     lastTrigger: null,
     lastError: null,
   });
+  const continuity = createTrackedProjectContinuitySummary(snapshot.checkedAt);
 
   return {
     monitor,
-    eventPayload: buildProjectSnapshotEventPayload(projectId, canonicalPath, snapshot, true, 'register', monitor),
+    eventPayload: buildProjectSnapshotEventPayload(
+      projectId,
+      canonicalPath,
+      snapshot,
+      true,
+      'register',
+      monitor,
+      continuity,
+    ),
     timelineEntry: buildRegistrationTimelineEntry(snapshot, monitor),
   };
 }
@@ -580,10 +647,13 @@ export class ProjectReconciler {
         this.options.snapshotTimeoutMs ?? DEFAULT_SNAPSHOT_TIMEOUT_MS,
       );
       const monitor = buildSuccessfulMonitorSummary(snapshot, options.trigger, project.monitor);
+      const continuity = buildTrackedContinuitySummary(project, snapshot.checkedAt);
       const changed = isChangedSnapshot(project.snapshot, snapshot);
       const healthChanged = monitor.health !== project.monitor.health;
+      const continuityRecovered = project.continuity?.state === 'path_lost' && continuity.state === 'tracked';
       const timelineEntry = buildSuccessTimelineEntry({
         previousHealth: project.monitor.health,
+        previousContinuityState: project.continuity?.state,
         trigger: options.trigger,
         snapshot: snapshot,
         monitor,
@@ -595,6 +665,7 @@ export class ProjectReconciler {
           projectId: project.projectId,
           snapshot,
           monitor,
+          continuity,
           eventPayload: buildProjectSnapshotEventPayload(
             project.projectId,
             project.canonicalPath,
@@ -602,6 +673,7 @@ export class ProjectReconciler {
             changed,
             options.trigger,
             monitor,
+            continuity,
           ),
           timelineEntry,
         };
@@ -618,12 +690,19 @@ export class ProjectReconciler {
         };
       }
 
-      if (healthChanged) {
+      if (healthChanged || continuityRecovered) {
         const result = this.registry.updateProjectMonitor({
           projectId: project.projectId,
           monitor,
+          continuity,
           emittedAt: snapshot.checkedAt,
-          eventPayload: buildProjectMonitorEventPayload(project, monitor, project.monitor.health, options.trigger),
+          eventPayload: buildProjectMonitorEventPayload(
+            project,
+            monitor,
+            project.monitor.health,
+            options.trigger,
+            continuity,
+          ),
           timelineEntry,
         });
 
@@ -643,6 +722,7 @@ export class ProjectReconciler {
       const result = this.registry.updateProjectMonitor({
         projectId: project.projectId,
         monitor,
+        continuity,
         emittedAt: snapshot.checkedAt,
       });
 
@@ -657,27 +737,49 @@ export class ProjectReconciler {
       const failure = error instanceof Error ? error : new Error('Project reconcile failed.');
       const attemptedAt = new Date().toISOString();
       const monitor = buildFailedMonitorSummary(project.monitor, options.trigger, attemptedAt, failure);
+      const continuity = isMissingProjectRootError(failure)
+        ? buildPathLostContinuitySummary(project, attemptedAt)
+        : createTrackedProjectContinuitySummary(attemptedAt, {
+            state: project.continuity?.state ?? 'tracked',
+            pathLostAt: project.continuity?.pathLostAt ?? null,
+            lastRelinkedAt: project.continuity?.lastRelinkedAt ?? null,
+            previousRegisteredPath: project.continuity?.previousRegisteredPath ?? null,
+            previousCanonicalPath: project.continuity?.previousCanonicalPath ?? null,
+          });
       const healthChanged = monitor.health !== project.monitor.health;
-      const timelineEntry = healthChanged
-        ? buildFailureTimelineEntry({
-            trigger: options.trigger,
-            snapshot: project.snapshot,
-            monitor,
-          })
-        : null;
+      const continuityChanged =
+        continuity.state !== (project.continuity?.state ?? 'tracked')
+        || continuity.pathLostAt !== (project.continuity?.pathLostAt ?? null);
+      const timelineEntry = isMissingProjectRootError(failure)
+        ? (continuityChanged
+          ? buildPathLostTimelineEntry({
+              trigger: options.trigger,
+              snapshot: project.snapshot,
+              monitor,
+            })
+          : null)
+        : (healthChanged
+          ? buildFailureTimelineEntry({
+              trigger: options.trigger,
+              snapshot: project.snapshot,
+              monitor,
+            })
+          : null);
 
       try {
         const result = this.registry.updateProjectMonitor({
           projectId: project.projectId,
           monitor,
+          continuity,
           emittedAt: attemptedAt,
-          ...(healthChanged
+          ...(healthChanged || continuityChanged
             ? {
                 eventPayload: buildProjectMonitorEventPayload(
                   project,
                   monitor,
                   project.monitor.health,
                   options.trigger,
+                  continuity,
                 ),
               }
             : {}),

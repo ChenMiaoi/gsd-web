@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -254,6 +254,12 @@ export async function applyProjectMutationsBurst(
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
+}
+
+export async function moveProjectRoot(projectRoot: string, nextProjectRoot: string) {
+  await mkdir(path.dirname(nextProjectRoot), { recursive: true });
+  await rename(projectRoot, nextProjectRoot);
+  return nextProjectRoot;
 }
 
 export async function createUnreadableProject(workspaceRoot: string, projectName: string) {

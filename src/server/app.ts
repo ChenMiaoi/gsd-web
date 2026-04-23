@@ -278,9 +278,26 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
         event.projectId
         && (event.type === 'project.registered'
           || event.type === 'project.refreshed'
-          || event.type === 'project.monitor.updated')
+          || event.type === 'project.monitor.updated'
+          || event.type === 'project.relinked')
       ) {
         void monitorManagerInstance.syncProject(event.projectId);
+      }
+
+      if (event.projectId && event.type === 'project.relinked') {
+        void monitorManagerInstance
+          .syncProject(event.projectId)
+          .then(() =>
+            reconciler.reconcileProject(event.projectId!, {
+              trigger: 'relink',
+              emitRefreshEventOnNoChange: true,
+            }))
+          .catch((error) => {
+            app.log.warn(
+              { err: error, projectId: event.projectId, trigger: 'relink' },
+              'Relink follow-up reconcile failed',
+            );
+          });
       }
     });
 
