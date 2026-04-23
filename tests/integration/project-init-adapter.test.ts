@@ -14,6 +14,8 @@ import {
 } from '../helpers/project-fixtures.js';
 
 const cleanupTasks: Array<() => Promise<void>> = [];
+const shouldRunOfficialGsdAdapterSmoke =
+  process.env.GSD_INIT_ADAPTER_E2E === '1' || Boolean(process.env.GSD_BIN_PATH?.trim());
 
 function isPathWithin(parentPath: string, candidatePath: string) {
   const relativePath = path.relative(parentPath, candidatePath);
@@ -32,7 +34,7 @@ afterEach(async () => {
 });
 
 describe('official /gsd init adapter', () => {
-  test(
+  test.skipIf(!shouldRunOfficialGsdAdapterSmoke)(
     'drives the supported default init wizard in an external temp project and proves bootstrap completeness',
     async () => {
       const { workspace, projectRoot } = await createExternalInitProject('real-init-project');

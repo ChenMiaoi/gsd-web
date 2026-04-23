@@ -171,6 +171,48 @@ export async function createBootstrapCompleteGsdDirectory(projectRoot: string) {
   return gsdRoot;
 }
 
+export async function createSnapshotCompleteBootstrap(projectRoot: string) {
+  const projectName = path.basename(projectRoot);
+  const gsdRoot = path.join(projectRoot, '.gsd');
+  const stagingGsdRoot = path.join(projectRoot, `.gsd-staging-${process.pid}-${Date.now()}`);
+
+  await rm(stagingGsdRoot, { recursive: true, force: true });
+  await mkdir(path.join(stagingGsdRoot, 'milestones'), { recursive: true });
+  await mkdir(path.join(stagingGsdRoot, 'runtime'), { recursive: true });
+  await writeFile(path.join(projectRoot, '.gsd-id'), `gsd-${projectName}\n`);
+  await writeFile(path.join(stagingGsdRoot, 'STATE.md'), '# State\n\nHealthy fixture state for integration coverage.\n');
+  await writeFile(path.join(stagingGsdRoot, 'PREFERENCES.md'), '# Preferences\n\nUsing fixture defaults.\n');
+  await writeFile(path.join(stagingGsdRoot, 'CODEBASE.md'), '# Codebase\n\nIndexed fixture.\n');
+  await writeFile(
+    path.join(stagingGsdRoot, 'PROJECT.md'),
+    '# Initialized Project\n\nBootstrapped by the integration fixture.\n',
+  );
+  await writeFile(
+    path.join(stagingGsdRoot, 'repo-meta.json'),
+    toJsonString({
+      projectName,
+      currentBranch: 'main',
+      headSha: 'feedbeef1234567',
+      repoFingerprint: `${projectName}-fingerprint`,
+      dirty: false,
+    }),
+  );
+  await writeFile(
+    path.join(stagingGsdRoot, 'auto.lock'),
+    toJsonString({
+      status: 'idle',
+      pid: 4242,
+      startedAt: '2026-04-22T10:00:00.000Z',
+      updatedAt: '2026-04-22T10:05:00.000Z',
+    }),
+  );
+  await writeFile(path.join(stagingGsdRoot, 'notifications.jsonl'), '');
+  await createValidGsdDb(path.join(stagingGsdRoot, 'gsd.db'));
+  await rename(stagingGsdRoot, gsdRoot);
+
+  return gsdRoot;
+}
+
 export async function createInitializedProject(
   workspaceRoot: string,
   projectName: string,

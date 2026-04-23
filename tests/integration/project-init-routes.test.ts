@@ -1,5 +1,4 @@
 import path from 'node:path';
-import { writeFile } from 'node:fs/promises';
 import { TextDecoder } from 'node:util';
 import type { AddressInfo } from 'node:net';
 
@@ -17,9 +16,9 @@ import type { ProjectInitRunner } from '../../src/server/routes/projects.js';
 import { BOOTSTRAP_REQUIRED_ENTRIES } from '../../src/server/snapshots.js';
 import type { InitRunResult, RunOfficialInitOptions } from '../../src/server/init-jobs.js';
 import {
-  createBootstrapCompleteGsdDirectory,
   createEmptyProject,
   createInitializedProject,
+  createSnapshotCompleteBootstrap,
   createTempWorkspace,
   writeClientShell,
 } from '../helpers/project-fixtures.js';
@@ -190,41 +189,7 @@ async function openEventStream(url: string) {
 }
 
 async function materializeInitializedBootstrap(projectRoot: string) {
-  const projectName = path.basename(projectRoot);
-
-  await createBootstrapCompleteGsdDirectory(projectRoot);
-  await writeFile(path.join(projectRoot, '.gsd-id'), `gsd-${projectName}\n`);
-  await writeFile(
-    path.join(projectRoot, '.gsd', 'PROJECT.md'),
-    '# Initialized Project\n\nBootstrapped by the init route integration fixture.\n',
-  );
-  await writeFile(
-    path.join(projectRoot, '.gsd', 'repo-meta.json'),
-    `${JSON.stringify(
-      {
-        projectName,
-        currentBranch: 'main',
-        headSha: 'feedbeef1234567',
-        repoFingerprint: `${projectName}-fingerprint`,
-        dirty: false,
-      },
-      null,
-      2,
-    )}\n`,
-  );
-  await writeFile(
-    path.join(projectRoot, '.gsd', 'auto.lock'),
-    `${JSON.stringify(
-      {
-        status: 'idle',
-        pid: 4242,
-        startedAt: '2026-04-22T10:00:00.000Z',
-        updatedAt: '2026-04-22T10:05:00.000Z',
-      },
-      null,
-      2,
-    )}\n`,
-  );
+  await createSnapshotCompleteBootstrap(projectRoot);
 }
 
 function emitStage(
