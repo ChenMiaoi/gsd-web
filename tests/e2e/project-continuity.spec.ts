@@ -10,7 +10,7 @@ import { startServer } from '../../src/server/index.js';
 import type { InitRunResult, RunOfficialInitOptions } from '../../src/server/init-jobs.js';
 import type { ProjectInitRunner } from '../../src/server/routes/projects.js';
 import { BOOTSTRAP_REQUIRED_ENTRIES } from '../../src/server/snapshots.js';
-import type { ProjectMutationResponse } from '../../src/shared/contracts.js';
+import type { ProjectMutationResponse, ProjectRecord } from '../../src/shared/contracts.js';
 import {
   createEmptyProject,
   createInitializedProject,
@@ -75,6 +75,44 @@ async function refreshProject(baseUrl: string, projectId: string) {
       accept: 'application/json',
     },
   });
+}
+
+async function getProject(baseUrl: string, projectId: string): Promise<ProjectRecord> {
+  const response = await fetch(`${baseUrl}/api/projects/${projectId}`, {
+    headers: {
+      accept: 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Expected project detail ${projectId}, got ${response.status}`);
+  }
+
+  return (await response.json()) as ProjectRecord;
+}
+
+async function waitForProject(
+  baseUrl: string,
+  projectId: string,
+  predicate: (project: ProjectRecord) => boolean,
+  timeoutMs: number = 5_000,
+): Promise<ProjectRecord> {
+  const deadline = Date.now() + timeoutMs;
+  let lastProject: ProjectRecord | null = null;
+
+  while (Date.now() < deadline) {
+    lastProject = await getProject(baseUrl, projectId);
+
+    if (predicate(lastProject)) {
+      return lastProject;
+    }
+
+    await sleep(50);
+  }
+
+  throw new Error(
+    `Timed out waiting for project ${projectId}. Last state: ${JSON.stringify(lastProject?.continuity ?? null)}`,
+  );
 }
 
 function emitStage(
@@ -209,6 +247,12 @@ test.describe('project continuity dashboard flow', () => {
 
       await moveProjectRoot(sourceProjectPath, movedProjectPath);
       await refreshProject(harness.baseUrl, projectId!);
+      await waitForProject(
+        harness.baseUrl,
+        projectId!,
+        (project) => project.continuity?.state === 'path_lost' && project.monitor.health === 'read_failed',
+      );
+      await page.reload();
 
       await expect(page.getByTestId('detail-continuity-state')).toContainText('Path lost');
       await expect(page.getByTestId('detail-monitor-health')).toContainText('Read failed');
@@ -274,6 +318,12 @@ test.describe('project continuity dashboard flow', () => {
 
       await moveProjectRoot(projectPath, movedProjectPath);
       await refreshProject(harness.baseUrl, projectId!);
+      await waitForProject(
+        harness.baseUrl,
+        projectId!,
+        (project) => project.continuity?.state === 'path_lost' && project.monitor.health === 'read_failed',
+      );
+      await page.reload();
 
       await expect(page.getByTestId('detail-continuity-state')).toContainText('Path lost');
       await expect(page.getByTestId('detail-project-id-value')).toHaveText(projectId!);
