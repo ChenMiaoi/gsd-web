@@ -60,6 +60,7 @@ import {
 
 type StreamStatus = UiStreamStatus;
 type StreamResyncStatus = 'idle' | 'syncing' | 'failed';
+type AppPage = 'overview' | 'details';
 type KnownEventType =
   | 'service.ready'
   | 'project.registered'
@@ -136,6 +137,39 @@ type WorkflowExecutionStats = {
   modelUsage: ModelUsageSummary[];
 };
 
+type ProjectOverviewRow = {
+  project: ProjectRecord;
+  label: string;
+  continuity: ProjectContinuitySummary;
+  workflowPhase: string;
+  currentStage: string;
+  cost: number;
+  totalTokens: number;
+  elapsedMs: number | null;
+  estimatedRemainingMs: number | null;
+  completedTasks: number;
+  totalTasks: number;
+  remainingTasks: number;
+  progressPercent: number;
+  warningCount: number;
+  unitCount: number;
+  metricsAvailable: boolean;
+};
+
+type PortfolioSummary = {
+  rows: ProjectOverviewRow[];
+  totalCost: number;
+  totalTokens: number;
+  totalElapsedMs: number | null;
+  totalWarnings: number;
+  completedTasks: number;
+  totalTasks: number;
+  remainingTasks: number;
+  activeProjects: number;
+  metricsProjects: number;
+};
+
+const APP_PAGES: readonly AppPage[] = ['overview', 'details'];
 const WORKFLOW_TABS: readonly WorkflowTab[] = [
   'progress',
   'dependencies',
@@ -589,6 +623,11 @@ function parseProjectSnapshot(value: unknown, label: string): ProjectSnapshot {
   const record = expectRecord(value, label);
   const identityHints = expectRecord(record.identityHints, `${label}.identityHints`);
   const sources = expectRecord(record.sources, `${label}.sources`);
+  const displayName = expectOptionalString(identityHints.displayName, `${label}.identityHints.displayName`);
+  const displayNameSource = expectOptionalString(
+    identityHints.displayNameSource,
+    `${label}.identityHints.displayNameSource`,
+  ) as ProjectSnapshot['identityHints']['displayNameSource'];
 
   return {
     status: parseSnapshotStatus(record.status, `${label}.status`),
@@ -600,6 +639,8 @@ function parseProjectSnapshot(value: unknown, label: string): ProjectSnapshot {
         identityHints.repoFingerprint,
         `${label}.identityHints.repoFingerprint`,
       ),
+      ...(displayName === undefined ? {} : { displayName }),
+      ...(displayNameSource === undefined ? {} : { displayNameSource }),
     },
     sources: {
       directory: parseSnapshotSource(sources.directory, `${label}.sources.directory`, parseDirectorySummary),
@@ -1302,12 +1343,32 @@ function inferProjectDataLocation(projectRoot: string): ProjectDataLocation {
   };
 }
 
+function trimDisplayName(value: string | null | undefined) {
+  const trimmed = value?.trim() ?? '';
+
+  return trimmed.length === 0 ? null : trimmed;
+}
+
+function isGenericDisplayName(value: string | null | undefined) {
+  const normalized = value?.trim().toLowerCase().replace(/[\s_-]+/gu, ' ') ?? '';
+
+  return normalized === 'project' || normalized === 'untitled project' || normalized === 'project snapshot fixture';
+}
+
 function describeProject(project: ProjectRecord) {
+  const hintedName = trimDisplayName(project.snapshot.identityHints.displayName);
+  const repoName = trimDisplayName(project.snapshot.sources.repoMeta.value?.projectName);
+  const directoryName = trimDisplayName(basenameFromPath(project.canonicalPath));
+  const projectTitle = trimDisplayName(project.snapshot.sources.projectMd.value?.title);
+  const gsdId = trimDisplayName(project.snapshot.identityHints.gsdId);
+
   return (
-    project.snapshot.sources.projectMd.value?.title ??
-    project.snapshot.sources.repoMeta.value?.projectName ??
-    project.snapshot.identityHints.gsdId ??
-    basenameFromPath(project.canonicalPath)
+    (hintedName && !isGenericDisplayName(hintedName) ? hintedName : null)
+    ?? (repoName && !isGenericDisplayName(repoName) ? repoName : null)
+    ?? directoryName
+    ?? (projectTitle && !isGenericDisplayName(projectTitle) ? projectTitle : null)
+    ?? gsdId
+    ?? project.canonicalPath
   );
 }
 
@@ -2440,6 +2501,149 @@ function initButtonLabel(
   return copy.actions.initializeProject;
 }
 
+function appPageLabel(page: AppPage, copy: UiCopy) {
+  return page === 'overview' ? copy.labels.overview : copy.labels.details;
+}
+
+function getProjectWorkflowPhase(project: ProjectRecord, copy: UiCopy) {
+  const initJob = project.latestInitJob;
+
+  if (initJob && hasActiveInitJob(initJob)) {
+    return copy.initStageLabels[initJob.stage];
+  }
+
+  return copy.statusLabels[project.snapshot.status];
+}
+
+function describeProjectCurrentStage(
+  project: ProjectRecord,
+  activeMilestone: GsdDbMilestoneSummary | null,
+  copy: UiCopy,
+) {
+  const initJob = project.latestInitJob;
+
+  if (initJob && hasActiveInitJob(initJob)) {
+    return `${copy.labels.initialization}: ${copy.initStageLabels[initJob.stage]}`;
+  }
+
+  const activeSlice = findActiveSlice(activeMilestone);
+  const activeTask = findActiveTask(activeSlice);
+
+  if (activeTask && activeSlice) {
+    return `${activeSlice.id}/${activeTask.id}: ${taskTitle(activeTask)}`;
+  }
+
+  if (activeSlice) {
+    return `${activeSlice.id}: ${sentenceCaseTitle(sliceTitle(activeSlice))}`;
+  }
+
+  if (activeMilestone) {
+    return `${activeMilestone.id}: ${milestoneTitle(activeMilestone)}`;
+  }
+
+  return getProjectWorkflowPhase(project, copy);
+}
+
+function buildProjectOverviewRow(project: ProjectRecord, nowMs: number, copy: UiCopy): ProjectOverviewRow {
+  const gsdDb = project.snapshot.sources.gsdDb.value ?? null;
+  const metrics = project.snapshot.sources.metricsJson.value ?? null;
+  const milestoneSource = gsdDb?.milestones ?? [];
+  const activeMilestone = findActiveMilestone(milestoneSource);
+  const milestones = orderWorkflowMilestones(milestoneSource, activeMilestone?.id ?? null);
+  const executionStats = buildWorkflowExecutionStats(milestones, metrics, nowMs, copy);
+  const progressPercent =
+    executionStats.totalTasks === 0
+      ? project.snapshot.status === 'initialized'
+        ? 100
+        : 0
+      : Math.round((executionStats.completedTasks / executionStats.totalTasks) * 100);
+
+  return {
+    project,
+    label: describeProject(project),
+    continuity: getProjectContinuity(project),
+    workflowPhase: getProjectWorkflowPhase(project, copy),
+    currentStage: describeProjectCurrentStage(project, activeMilestone, copy),
+    cost: metrics?.totals.cost ?? 0,
+    totalTokens: metrics?.totals.totalTokens ?? 0,
+    elapsedMs: executionStats.elapsedMs,
+    estimatedRemainingMs: executionStats.estimatedRemainingMs,
+    completedTasks: executionStats.completedTasks,
+    totalTasks: executionStats.totalTasks,
+    remainingTasks: executionStats.remainingTasks,
+    progressPercent,
+    warningCount: project.snapshot.warnings.length,
+    unitCount: metrics?.unitCount ?? 0,
+    metricsAvailable: metrics !== null,
+  };
+}
+
+function compareProjectOverviewRows(first: ProjectOverviewRow, second: ProjectOverviewRow) {
+  const statusRank: Record<ProjectSnapshotStatus, number> = {
+    degraded: 0,
+    uninitialized: 1,
+    initialized: 2,
+  };
+  const firstRank = statusRank[first.project.snapshot.status];
+  const secondRank = statusRank[second.project.snapshot.status];
+
+  if (firstRank !== secondRank) {
+    return firstRank - secondRank;
+  }
+
+  return second.cost - first.cost || first.label.localeCompare(second.label);
+}
+
+function buildPortfolioSummary(projects: ProjectRecord[], nowMs: number, copy: UiCopy): PortfolioSummary {
+  const rows = projects.map((project) => buildProjectOverviewRow(project, nowMs, copy)).sort(compareProjectOverviewRows);
+  const elapsedValues = rows
+    .map((row) => row.elapsedMs)
+    .filter((value): value is number => value !== null && value > 0);
+
+  return {
+    rows,
+    totalCost: rows.reduce((total, row) => total + row.cost, 0),
+    totalTokens: rows.reduce((total, row) => total + row.totalTokens, 0),
+    totalElapsedMs: elapsedValues.length === 0 ? null : elapsedValues.reduce((total, value) => total + value, 0),
+    totalWarnings: rows.reduce((total, row) => total + row.warningCount, 0),
+    completedTasks: rows.reduce((total, row) => total + row.completedTasks, 0),
+    totalTasks: rows.reduce((total, row) => total + row.totalTasks, 0),
+    remainingTasks: rows.reduce((total, row) => total + row.remainingTasks, 0),
+    activeProjects: rows.filter((row) => hasActiveInitJob(row.project.latestInitJob) || row.remainingTasks > 0).length,
+    metricsProjects: rows.filter((row) => row.metricsAvailable).length,
+  };
+}
+
+function AppPageIcon({ page }: { page: AppPage }) {
+  if (page === 'overview') {
+    return (
+      <svg viewBox="0 0 20 20" aria-hidden="true">
+        <path d="M4 5h12" />
+        <path d="M4 10h12" />
+        <path d="M4 15h7" />
+        <path d="M14 13.5 16.5 16 19 11" />
+      </svg>
+    );
+  }
+
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <path d="M4 4h12v12H4z" />
+      <path d="M7 8h6" />
+      <path d="M7 12h4" />
+    </svg>
+  );
+}
+
+function OpenDetailsIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <path d="M5 10h10" />
+      <path d="m11 6 4 4-4 4" />
+    </svg>
+  );
+}
+
 function workflowTabLabel(tab: WorkflowTab, copy: UiCopy) {
   switch (tab) {
     case 'progress':
@@ -2626,6 +2830,7 @@ function WorkflowMilestoneRail({
 export default function App() {
   const [locale, setLocale] = useState<Locale>(() => getInitialLocale());
   const copy = UI_COPY[locale];
+  const [activeAppPage, setActiveAppPage] = useState<AppPage>('overview');
   const [activeWorkflowTab, setActiveWorkflowTab] = useState<WorkflowTab>('progress');
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
@@ -3128,6 +3333,7 @@ export default function App() {
 
   const selectProject = useCallback(
     (project: ProjectRecord) => {
+      setActiveAppPage('details');
       selectedProjectIdRef.current = project.projectId;
       setSelectedProjectId(project.projectId);
       setSelectedProject(project);
@@ -3189,11 +3395,9 @@ export default function App() {
     [copy.errors.folderBrowserTimeout, copy.errors.unexpected],
   );
 
-  const handleRegister = useCallback(
-    async (event: React.FormEvent<HTMLFormElement>) => {
-      event.preventDefault();
-
-      const candidatePath = registerPath.trim();
+  const submitRegisterPath = useCallback(
+    async (rawPath: string, options: { closeDirectoryPickerOnSuccess?: boolean } = {}) => {
+      const candidatePath = rawPath.trim();
 
       if (candidatePath.length === 0) {
         setRegisterError(copy.errors.emptyRegisterPath);
@@ -3216,6 +3420,7 @@ export default function App() {
       }
 
       setRegisterPending(true);
+      setRegisterPath(candidatePath);
       setRegisterError(null);
       setRegisterSuccess(null);
 
@@ -3239,6 +3444,10 @@ export default function App() {
         }
 
         setProjects((current) => upsertProject(current, response.project));
+        setActiveAppPage('details');
+        if (options.closeDirectoryPickerOnSuccess) {
+          setDirectoryPickerOpen(false);
+        }
         selectedProjectIdRef.current = response.project.projectId;
         setSelectedProjectId(response.project.projectId);
         setSelectedProject(response.project);
@@ -3278,9 +3487,16 @@ export default function App() {
       copy.errors.unexpected,
       copy.notices,
       projects,
-      registerPath,
       syncSelectedProjectPanels,
     ],
+  );
+
+  const handleRegister = useCallback(
+    (event: React.FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      void submitRegisterPath(registerPath);
+    },
+    [registerPath, submitRegisterPath],
   );
 
   const handleRelinkSelected = useCallback(
@@ -3522,6 +3738,8 @@ export default function App() {
   const initializedCount = projects.filter((project) => project.snapshot.status === 'initialized').length;
   const degradedCount = projects.filter((project) => project.snapshot.status === 'degraded').length;
   const uninitializedCount = projects.filter((project) => project.snapshot.status === 'uninitialized').length;
+  const nowMs = Date.now();
+  const portfolioSummary = buildPortfolioSummary(projects, nowMs, copy);
   const selectedInitJob = selectedProject?.latestInitJob ?? null;
   const selectedInitRequestPending =
     selectedProject !== null && initPendingProjectId === selectedProject.projectId;
@@ -3570,38 +3788,358 @@ export default function App() {
       : selectedProject
         ? copy.statusLabels[selectedProject.snapshot.status]
         : copy.messages.notRecorded;
-  const selectedExecutionStats = buildWorkflowExecutionStats(selectedMilestones, selectedMetrics, Date.now(), copy);
+  const selectedExecutionStats = buildWorkflowExecutionStats(selectedMilestones, selectedMetrics, nowMs, copy);
   const selectedRecentExecutionUnits = (selectedMetrics?.recentUnits ?? []).map(toExecutionUnit);
   const primaryModel = selectedExecutionStats.modelUsage[0]?.model ?? copy.messages.notRecorded;
   const averageUnitDurationMs = averageDuration(selectedExecutionStats.units);
+  const renderRegisterPanel = (inputId: string) => (
+    <form className="register-panel" onSubmit={handleRegister}>
+      <div>
+        <h2>{copy.actions.registerProject}</h2>
+        <p>{copy.help.registerPanel}</p>
+      </div>
+
+      <div className="field register-panel__field">
+        <label htmlFor={inputId}>{copy.labels.projectPath}</label>
+        <div className="path-input-row">
+          <input
+            id={inputId}
+            name={inputId}
+            type="text"
+            autoComplete="off"
+            spellCheck={false}
+            placeholder={copy.placeholders.projectPath}
+            value={registerPath}
+            onChange={(nextEvent) => {
+              setRegisterPath(nextEvent.target.value);
+              setRegisterError(null);
+              setRegisterSuccess(null);
+            }}
+          />
+          <button
+            type="button"
+            className="secondary-button secondary-button--icon"
+            onClick={() => {
+              setRegisterError(null);
+              setRegisterSuccess(null);
+              setDirectoryPickerOpen(true);
+              void loadDirectoryPicker(registerPath);
+            }}
+            disabled={directoryPickerLoading}
+          >
+            <FolderIcon />
+            <span>{copy.actions.browseFolders}</span>
+          </button>
+        </div>
+      </div>
+
+      <div className="register-panel__actions">
+        <button type="submit" className="primary-button" disabled={registerPending}>
+          {registerPending ? copy.actions.registering : copy.actions.registerProject}
+        </button>
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={() => {
+            setRegisterPath('');
+            setRegisterError(null);
+            setRegisterSuccess(null);
+          }}
+          disabled={registerPending || registerPath.length === 0}
+        >
+          {copy.actions.clearInput}
+        </button>
+      </div>
+
+      {registerError ? (
+        <p className="inline-alert inline-alert--error" role="alert" data-testid="register-error">
+          {registerError}
+        </p>
+      ) : null}
+
+      {registerSuccess ? (
+        <p className="inline-alert inline-alert--success" data-testid="register-success">
+          {registerSuccess}
+        </p>
+      ) : null}
+    </form>
+  );
+  const renderStreamStrip = () => (
+    <div className="stream-strip">
+      <div data-testid="stream-status" data-stream-status={streamStatus}>
+        <span className="stat-card__label">{copy.stats.liveStream}</span>
+        <strong>{copy.streamStatusLabels[streamStatus]}</strong>
+        <span>{copy.streamStatusMessages[streamStatus]}</span>
+        {streamResyncMessage ? (
+          <span
+            className="stream-resync-note"
+            data-testid="stream-resync-status"
+            data-resync-status={streamResyncStatus}
+          >
+            {streamResyncMessage}
+          </span>
+        ) : null}
+      </div>
+      <div data-testid="stream-last-event">
+        <span className="stat-card__label">{copy.stats.lastSseEvent}</span>
+        {streamSummary ? (
+          <>
+            <strong>{streamSummary.type}</strong>
+            <span>{streamSummary.id}</span>
+            <time dateTime={streamSummary.emittedAt}>{formatTimestamp(streamSummary.emittedAt, locale)}</time>
+          </>
+        ) : (
+          <span>{copy.stats.waitingForEvent}</span>
+        )}
+      </div>
+    </div>
+  );
 
   return (
     <main className="app-shell" data-locale={locale}>
-      <section className="workspace-layout">
-        <aside className="project-sidebar panel" aria-labelledby="inventory-heading">
-          <div className="sidebar-header">
-            <div className="sidebar-title">
-              <p className="eyebrow">{copy.app.eyebrow}</p>
-              <h1>{copy.app.title}</h1>
-              <p className="lede">{copy.app.lede}</p>
-            </div>
-            <div className="locale-switch" role="group" aria-label={copy.languageToggleLabel}>
-              {(['en', 'zh'] as Locale[]).map((option) => (
-                <button
-                  key={option}
-                  type="button"
-                  className="locale-switch__option"
-                  aria-pressed={locale === option}
-                  onClick={() => {
-                    setLocale(option);
-                  }}
-                >
-                  {copy.localeOptions[option]}
-                </button>
-              ))}
-            </div>
+      <section className="app-frame">
+        <header className="app-topbar panel">
+          <div className="app-topbar__title">
+            <p className="eyebrow">{copy.app.eyebrow}</p>
+            <h1>{copy.app.title}</h1>
+            <p className="lede">{copy.app.lede}</p>
           </div>
 
+          <div className="app-page-tabs" role="tablist" aria-label={copy.labels.workspacePages}>
+            {APP_PAGES.map((page) => (
+              <button
+                key={page}
+                type="button"
+                className="app-page-tabs__item"
+                role="tab"
+                aria-selected={activeAppPage === page}
+                aria-controls={`app-page-${page}`}
+                data-active={activeAppPage === page}
+                onClick={() => {
+                  setActiveAppPage(page);
+                }}
+              >
+                <AppPageIcon page={page} />
+                <span>{appPageLabel(page, copy)}</span>
+              </button>
+            ))}
+          </div>
+
+          <div className="locale-switch" role="group" aria-label={copy.languageToggleLabel}>
+            {(['en', 'zh'] as Locale[]).map((option) => (
+              <button
+                key={option}
+                type="button"
+                className="locale-switch__option"
+                aria-pressed={locale === option}
+                onClick={() => {
+                  setLocale(option);
+                }}
+              >
+                {copy.localeOptions[option]}
+              </button>
+            ))}
+          </div>
+        </header>
+
+        {activeAppPage === 'overview' ? (
+          <section className="overview-layout app-page" id="app-page-overview" aria-labelledby="overview-heading">
+            <section className="overview-hero panel">
+              <div className="overview-hero__copy">
+                <p className="eyebrow">{copy.app.healthRailLabel}</p>
+                <h2 id="overview-heading">{copy.labels.portfolio}</h2>
+                <p>{copy.app.healthRailCopy}</p>
+              </div>
+              <div className="overview-hero__actions">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => {
+                    void syncInventory(selectedProjectIdRef.current);
+                  }}
+                  disabled={inventoryLoading}
+                >
+                  {inventoryLoading ? copy.actions.refreshing : copy.actions.refreshInventory}
+                </button>
+              </div>
+
+              <div className="overview-metrics">
+                <div className="overview-metric-card" data-testid="inventory-count">
+                  <span className="stat-card__label">{copy.stats.registered}</span>
+                  <strong>{totalProjectsLabel}</strong>
+                  <small>{initializedCount} {copy.stats.initialized}</small>
+                </div>
+                <div className="overview-metric-card">
+                  <span className="stat-card__label">{copy.labels.totalCost}</span>
+                  <strong>{formatCost(portfolioSummary.totalCost, locale)}</strong>
+                  <small>{copy.formatCount(portfolioSummary.metricsProjects, 'project')}</small>
+                </div>
+                <div className="overview-metric-card">
+                  <span className="stat-card__label">{copy.labels.totalElapsed}</span>
+                  <strong>{formatDuration(portfolioSummary.totalElapsedMs, locale, copy.messages.notRecorded)}</strong>
+                  <small>{formatCompactNumber(portfolioSummary.totalTokens, locale)} {copy.labels.tokens}</small>
+                </div>
+                <div className="overview-metric-card">
+                  <span className="stat-card__label">{copy.labels.remainingTasks}</span>
+                  <strong>{portfolioSummary.remainingTasks}</strong>
+                  <small>
+                    {portfolioSummary.completedTasks}/{portfolioSummary.totalTasks} {copy.labels.completed}
+                  </small>
+                </div>
+              </div>
+            </section>
+
+            <div className="overview-content">
+              <section className="overview-board panel" aria-labelledby="overview-projects-heading">
+                <div className="panel-header inventory-panel__header">
+                  <div>
+                    <h2 id="overview-projects-heading">{copy.labels.projectOverview}</h2>
+                    <p>{copy.help.portfolioProjection}</p>
+                  </div>
+                  <div className="detail-header__meta">
+                    <span className="status-pill" data-status="initialized">{initializedCount} {copy.stats.initialized}</span>
+                    <span className="status-pill" data-status="degraded">{degradedCount} {copy.stats.degraded}</span>
+                    <span className="status-pill" data-status="uninitialized">
+                      {uninitializedCount} {copy.stats.uninitialized}
+                    </span>
+                  </div>
+                </div>
+
+                {inventoryError ? (
+                  <div className="inline-alert inline-alert--error" role="alert" data-testid="inventory-error">
+                    <p>{inventoryError}</p>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => {
+                        void syncInventory(selectedProjectIdRef.current);
+                      }}
+                    >
+                      {copy.actions.retryInventory}
+                    </button>
+                  </div>
+                ) : null}
+
+                {projects.length === 0 ? (
+                  <div className="empty-state" data-testid="inventory-empty">
+                    <h3>{copy.empty.inventoryTitle}</h3>
+                    <p>{copy.empty.inventoryCopy}</p>
+                  </div>
+                ) : (
+                  <div className="overview-project-list">
+                    {portfolioSummary.rows.map((row) => (
+                      <button
+                        key={row.project.projectId}
+                        type="button"
+                        className="overview-project-row"
+                        data-status={row.project.snapshot.status}
+                        data-testid={`overview-project-card-${row.project.projectId}`}
+                        onClick={() => {
+                          selectProject(row.project);
+                        }}
+                      >
+                        <span className="overview-project-row__identity">
+                          <strong>{row.label}</strong>
+                        </span>
+
+                        <span className="overview-project-row__state">
+                          <span className="overview-project-row__meter" aria-hidden="true">
+                            <span style={{ width: `${row.progressPercent}%` }} />
+                          </span>
+                          <span className="overview-project-row__badges">
+                            <span className="status-pill" data-status={row.project.snapshot.status}>
+                              {copy.statusLabels[row.project.snapshot.status]}
+                            </span>
+                            <span className="status-pill" data-status={row.project.monitor.health}>
+                              {copy.monitorHealthLabels[row.project.monitor.health]}
+                            </span>
+                            <span className="status-pill" data-status={continuityTone(row.continuity.state)}>
+                              {copy.continuityStateLabels[row.continuity.state]}
+                            </span>
+                          </span>
+                        </span>
+
+                        <span className="overview-project-row__facts">
+                          <span>
+                            <small>{copy.labels.cost}</small>
+                            <strong>{formatCost(row.cost, locale)}</strong>
+                          </span>
+                          <span>
+                            <small>{copy.labels.elapsed}</small>
+                            <strong>{formatDuration(row.elapsedMs, locale, copy.messages.notRecorded)}</strong>
+                          </span>
+                          <span>
+                            <small>{copy.labels.currentStage}</small>
+                            <strong title={row.currentStage}>{row.currentStage}</strong>
+                          </span>
+                          <span>
+                            <small>{copy.labels.estimatedRemaining}</small>
+                            <strong>
+                              {formatDuration(
+                                row.estimatedRemainingMs,
+                                locale,
+                                copy.messages.estimateUnavailable,
+                              )}
+                            </strong>
+                          </span>
+                        </span>
+
+                        <span className="overview-project-row__open">
+                          <OpenDetailsIcon />
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </section>
+
+              <aside className="overview-side" aria-label={copy.labels.serviceState}>
+                <section className="overview-register panel">
+                  {renderRegisterPanel('overview-project-path')}
+                </section>
+                <section className="overview-status panel">
+                  <div className="subpanel__header">
+                    <h2>{copy.labels.statusBreakdown}</h2>
+                    <p>{copy.help.statusBreakdown}</p>
+                  </div>
+                  <dl className="detail-facts detail-facts--compact">
+                    <div>
+                      <dt>{copy.labels.activeProjects}</dt>
+                      <dd>{portfolioSummary.activeProjects}</dd>
+                    </div>
+                    <div>
+                      <dt>{copy.labels.totalWarnings}</dt>
+                      <dd>{portfolioSummary.totalWarnings}</dd>
+                    </div>
+                    <div>
+                      <dt>{copy.labels.apiRequests}</dt>
+                      <dd>
+                        {formatCompactNumber(
+                          portfolioSummary.rows.reduce(
+                            (total, row) => total + (row.project.snapshot.sources.metricsJson.value?.totals.apiRequests ?? 0),
+                            0,
+                          ),
+                          locale,
+                        )}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>{copy.labels.units}</dt>
+                      <dd>{portfolioSummary.rows.reduce((total, row) => total + row.unitCount, 0)}</dd>
+                    </div>
+                  </dl>
+                </section>
+                <section className="overview-stream panel">
+                  {renderStreamStrip()}
+                </section>
+              </aside>
+            </div>
+          </section>
+        ) : null}
+
+        {activeAppPage === 'details' ? (
+        <section className="workspace-layout app-page" id="app-page-details" aria-labelledby="detail-heading">
+        <aside className="project-sidebar panel" aria-labelledby="inventory-heading">
           <div className="sidebar-stats">
             <div className="stat-card" data-testid="inventory-count">
               <span className="stat-card__label">{copy.stats.registered}</span>
@@ -3621,74 +4159,7 @@ export default function App() {
             </div>
           </div>
 
-          <form className="register-panel" onSubmit={handleRegister}>
-            <div>
-              <h2>{copy.actions.registerProject}</h2>
-              <p>{copy.help.registerPanel}</p>
-            </div>
-
-            <div className="field register-panel__field">
-              <label htmlFor="project-path">{copy.labels.projectPath}</label>
-              <div className="path-input-row">
-                <input
-                  id="project-path"
-                  name="project-path"
-                  type="text"
-                  autoComplete="off"
-                  spellCheck={false}
-                  placeholder={copy.placeholders.projectPath}
-                  value={registerPath}
-                  onChange={(nextEvent) => {
-                    setRegisterPath(nextEvent.target.value);
-                    setRegisterError(null);
-                    setRegisterSuccess(null);
-                  }}
-                />
-                <button
-                  type="button"
-                  className="secondary-button secondary-button--icon"
-                  onClick={() => {
-                    setDirectoryPickerOpen(true);
-                    void loadDirectoryPicker(registerPath);
-                  }}
-                  disabled={directoryPickerLoading}
-                >
-                  <FolderIcon />
-                  <span>{copy.actions.browseFolders}</span>
-                </button>
-              </div>
-            </div>
-
-            <div className="register-panel__actions">
-              <button type="submit" className="primary-button" disabled={registerPending}>
-                {registerPending ? copy.actions.registering : copy.actions.registerProject}
-              </button>
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => {
-                  setRegisterPath('');
-                  setRegisterError(null);
-                  setRegisterSuccess(null);
-                }}
-                disabled={registerPending || registerPath.length === 0}
-              >
-                {copy.actions.clearInput}
-              </button>
-            </div>
-
-            {registerError ? (
-              <p className="inline-alert inline-alert--error" role="alert" data-testid="register-error">
-                {registerError}
-              </p>
-            ) : null}
-
-            {registerSuccess ? (
-              <p className="inline-alert inline-alert--success" data-testid="register-success">
-                {registerSuccess}
-              </p>
-            ) : null}
-          </form>
+          {renderRegisterPanel('details-project-path')}
 
           <section className="inventory-panel">
             <div className="panel-header inventory-panel__header">
@@ -3792,34 +4263,7 @@ export default function App() {
           )}
           </section>
 
-          <div className="stream-strip">
-            <div data-testid="stream-status" data-stream-status={streamStatus}>
-              <span className="stat-card__label">{copy.stats.liveStream}</span>
-              <strong>{copy.streamStatusLabels[streamStatus]}</strong>
-              <span>{copy.streamStatusMessages[streamStatus]}</span>
-              {streamResyncMessage ? (
-                <span
-                  className="stream-resync-note"
-                  data-testid="stream-resync-status"
-                  data-resync-status={streamResyncStatus}
-                >
-                  {streamResyncMessage}
-                </span>
-              ) : null}
-            </div>
-            <div data-testid="stream-last-event">
-              <span className="stat-card__label">{copy.stats.lastSseEvent}</span>
-              {streamSummary ? (
-                <>
-                  <strong>{streamSummary.type}</strong>
-                  <span>{streamSummary.id}</span>
-                  <time dateTime={streamSummary.emittedAt}>{formatTimestamp(streamSummary.emittedAt, locale)}</time>
-                </>
-              ) : (
-                <span>{copy.stats.waitingForEvent}</span>
-              )}
-            </div>
-          </div>
+          {renderStreamStrip()}
         </aside>
 
         <section className="panel detail-panel" aria-labelledby="detail-heading">
@@ -5057,6 +5501,8 @@ export default function App() {
             </p>
           </div>
         </section>
+        </section>
+        ) : null}
       </section>
 
       {directoryPickerOpen ? (
@@ -5114,23 +5560,28 @@ export default function App() {
                 <button
                   type="button"
                   className="primary-button"
-                  disabled={!directoryPicker}
+                  disabled={!directoryPicker || registerPending}
                   onClick={() => {
                     if (directoryPicker) {
-                      setRegisterPath(directoryPicker.path);
-                      setRegisterError(null);
-                      setRegisterSuccess(null);
-                      setDirectoryPickerOpen(false);
+                      void submitRegisterPath(directoryPicker.path, {
+                        closeDirectoryPickerOnSuccess: true,
+                      });
                     }
                   }}
                 >
                   <FolderIcon />
-                  <span>{copy.actions.useCurrentFolder}</span>
+                  <span>{registerPending ? copy.actions.registering : copy.actions.useCurrentFolder}</span>
                 </button>
               </div>
             </div>
 
             <div className="directory-picker__browser">
+              {registerError ? (
+                <p className="inline-alert inline-alert--error" role="alert" data-testid="directory-register-error">
+                  {registerError}
+                </p>
+              ) : null}
+
               {directoryPickerError ? (
                 <p className="inline-alert inline-alert--error" role="alert">
                   {directoryPickerError}

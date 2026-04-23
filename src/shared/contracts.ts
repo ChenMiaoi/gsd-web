@@ -238,6 +238,8 @@ export interface ProjectSnapshot {
   identityHints: {
     gsdId: string | null;
     repoFingerprint: string | null;
+    displayName?: string;
+    displayNameSource?: 'readme' | 'git' | 'repoMeta' | 'directory' | 'projectMd' | 'gsdId';
   };
   sources: ProjectSnapshotSources;
   warnings: SnapshotWarning[];

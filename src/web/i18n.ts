@@ -35,6 +35,16 @@ export interface UiCopy {
     waitingForEvent: string;
   };
   labels: {
+    workspacePages: string;
+    overview: string;
+    details: string;
+    portfolio: string;
+    projectOverview: string;
+    statusBreakdown: string;
+    activeProjects: string;
+    totalCost: string;
+    totalElapsed: string;
+    totalWarnings: string;
     projectPath: string;
     newProjectPath: string;
     registeredInventory: string;
@@ -109,6 +119,7 @@ export interface UiCopy {
     remainingTasks: string;
     estimatedRemaining: string;
     estimatedFinish: string;
+    currentStage: string;
     currentTask: string;
     actualDuration: string;
     firstStarted: string;
@@ -122,6 +133,8 @@ export interface UiCopy {
   };
   help: {
     registerPanel: string;
+    portfolioProjection: string;
+    statusBreakdown: string;
     inventoryProjection: string;
     detailProjection: string;
     monitor: string;
@@ -306,6 +319,16 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       waitingForEvent: 'Waiting for the first event envelope.',
     },
     labels: {
+      workspacePages: 'Workspace pages',
+      overview: 'Overview',
+      details: 'Details',
+      portfolio: 'Portfolio summary',
+      projectOverview: 'Project overview',
+      statusBreakdown: 'Status breakdown',
+      activeProjects: 'Active projects',
+      totalCost: 'Total cost',
+      totalElapsed: 'Total elapsed',
+      totalWarnings: 'Total warnings',
       projectPath: 'Project path',
       newProjectPath: 'New project path',
       registeredInventory: 'Registered inventory',
@@ -380,6 +403,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       remainingTasks: 'Tasks remaining',
       estimatedRemaining: 'Estimated remaining',
       estimatedFinish: 'Estimated finish',
+      currentStage: 'Current stage',
       currentTask: 'Current task',
       actualDuration: 'Actual time',
       firstStarted: 'First started',
@@ -394,6 +418,9 @@ export const UI_COPY: Record<Locale, UiCopy> = {
     help: {
       registerPanel:
         'Registration stays read-only: the service snapshots the directory, records a stable project id, and leaves the monitored workspace untouched.',
+      portfolioProjection:
+        'Aggregated cost, elapsed time, and state across every registered project. Select a project to open detail.',
+      statusBreakdown: 'Status totals are computed from the current project inventory and metrics snapshots.',
       inventoryProjection: 'Current projection from /api/projects.',
       detailProjection: 'Truthful snapshot from /api/projects/:id plus manual refresh.',
       monitor: 'Service-owned reconcile health that stays distinct from the current snapshot state.',
@@ -425,7 +452,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       exportSnapshot: 'Export snapshot JSON',
       browseFolders: 'Browse folders',
       closePicker: 'Close',
-      useCurrentFolder: 'Use this folder',
+      useCurrentFolder: 'Register this folder',
       openParentFolder: 'Parent',
       refreshFolders: 'Refresh folders',
       loadingFolders: 'Loading folders...',
@@ -611,6 +638,16 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       waitingForEvent: '正在等待第一个事件包。',
     },
     labels: {
+      workspacePages: '工作区页面',
+      overview: '总览',
+      details: '详情',
+      portfolio: '项目总览',
+      projectOverview: '项目概览',
+      statusBreakdown: '状态分布',
+      activeProjects: '活跃项目',
+      totalCost: '总成本',
+      totalElapsed: '总耗时',
+      totalWarnings: '总警告',
       projectPath: '项目路径',
       newProjectPath: '新的项目路径',
       registeredInventory: '已登记清单',
@@ -685,6 +722,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       remainingTasks: '剩余任务',
       estimatedRemaining: '预计剩余',
       estimatedFinish: '预计结束',
+      currentStage: '当前阶段',
       currentTask: '当前任务',
       actualDuration: '实际耗时',
       firstStarted: '首次开始',
@@ -698,6 +736,8 @@ export const UI_COPY: Record<Locale, UiCopy> = {
     },
     help: {
       registerPanel: '登记操作只读执行：服务会扫描目录、记录稳定项目 ID，不会修改被监控的工作区。',
+      portfolioProjection: '汇总所有已登记项目的成本、耗时与状态。选择一个项目即可进入详情。',
+      statusBreakdown: '状态统计来自当前项目清单和 metrics 快照。',
       inventoryProjection: '来自 /api/projects 的当前投影。',
       detailProjection: '来自 /api/projects/:id 的真实快照，并支持手动刷新。',
       monitor: '服务侧 reconcile 健康度，与当前快照状态分开呈现。',
@@ -728,7 +768,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       exportSnapshot: '导出快照 JSON',
       browseFolders: '选择目录',
       closePicker: '关闭',
-      useCurrentFolder: '使用此目录',
+      useCurrentFolder: '登记此目录',
       openParentFolder: '上一级',
       refreshFolders: '刷新目录',
       loadingFolders: '正在读取目录...',

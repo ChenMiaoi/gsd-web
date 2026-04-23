@@ -19,6 +19,7 @@ import {
   createTempWorkspace,
   createUnreadableProject,
   writeClientShell,
+  writeProjectFile,
 } from '../helpers/project-fixtures.js';
 
 const cleanupTasks: Array<() => Promise<void>> = [];
@@ -179,6 +180,8 @@ describe('project registry and snapshot contracts', () => {
     const emptyMutation = (await emptyRegisterResponse.json()) as ProjectMutationResponse;
     expect(emptyMutation.project.projectId).toMatch(/^prj_/u);
     expect(emptyMutation.project.snapshot.status).toBe('uninitialized');
+    expect(emptyMutation.project.snapshot.identityHints.displayName).toBe('empty-project');
+    expect(emptyMutation.project.snapshot.identityHints.displayNameSource).toBe('directory');
     expect(emptyMutation.project.snapshot.directory.isEmpty).toBe(true);
     expect(emptyMutation.project.snapshot.sources.gsdDirectory.state).toBe('missing');
     expect(emptyMutation.project.snapshot.warnings).toEqual([]);
@@ -206,6 +209,11 @@ describe('project registry and snapshot contracts', () => {
       stateMdContent: new Uint8Array([0xc3, 0x28]),
       gsdDbMode: 'corrupt',
     });
+    await writeProjectFile(
+      partialProjectPath,
+      'README.md',
+      '# Readable Partial Fixture\n\nA user-facing project name.\n',
+    );
     const partialRegisterResponse = await postJson(`${service.baseUrl}/api/projects/register`, {
       path: partialProjectPath,
     });
@@ -215,6 +223,8 @@ describe('project registry and snapshot contracts', () => {
     const partialMutation = (await partialRegisterResponse.json()) as ProjectMutationResponse;
     expect(partialMutation.project.snapshot.status).toBe('degraded');
     expect(partialMutation.project.snapshot.identityHints.gsdId).toBe('gsd-partial-project');
+    expect(partialMutation.project.snapshot.identityHints.displayName).toBe('Readable Partial Fixture');
+    expect(partialMutation.project.snapshot.identityHints.displayNameSource).toBe('readme');
     expect(partialMutation.project.snapshot.sources.gsdDirectory.state).toBe('ok');
     expect(partialMutation.project.snapshot.sources.gsdId.state).toBe('ok');
     expect(partialMutation.project.snapshot.sources.autoLock.state).toBe('ok');

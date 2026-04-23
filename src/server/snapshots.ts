@@ -54,6 +54,13 @@ interface SourceReadResult<T> {
   warning?: SnapshotWarning;
 }
 
+type ProjectDisplayNameSource = NonNullable<ProjectSnapshot['identityHints']['displayNameSource']>;
+
+interface ProjectDisplayName {
+  name: string;
+  source: ProjectDisplayNameSource;
+}
+
 class ProjectPathValidationError extends Error {
   readonly responseCode: 'invalid_path';
   readonly statusCode: number;
@@ -190,6 +197,18 @@ function trimDetail(detail: string) {
   return detail.length > MAX_SUMMARY_LENGTH ? `${detail.slice(0, MAX_SUMMARY_LENGTH)}…` : detail;
 }
 
+function trimProjectName(value: string | null | undefined) {
+  const trimmed = value?.trim() ?? '';
+
+  return trimmed.length === 0 ? null : trimDetail(trimmed);
+}
+
+function isGenericProjectName(value: string | null | undefined) {
+  const normalized = value?.trim().toLowerCase().replace(/[\s_-]+/gu, ' ') ?? '';
+
+  return normalized === 'project' || normalized === 'untitled project' || normalized === 'project snapshot fixture';
+}
+
 function pickString(record: Record<string, unknown>, keys: string[]): string | null {
   for (const key of keys) {
     const value = record[key];
@@ -315,6 +334,156 @@ function summarizeMarkdown(markdown: string): ProjectMarkdownValue {
     title: titleLine === null ? null : trimDetail(titleLine.slice(2).trim()),
     summary: summaryLine === null ? null : trimDetail(summaryLine),
   };
+}
+
+function readmeCandidatePaths(projectRoot: string) {
+  return ['README.md', 'README.markdown', 'README.mdown', 'README.txt', 'README']
+    .flatMap((name) => [name, name.toLowerCase()])
+    .map((name) => path.join(projectRoot, name));
+}
+
+async function readReadmeTitle(projectRoot: string) {
+  for (const readmePath of readmeCandidatePaths(projectRoot)) {
+    try {
+      const markdown = await readUtf8FileStrict(readmePath);
+      const title = summarizeMarkdown(markdown).title;
+
+      if (title && !isGenericProjectName(title)) {
+        return title;
+      }
+    } catch {
+      // README is best-effort metadata for display only; it must not degrade snapshot health.
+    }
+  }
+
+  return null;
+}
+
+function parseGitRemoteRepoName(value: string) {
+  const trimmed = value.trim();
+
+  if (trimmed.length === 0) {
+    return null;
+  }
+
+  try {
+    const remoteUrl = new URL(trimmed);
+    const segment = remoteUrl.pathname.split('/').filter(Boolean).at(-1);
+
+    return trimProjectName(segment?.replace(/\.git$/iu, '') ?? null);
+  } catch {
+    const normalized = trimmed
+      .replace(/^.+:/u, '')
+      .replace(/\\/gu, '/')
+      .replace(/\/+$/u, '');
+    const segment = normalized.split('/').filter(Boolean).at(-1);
+
+    return trimProjectName(segment?.replace(/\.git$/iu, '') ?? null);
+  }
+}
+
+function parseGitRemoteOriginName(config: string) {
+  const lines = config.split(/\r?\n/u);
+  let inOriginSection = false;
+
+  for (const line of lines) {
+    if (/^\s*\[/u.test(line)) {
+      inOriginSection = /^\s*\[remote\s+"origin"\]\s*$/u.test(line);
+      continue;
+    }
+
+    if (!inOriginSection) {
+      continue;
+    }
+
+    const url = line.match(/^\s*url\s*=\s*(?<url>.+?)\s*$/u)?.groups?.url;
+
+    if (url) {
+      return parseGitRemoteRepoName(url);
+    }
+  }
+
+  return null;
+}
+
+async function readGitConfigPath(projectRoot: string) {
+  const dotGitPath = path.join(projectRoot, '.git');
+
+  try {
+    const dotGitStats = await stat(dotGitPath);
+
+    if (dotGitStats.isDirectory()) {
+      return path.join(dotGitPath, 'config');
+    }
+
+    if (dotGitStats.isFile()) {
+      const gitFile = await readUtf8FileStrict(dotGitPath);
+      const gitDir = gitFile.match(/^\s*gitdir:\s*(?<gitDir>.+?)\s*$/imu)?.groups?.gitDir;
+
+      if (gitDir) {
+        return path.join(path.isAbsolute(gitDir) ? gitDir : path.resolve(projectRoot, gitDir), 'config');
+      }
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+async function readGitRepositoryName(projectRoot: string) {
+  const configPath = await readGitConfigPath(projectRoot);
+
+  if (!configPath) {
+    return null;
+  }
+
+  try {
+    const config = await readUtf8FileStrict(configPath);
+    const remoteName = parseGitRemoteOriginName(config);
+
+    return remoteName && !isGenericProjectName(remoteName) ? remoteName : trimProjectName(path.basename(projectRoot));
+  } catch {
+    return trimProjectName(path.basename(projectRoot));
+  }
+}
+
+async function resolveProjectDisplayName(
+  projectRoot: string,
+  projectMarkdown: ProjectMarkdownValue | null,
+  repoMeta: RepoMetaValue | null,
+): Promise<ProjectDisplayName> {
+  const readmeTitle = await readReadmeTitle(projectRoot);
+
+  if (readmeTitle) {
+    return { name: readmeTitle, source: 'readme' };
+  }
+
+  const gitName = await readGitRepositoryName(projectRoot);
+
+  if (gitName) {
+    return { name: gitName, source: 'git' };
+  }
+
+  const repoName = trimProjectName(repoMeta?.projectName);
+
+  if (repoName && !isGenericProjectName(repoName)) {
+    return { name: repoName, source: 'repoMeta' };
+  }
+
+  const directoryName = trimProjectName(path.basename(projectRoot));
+
+  if (directoryName) {
+    return { name: directoryName, source: 'directory' };
+  }
+
+  const projectTitle = trimProjectName(projectMarkdown?.title);
+
+  if (projectTitle && !isGenericProjectName(projectTitle)) {
+    return { name: projectTitle, source: 'projectMd' };
+  }
+
+  return { name: projectRoot, source: 'directory' };
 }
 
 function summarizeStateMarkdown(markdown: string): StateMarkdownValue {
@@ -1129,6 +1298,7 @@ export async function buildProjectSnapshot(projectRoot: string): Promise<Project
   );
 
   if (!hasGsdDirectory) {
+    const displayName = await resolveProjectDisplayName(projectRoot, null, null);
     const sources: ProjectSnapshotSources = {
       directory: directorySource,
       gsdDirectory: gsdDirectorySource,
@@ -1166,6 +1336,8 @@ export async function buildProjectSnapshot(projectRoot: string): Promise<Project
       identityHints: {
         gsdId: gsdIdResult.source.value?.gsdId ?? null,
         repoFingerprint: null,
+        displayName: displayName.name,
+        displayNameSource: displayName.source,
       },
       sources,
       warnings: [],
@@ -1218,6 +1390,11 @@ export async function buildProjectSnapshot(projectRoot: string): Promise<Project
     },
   );
   const gsdDbResult = await readGsdDbSummary(path.join(gsdDirectoryPath, 'gsd.db'), true);
+  const displayName = await resolveProjectDisplayName(
+    projectRoot,
+    projectMdResult.source.value ?? null,
+    repoMetaResult.source.value ?? null,
+  );
 
   const warnings = collectWarnings([
     gsdIdResult,
@@ -1248,6 +1425,8 @@ export async function buildProjectSnapshot(projectRoot: string): Promise<Project
     identityHints: {
       gsdId: gsdIdResult.source.value?.gsdId ?? null,
       repoFingerprint: repoMetaResult.source.value?.repoFingerprint ?? null,
+      displayName: displayName.name,
+      displayNameSource: displayName.source,
     },
     sources,
     warnings,
