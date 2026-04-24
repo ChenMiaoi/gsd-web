@@ -78,6 +78,15 @@ async function postJson(url: string, body?: unknown) {
   });
 }
 
+async function deleteRequest(url: string) {
+  return fetch(url, {
+    method: 'DELETE',
+    headers: {
+      accept: 'application/json',
+    },
+  });
+}
+
 function normalizeSseBuffer(buffer: string) {
   return buffer.replace(/\r\n/g, '\n');
 }
@@ -296,6 +305,73 @@ describe('project registry and snapshot contracts', () => {
 
     const health = (await healthResponse.json()) as HealthResponse;
     expect(health.projects.total).toBe(2);
+
+    await events.close();
+  });
+
+  test('deletes a registered project, removes retained history, and emits a project.deleted envelope', async () => {
+    const service = await bootService();
+    const events = await openEventStream(`${service.baseUrl}/api/events`);
+
+    await events.next();
+
+    const projectPath = await createInitializedProject(service.workspace.root, 'deletable-project');
+    const registerResponse = await postJson(`${service.baseUrl}/api/projects/register`, {
+      path: projectPath,
+    });
+
+    expect(registerResponse.status).toBe(201);
+
+    const registerMutation = (await registerResponse.json()) as ProjectMutationResponse;
+    const projectId = registerMutation.project.projectId;
+
+    const registeredEvent = await events.next();
+    expect(registeredEvent).toMatchObject({
+      type: 'project.registered',
+      projectId,
+    });
+
+    const deleteResponse = await deleteRequest(`${service.baseUrl}/api/projects/${projectId}`);
+
+    expect(deleteResponse.status).toBe(200);
+
+    const deleteMutation = (await deleteResponse.json()) as ProjectMutationResponse;
+    expect(deleteMutation.project.projectId).toBe(projectId);
+    expect(deleteMutation.event).toMatchObject({
+      type: 'project.deleted',
+      projectId: null,
+      payload: {
+        projectId,
+        canonicalPath: projectPath,
+        registeredPath: projectPath,
+      },
+    });
+
+    const deletedEvent = await events.next();
+    expect(deletedEvent).toMatchObject({
+      id: deleteMutation.event.id,
+      type: 'project.deleted',
+      projectId: null,
+      payload: {
+        projectId,
+        canonicalPath: projectPath,
+        registeredPath: projectPath,
+      },
+    });
+
+    const inventoryResponse = await fetch(`${service.baseUrl}/api/projects`);
+    expect(inventoryResponse.status).toBe(200);
+    const inventory = (await inventoryResponse.json()) as ProjectsResponse;
+    expect(inventory).toEqual({
+      items: [],
+      total: 0,
+    });
+
+    const detailResponse = await fetch(`${service.baseUrl}/api/projects/${projectId}`);
+    expect(detailResponse.status).toBe(404);
+
+    const timelineResponse = await fetch(`${service.baseUrl}/api/projects/${projectId}/timeline`);
+    expect(timelineResponse.status).toBe(404);
 
     await events.close();
   });

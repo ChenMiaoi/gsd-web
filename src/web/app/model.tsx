@@ -30,6 +30,7 @@ import {
   type ProjectContinuityState,
   type ProjectContinuitySummary,
   type ProjectDataLocation,
+  type ProjectDeletedEventPayload,
   type ProjectDetailResponse,
   type ProjectInitEventPayload,
   type ProjectInitJob,
@@ -83,6 +84,7 @@ export type KnownEventType =
   | 'service.ready'
   | 'project.registered'
   | 'project.refreshed'
+  | 'project.deleted'
   | 'project.relinked'
   | 'project.monitor.updated'
   | 'project.init.updated';
@@ -234,6 +236,7 @@ export const KNOWN_EVENT_TYPES: ReadonlySet<KnownEventType> = new Set([
   'service.ready',
   'project.registered',
   'project.refreshed',
+  'project.deleted',
   'project.relinked',
   'project.monitor.updated',
   'project.init.updated',
@@ -1250,6 +1253,17 @@ export function parseProjectRelinkEventPayload(value: unknown, label: string): P
   };
 }
 
+export function parseProjectDeletedEventPayload(value: unknown, label: string): ProjectDeletedEventPayload {
+  const record = expectRecord(value, label);
+
+  return {
+    projectId: expectString(record.projectId, `${label}.projectId`),
+    registeredPath: expectString(record.registeredPath, `${label}.registeredPath`),
+    canonicalPath: expectString(record.canonicalPath, `${label}.canonicalPath`),
+    deletedAt: expectString(record.deletedAt, `${label}.deletedAt`),
+  };
+}
+
 export function parseProjectInitEventPayload(value: unknown, label: string): ProjectInitEventPayload {
   const record = expectRecord(value, label);
   const continuity =
@@ -1270,15 +1284,20 @@ export function parseProjectInitEventPayload(value: unknown, label: string): Pro
 export function parseEventEnvelope(value: unknown): StreamSummary {
   const record = expectRecord(value, 'project event envelope');
   const type = parseKnownEventType(record.type, 'project event envelope.type');
+  const deletedProjectId =
+    type === 'project.deleted'
+      ? parseProjectDeletedEventPayload(record.payload, 'project event envelope.payload').projectId
+      : null;
+  const projectId =
+    record.projectId === undefined
+      ? null
+      : expectNullableString(record.projectId, 'project event envelope.projectId');
 
   return {
     id: expectString(record.id, 'project event envelope.id'),
     type,
     emittedAt: expectString(record.emittedAt, 'project event envelope.emittedAt'),
-    projectId:
-      record.projectId === undefined
-        ? null
-        : expectNullableString(record.projectId, 'project event envelope.projectId'),
+    projectId: projectId ?? deletedProjectId,
   };
 }
 
@@ -1301,6 +1320,8 @@ export function parseProjectMutationResponse(value: unknown): ProjectMutationRes
       payload:
         eventType === 'project.init.updated'
           ? parseProjectInitEventPayload(eventRecord.payload, 'project mutation response.event.payload')
+          : eventType === 'project.deleted'
+            ? parseProjectDeletedEventPayload(eventRecord.payload, 'project mutation response.event.payload')
           : eventType === 'project.monitor.updated'
             ? parseProjectMonitorEventPayload(eventRecord.payload, 'project mutation response.event.payload')
             : eventType === 'project.relinked'

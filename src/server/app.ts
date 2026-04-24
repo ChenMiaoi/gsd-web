@@ -32,7 +32,7 @@ export type RuntimeSignal =
     }
   | {
       event: 'route_registration';
-      method: 'GET' | 'POST';
+      method: 'GET' | 'POST' | 'DELETE';
       route: string;
     }
   | {
@@ -418,14 +418,22 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
       emitProjectEvent(app, options.logSink, event);
     });
     eventHubInstance.subscribe((event) => {
+      const payloadProjectId =
+        event.payload && typeof event.payload === 'object' && 'projectId' in event.payload
+          && typeof event.payload.projectId === 'string'
+          ? event.payload.projectId
+          : null;
+      const eventProjectId = event.projectId ?? payloadProjectId;
+
       if (
-        event.projectId
+        eventProjectId
         && (event.type === 'project.registered'
           || event.type === 'project.refreshed'
           || event.type === 'project.monitor.updated'
-          || event.type === 'project.relinked')
+          || event.type === 'project.relinked'
+          || event.type === 'project.deleted')
       ) {
-        void monitorManagerInstance.syncProject(event.projectId);
+        void monitorManagerInstance.syncProject(eventProjectId);
       }
 
       if (event.projectId && event.type === 'project.relinked') {

@@ -157,6 +157,8 @@ export interface UiCopy {
     reloadDetail: string;
     reloading: string;
     refreshSelected: string;
+    deleteProject: string;
+    deleting: string;
     relinkProject: string;
     relinking: string;
     clearRelinkPath: string;
@@ -230,6 +232,7 @@ export interface UiCopy {
     noModelUsage: string;
     selectedFolderHint: string;
     dragGraphHint: string;
+    deleteProjectConfirm: (name: string) => string;
   };
   notices: {
     registeredSuccess: (name: string) => string;
@@ -260,6 +263,7 @@ export interface UiCopy {
     relinkTimeout: string;
     initTimeout: string;
     refreshTimeout: string;
+    deleteTimeout: string;
     folderBrowserTimeout: string;
     projectRouteNotFound: (projectId: string) => string;
   };
@@ -457,6 +461,8 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       reloadDetail: 'Reload detail',
       reloading: 'Reloading...',
       refreshSelected: 'Refresh selected project',
+      deleteProject: 'Delete project',
+      deleting: 'Deleting...',
       relinkProject: 'Relink project',
       relinking: 'Relinking...',
       clearRelinkPath: 'Clear relink path',
@@ -533,6 +539,8 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       noModelUsage: 'No model usage has been recorded yet.',
       selectedFolderHint: 'Choose a folder from the service host and use it as the project path.',
       dragGraphHint: 'Drag the graph to pan. Use zoom controls when the workflow exceeds the visible area.',
+      deleteProjectConfirm: (name) =>
+        `Delete ${name} from the inventory? This removes the retained timeline and init history from gsd-web only.`,
     },
     notices: {
       registeredSuccess: (name) => `Registered ${name}.`,
@@ -569,6 +577,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       initTimeout:
         'Project initialization timed out. The current project detail stayed visible, and you can retry when the request resolves.',
       refreshTimeout: 'Project refresh timed out. The last visible snapshot is still shown while you retry.',
+      deleteTimeout: 'Project deletion timed out. The current inventory stayed visible while you retry.',
       folderBrowserTimeout: 'Server directory browsing timed out. The current path input was not changed.',
       projectRouteNotFound: (projectId) => `No registered project matches route id ${projectId}.`,
     },
@@ -825,6 +834,8 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       reloadDetail: '重新加载详情',
       reloading: '加载中...',
       refreshSelected: '刷新选中项目',
+      deleteProject: '删除项目',
+      deleting: '删除中...',
       relinkProject: '重新关联项目路径',
       relinking: '重新关联中...',
       clearRelinkPath: '清空新路径',
@@ -900,6 +911,8 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       noModelUsage: '还没有记录模型使用情况。',
       selectedFolderHint: '从服务运行机器的文件树中选择目录，并作为项目路径使用。',
       dragGraphHint: '当工作流超出可视范围时，可以拖动画布查看，并使用缩放按钮调整视图。',
+      deleteProjectConfirm: (name) =>
+        `要从清单中删除 ${name} 吗？这只会删除 gsd-web 中保留的项目记录、时间线和初始化历史，不会改动项目目录。`,
     },
     notices: {
       registeredSuccess: (name) => `已登记 ${name}。`,
@@ -931,6 +944,7 @@ export const UI_COPY: Record<Locale, UiCopy> = {
       relinkTimeout: '项目路径重新关联请求超时。当前详情、初始化历史和时间线会保持可见，可稍后重试。',
       initTimeout: '项目初始化请求超时。当前项目详情会保持可见，请求完成后可以重试。',
       refreshTimeout: '项目刷新请求超时。重试期间仍会显示最近可见快照。',
+      deleteTimeout: '项目删除请求超时。当前清单会保持可见，可稍后重试。',
       folderBrowserTimeout: '服务端目录浏览超时。当前路径输入不会改变。',
       projectRouteNotFound: (projectId) => `没有已登记项目匹配路由 ID ${projectId}。`,
     },

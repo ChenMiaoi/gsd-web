@@ -319,6 +319,8 @@ describe('service shell bootstrap', () => {
         expect.objectContaining({ method: 'GET', route: '/api/projects/:id' }),
         expect.objectContaining({ method: 'GET', route: '/api/projects/:id/timeline' }),
         expect.objectContaining({ method: 'POST', route: '/api/projects/register' }),
+        expect.objectContaining({ method: 'POST', route: '/api/projects/:id/relink' }),
+        expect.objectContaining({ method: 'DELETE', route: '/api/projects/:id' }),
         expect.objectContaining({ method: 'POST', route: '/api/projects/:id/refresh' }),
         expect.objectContaining({ method: 'POST', route: '/api/projects/:id/init' }),
         expect.objectContaining({ method: 'GET', route: '/api/events' }),

@@ -6,6 +6,7 @@ import type {
   ProjectDataLocation,
   ProjectContinuityState,
   ProjectContinuitySummary,
+  ProjectDeletedEventPayload,
   ProjectEventEnvelope,
   ProjectEventPayload,
   ProjectEventType,
@@ -791,6 +792,61 @@ export class RegistryDatabase {
         throw new DuplicateProjectError(input.canonicalPath);
       }
 
+      throw error;
+    }
+  }
+
+  deleteProject(input: {
+    projectId: string;
+    emittedAt: string;
+    eventPayload: ProjectDeletedEventPayload;
+  }): {
+    project: ProjectRecord;
+    event: ProjectEventEnvelope<ProjectDeletedEventPayload>;
+  } {
+    const existing = this.getProjectById(input.projectId);
+
+    if (!existing) {
+      throw new ProjectNotFoundError(input.projectId);
+    }
+
+    this.begin();
+
+    try {
+      this.database
+        .prepare('UPDATE projects SET last_event_sequence = NULL WHERE project_id = ?')
+        .run(input.projectId);
+
+      this.database
+        .prepare('DELETE FROM project_timeline WHERE project_id = ?')
+        .run(input.projectId);
+
+      this.database
+        .prepare('DELETE FROM init_jobs WHERE project_id = ?')
+        .run(input.projectId);
+
+      this.database
+        .prepare('DELETE FROM project_events WHERE project_id = ?')
+        .run(input.projectId);
+
+      const deleteResult = this.database
+        .prepare('DELETE FROM projects WHERE project_id = ?')
+        .run(input.projectId);
+
+      if (Number(deleteResult.changes) !== 1) {
+        throw new ProjectNotFoundError(input.projectId);
+      }
+
+      const event = this.insertEvent('project.deleted', null, input.emittedAt, input.eventPayload);
+
+      this.commit();
+
+      return {
+        project: existing,
+        event,
+      };
+    } catch (error) {
+      this.rollback();
       throw error;
     }
   }

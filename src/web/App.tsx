@@ -108,6 +108,8 @@ export default function App() {
   const [relinkPending, setRelinkPending] = useState(false);
   const [relinkError, setRelinkError] = useState<string | null>(null);
   const [relinkSuccess, setRelinkSuccess] = useState<string | null>(null);
+  const [deletePending, setDeletePending] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [refreshPending, setRefreshPending] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [initPendingProjectId, setInitPendingProjectId] = useState<string | null>(null);
@@ -211,6 +213,7 @@ export default function App() {
     setRelinkPath('');
     setRelinkError(null);
     setRelinkSuccess(null);
+    setDeleteError(null);
   }, [selectedProjectId]);
 
   const loadProjectDetail = useCallback(async (projectId: string, fallbackProject?: ProjectRecord | null) => {
@@ -577,6 +580,24 @@ export default function App() {
           return;
         }
 
+        if (summary.type === 'project.deleted') {
+          const deletedSelectedProject = summary.projectId !== null && selectedProjectIdRef.current === summary.projectId;
+          const currentRoute = parseAppRoute(window.location.pathname);
+
+          if (
+            summary.projectId !== null
+            && currentRoute.page === 'details'
+            && currentRoute.projectId === summary.projectId
+          ) {
+            navigateToRoute({ page: 'overview' });
+          }
+
+          void syncInventory(deletedSelectedProject ? null : selectedProjectIdRef.current, {
+            fallbackToFirstProject: !deletedSelectedProject,
+          });
+          return;
+        }
+
         if (
           summary.type === 'project.registered'
           || summary.type === 'project.refreshed'
@@ -622,6 +643,7 @@ export default function App() {
     eventSource.addEventListener('service.ready', handleEnvelope as EventListener);
     eventSource.addEventListener('project.registered', handleEnvelope as EventListener);
     eventSource.addEventListener('project.refreshed', handleEnvelope as EventListener);
+    eventSource.addEventListener('project.deleted', handleEnvelope as EventListener);
     eventSource.addEventListener('project.relinked', handleEnvelope as EventListener);
     eventSource.addEventListener('project.monitor.updated', handleEnvelope as EventListener);
     eventSource.addEventListener('project.init.updated', handleEnvelope as EventListener);
@@ -630,12 +652,13 @@ export default function App() {
       eventSource.removeEventListener('service.ready', handleEnvelope as EventListener);
       eventSource.removeEventListener('project.registered', handleEnvelope as EventListener);
       eventSource.removeEventListener('project.refreshed', handleEnvelope as EventListener);
+      eventSource.removeEventListener('project.deleted', handleEnvelope as EventListener);
       eventSource.removeEventListener('project.relinked', handleEnvelope as EventListener);
       eventSource.removeEventListener('project.monitor.updated', handleEnvelope as EventListener);
       eventSource.removeEventListener('project.init.updated', handleEnvelope as EventListener);
       eventSource.close();
     };
-  }, [resyncAfterReconnect, syncInitDetailAfterSuccess, syncInventory]);
+  }, [navigateToRoute, resyncAfterReconnect, syncInitDetailAfterSuccess, syncInventory]);
 
   const selectProject = useCallback(
     (project: ProjectRecord, options: { updateRoute?: boolean } = {}) => {
@@ -989,6 +1012,74 @@ export default function App() {
     }
   }, [copy.errors.initTimeout, copy.errors.unexpected]);
 
+  const handleDeleteSelected = useCallback(async () => {
+    const selected = selectedProjectRef.current;
+
+    if (!selected) {
+      return;
+    }
+
+    const confirmed = window.confirm(copy.messages.deleteProjectConfirm(describeProject(selected)));
+
+    if (!confirmed) {
+      return;
+    }
+
+    setDeletePending(true);
+    setDeleteError(null);
+
+    try {
+      const response = await requestJson(
+        `/api/projects/${selected.projectId}`,
+        {
+          method: 'DELETE',
+          headers: {
+            accept: 'application/json',
+          },
+        },
+        parseProjectMutationResponse,
+        'Project deletion',
+      );
+
+      if (!mountedRef.current) {
+        return;
+      }
+
+      setProjects((current) => current.filter((project) => project.projectId !== response.project.projectId));
+      selectedProjectIdRef.current = null;
+      setSelectedProjectId(null);
+      setSelectedProject(null);
+      setProjectTimeline({ items: [], total: 0 });
+      setDetailError(null);
+      setTimelineError(null);
+      setRefreshError(null);
+      setInitError(null);
+      setRelinkError(null);
+      setRelinkSuccess(null);
+      setRelinkPath('');
+      navigateToRoute({ page: 'overview' });
+      void syncInventory(null, {
+        fallbackToFirstProject: false,
+      });
+    } catch (error) {
+      if (!mountedRef.current) {
+        return;
+      }
+
+      setDeleteError(
+        formatRequestError(
+          error,
+          copy.errors.deleteTimeout,
+          copy.errors.unexpected,
+        ),
+      );
+    } finally {
+      if (mountedRef.current) {
+        setDeletePending(false);
+      }
+    }
+  }, [copy.errors.deleteTimeout, copy.errors.unexpected, copy.messages, navigateToRoute, syncInventory]);
+
   const handleRefreshSelected = useCallback(async () => {
     if (!selectedProjectIdRef.current) {
       return;
@@ -1079,6 +1170,7 @@ export default function App() {
     selectedProject === null
       ? true
       : selectedInitRequestPending ||
+        deletePending ||
         selectedInitSyncingDetail ||
         hasActiveInitJob(selectedInitJob);
   const selectedInitSummary = summarizeInitJob(selectedInitJob, copy);
@@ -1751,6 +1843,11 @@ export default function App() {
           {initError ? (
             <p className="inline-alert inline-alert--error" role="alert" data-testid="init-error">
               {initError}
+            </p>
+          ) : null}
+          {deleteError ? (
+            <p className="inline-alert inline-alert--error" role="alert" data-testid="delete-error">
+              {deleteError}
             </p>
           ) : null}
 
@@ -2646,9 +2743,20 @@ export default function App() {
                   onClick={() => {
                     void handleRefreshSelected();
                   }}
-                  disabled={!selectedProjectId || refreshPending}
+                  disabled={!selectedProjectId || refreshPending || deletePending}
                 >
                   {refreshPending ? copy.actions.refreshing : copy.actions.refreshSelected}
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  data-testid="delete-project-action"
+                  onClick={() => {
+                    void handleDeleteSelected();
+                  }}
+                  disabled={!selectedProjectId || deletePending}
+                >
+                  {deletePending ? copy.actions.deleting : copy.actions.deleteProject}
                 </button>
               </div>
             ) : null}

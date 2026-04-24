@@ -405,6 +405,7 @@ export type ProjectEventType =
   | 'service.ready'
   | 'project.registered'
   | 'project.refreshed'
+  | 'project.deleted'
   | 'project.relinked'
   | 'project.monitor.updated'
   | 'project.init.updated';
@@ -443,6 +444,13 @@ export interface ProjectRelinkEventPayload {
   monitor: ProjectMonitorSummary;
 }
 
+export interface ProjectDeletedEventPayload {
+  projectId: string;
+  registeredPath: string;
+  canonicalPath: string;
+  deletedAt: string;
+}
+
 export interface ProjectMonitorEventPayload {
   projectId: string;
   canonicalPath: string;
@@ -466,6 +474,7 @@ export interface ProjectInitEventPayload {
 export type ProjectEventPayload =
   | ServiceReadyEventPayload
   | ProjectSnapshotEventPayload
+  | ProjectDeletedEventPayload
   | ProjectRelinkEventPayload
   | ProjectMonitorEventPayload
   | ProjectInitEventPayload;

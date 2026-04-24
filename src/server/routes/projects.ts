@@ -641,6 +641,40 @@ export async function registerProjectRoutes(
     }
   });
 
+  app.delete<{ Params: { id: string } }>('/api/projects/:id', async (request, reply) => {
+    const existingProject = options.registry.getProjectById(request.params.id);
+
+    if (!existingProject) {
+      return sendError(reply, 404, `Project ${request.params.id} was not found.`, 'project_not_found');
+    }
+
+    try {
+      const emittedAt = new Date().toISOString();
+      const result = options.registry.deleteProject({
+        projectId: existingProject.projectId,
+        emittedAt,
+        eventPayload: {
+          projectId: existingProject.projectId,
+          registeredPath: existingProject.registeredPath,
+          canonicalPath: existingProject.canonicalPath,
+          deletedAt: emittedAt,
+        },
+      });
+      const response = toMutationResponse(result);
+
+      options.eventHub.broadcast(response.event);
+
+      return reply.code(200).send(response);
+    } catch (error) {
+      if (isNotFoundError(error)) {
+        return sendError(reply, 404, error.message, 'project_not_found');
+      }
+
+      request.log.error({ err: error, projectId: existingProject.projectId }, 'Failed to delete project');
+      return sendError(reply, 500, 'Failed to delete project.', 'project_delete_failed');
+    }
+  });
+
   app.post<{ Params: { id: string } }>('/api/projects/:id/refresh', async (request, reply) => {
     const existingProject = options.registry.getProjectById(request.params.id);
 
@@ -757,6 +791,10 @@ export async function registerProjectRoutes(
     {
       method: 'POST' as const,
       route: '/api/projects/:id/relink',
+    },
+    {
+      method: 'DELETE' as const,
+      route: '/api/projects/:id',
     },
     {
       method: 'POST' as const,

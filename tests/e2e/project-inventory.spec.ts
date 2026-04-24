@@ -287,6 +287,31 @@ test.describe('hosted dashboard inventory flow', () => {
     await expect(page.getByTestId('detail-route-fallback')).toHaveCount(0);
   });
 
+  test('deletes the selected project and exits the detail route', async ({ page, harness }) => {
+    const projectPath = await createInitializedProject(harness.workspace.root, 'deletable-project');
+    const registration = await registerProject(harness.baseUrl, projectPath);
+
+    await page.goto(`${harness.baseUrl}/lazy/employee-${registration.project.projectId}`);
+    await expect(page.getByTestId('detail-project-id-value')).toContainText(registration.project.projectId);
+
+    page.once('dialog', (dialog) => {
+      void dialog.accept();
+    });
+
+    await Promise.all([
+      page.waitForResponse((response) =>
+        response.request().method() === 'DELETE'
+        && response.url().endsWith(`/api/projects/${registration.project.projectId}`),
+      ),
+      page.getByTestId('delete-project-action').click(),
+    ]);
+
+    await expect(page).toHaveURL(`${harness.baseUrl}/lazy/boss`);
+    await expect(page.getByText(/No registered projects yet\.|还没有登记项目。/)).toBeVisible();
+    await expect(page.getByTestId(`overview-project-card-${registration.project.projectId}`)).toHaveCount(0);
+    await expect(page.getByTestId('delete-error')).toHaveCount(0);
+  });
+
   test('registers empty and degraded projects, then refreshes live detail', async ({ page, harness }) => {
     const emptyProjectPath = await createEmptyProject(harness.workspace.root, 'empty-project');
     const partialProjectPath = await createInitializedProject(harness.workspace.root, 'partial-project', {
