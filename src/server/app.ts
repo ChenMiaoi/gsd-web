@@ -109,6 +109,40 @@ function resolveOptionalEnvPath(env: NodeJS.ProcessEnv, name: string): string | 
   return value ? path.resolve(value) : undefined;
 }
 
+function resolveOptionalEnvInteger(env: NodeJS.ProcessEnv, name: string): number | undefined {
+  const value = env[name]?.trim();
+
+  if (!value) {
+    return undefined;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+
+  return parsed;
+}
+
+function resolveOptionalEnvBoolean(env: NodeJS.ProcessEnv, name: string): boolean | undefined {
+  const value = env[name]?.trim().toLowerCase();
+
+  if (!value) {
+    return undefined;
+  }
+
+  if (['1', 'true', 'yes', 'on'].includes(value)) {
+    return true;
+  }
+
+  if (['0', 'false', 'no', 'off'].includes(value)) {
+    return false;
+  }
+
+  throw new Error(`${name} must be a boolean value`);
+}
+
 async function assertReadableFile(filePath: string, message: string) {
   try {
     await access(filePath, constants.R_OK);
@@ -317,6 +351,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
           level: process.env.GSD_WEB_LOG_LEVEL?.trim() || process.env.LOG_LEVEL?.trim() || 'info',
           file: activeLogFilePath ?? path.join(logDir, 'gsd-web.log'),
         },
+    disableRequestLogging: !(resolveOptionalEnvBoolean(process.env, 'GSD_WEB_REQUEST_LOGS') ?? false),
     forceCloseConnections: true,
   }) as unknown as GsdWebApp;
   app.gsdWebPaths = {
@@ -355,7 +390,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
       ...(options.logSink === undefined ? {} : { signalSink: options.logSink }),
     });
     const monitorManagerInstance = new ProjectMonitorManager(registryInstance, reconciler, eventHubInstance, {
-      intervalMs: options.monitorIntervalMs ?? DEFAULT_MONITOR_INTERVAL_MS,
+      intervalMs:
+        options.monitorIntervalMs
+        ?? resolveOptionalEnvInteger(process.env, 'GSD_WEB_MONITOR_INTERVAL_MS')
+        ?? DEFAULT_MONITOR_INTERVAL_MS,
       ...(options.watchersEnabled === undefined ? {} : { watchersEnabled: options.watchersEnabled }),
       log: app.log,
       ...(options.logSink === undefined ? {} : { signalSink: options.logSink }),

@@ -11,7 +11,7 @@ import {
 } from './project-reconcile.js';
 import type { EventHub } from './routes/events.js';
 
-export const DEFAULT_MONITOR_INTERVAL_MS = 1_000;
+export const DEFAULT_MONITOR_INTERVAL_MS = 10_000;
 export const DEFAULT_WATCHER_DEBOUNCE_MS = 75;
 export const DEFAULT_WATCHER_READY_TIMEOUT_MS = 1_000;
 
@@ -30,7 +30,7 @@ export interface ProjectMonitorManagerOptions {
   watcherDebounceMs?: number;
   watcherReadyTimeoutMs?: number;
   watchersEnabled?: boolean;
-  log?: Pick<FastifyBaseLogger, 'error' | 'warn' | 'info'>;
+  log?: Pick<FastifyBaseLogger, 'debug' | 'error' | 'warn' | 'info'>;
   signalSink?: (signal: ProjectMonitorSignal | ProjectReconcileSignal) => void;
 }
 
@@ -65,6 +65,14 @@ function normalizeRelativePath(projectRoot: string, candidatePath: string) {
 }
 
 function isWatchedRelativePath(relativePath: string) {
+  if (
+    relativePath === '.gsd/gsd.db-shm'
+    || relativePath === '.gsd/gsd.db-wal'
+    || relativePath === '.gsd/gsd.db-journal'
+  ) {
+    return false;
+  }
+
   return (
     relativePath === ''
     || relativePath === '.gsd-id'
@@ -233,29 +241,32 @@ export class ProjectMonitorManager {
     const projects = this.registry.listProjects();
 
     for (const project of projects) {
-      void this.reconciler
-        .reconcileProject(project.projectId, {
+      if (this.closed) {
+        return;
+      }
+
+      try {
+        const result = await this.reconciler.reconcileProject(project.projectId, {
           trigger,
           emitRefreshEventOnNoChange: false,
-        })
-        .then((result) => {
-          if (result.status === 'failed') {
-            this.options.log?.warn?.(
-              {
-                projectId: project.projectId,
-                trigger,
-                error: result.error.message,
-              },
-              'Project monitor reconcile recorded a degraded state',
-            );
-          }
-        })
-        .catch((error) => {
-          this.options.log?.error?.(
-            { err: error, projectId: project.projectId, trigger },
-            'Project monitor reconcile sweep failed unexpectedly',
-          );
         });
+
+        if (result.status === 'failed') {
+          this.options.log?.warn?.(
+            {
+              projectId: project.projectId,
+              trigger,
+              error: result.error.message,
+            },
+            'Project monitor reconcile recorded a degraded state',
+          );
+        }
+      } catch (error) {
+        this.options.log?.error?.(
+          { err: error, projectId: project.projectId, trigger },
+          'Project monitor reconcile sweep failed unexpectedly',
+        );
+      }
     }
   }
 

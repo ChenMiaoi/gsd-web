@@ -459,7 +459,7 @@ export class ProjectReconciler {
     private readonly eventHub: EventHub,
     private readonly options: {
       snapshotTimeoutMs?: number;
-      log?: Pick<FastifyBaseLogger, 'error' | 'warn' | 'info'>;
+      log?: Pick<FastifyBaseLogger, 'debug' | 'error' | 'warn' | 'info'>;
       signalSink?: (signal: ProjectReconcileSignal) => void;
     } = {},
   ) {}
@@ -496,7 +496,7 @@ export class ProjectReconciler {
         queuedTrigger: state.queued.options.trigger,
         reason,
       });
-      this.options.log?.info?.(
+      this.options.log?.debug?.(
         {
           event: 'project-reconcile-queued',
           projectId,
@@ -543,17 +543,20 @@ export class ProjectReconciler {
       queuedTrigger: state.queued?.options.trigger ?? null,
       reason,
     });
-    this.options.log?.info?.(
-      {
-        event: 'project-reconcile-started',
-        projectId,
-        trigger: options.trigger,
-        reason,
-        emitRefreshEventOnNoChange: Boolean(options.emitRefreshEventOnNoChange),
-        queuedTrigger: state.queued?.options.trigger ?? null,
-      },
-      'Started project reconcile',
-    );
+    const startLogContext = {
+      event: 'project-reconcile-started',
+      projectId,
+      trigger: options.trigger,
+      reason,
+      emitRefreshEventOnNoChange: Boolean(options.emitRefreshEventOnNoChange),
+      queuedTrigger: state.queued?.options.trigger ?? null,
+    };
+
+    if (options.trigger === 'monitor_interval') {
+      this.options.log?.debug?.(startLogContext, 'Started project reconcile');
+    } else {
+      this.options.log?.info?.(startLogContext, 'Started project reconcile');
+    }
 
     const promise = this.performReconcile(projectId, options);
     state.active = {
@@ -574,19 +577,28 @@ export class ProjectReconciler {
           healthChanged: result.healthChanged,
           emittedEventType: result.event?.type ?? null,
         });
-        this.options.log?.info?.(
-          {
-            event: 'project-reconcile-completed',
-            projectId,
-            trigger: options.trigger,
-            reason,
-            status: result.status,
-            changed: result.status === 'success' ? result.changed : false,
-            healthChanged: result.healthChanged,
-            emittedEventType: result.event?.type ?? null,
-          },
-          'Completed project reconcile',
-        );
+        const isNoisyMonitorNoOp =
+          options.trigger === 'monitor_interval'
+          && result.status === 'success'
+          && !result.changed
+          && !result.healthChanged
+          && result.event === null;
+        const completedLogContext = {
+          event: 'project-reconcile-completed',
+          projectId,
+          trigger: options.trigger,
+          reason,
+          status: result.status,
+          changed: result.status === 'success' ? result.changed : false,
+          healthChanged: result.healthChanged,
+          emittedEventType: result.event?.type ?? null,
+        };
+
+        if (isNoisyMonitorNoOp) {
+          this.options.log?.debug?.(completedLogContext, 'Completed project reconcile');
+        } else {
+          this.options.log?.info?.(completedLogContext, 'Completed project reconcile');
+        }
       })
       .catch((error) => {
         this.options.log?.error?.(

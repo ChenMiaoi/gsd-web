@@ -145,6 +145,8 @@ The `/lazy` base path is intentional: the dashboard is for avoiding manual statu
 | `GSD_WEB_LOG_DIR` | `~/.gsd-web/logs` | Log directory |
 | `GSD_WEB_LOG_FILE` | `~/.gsd-web/logs/gsd-web.log` | JSONL service log |
 | `GSD_WEB_LOG_LEVEL` | `info` | Service log level |
+| `GSD_WEB_REQUEST_LOGS` | `false` | Enable HTTP request access logs |
+| `GSD_WEB_MONITOR_INTERVAL_MS` | `10000` | Periodic project monitor backstop interval |
 | `GSD_WEB_CLIENT_DIST_DIR` | packaged browser build | Static frontend directory |
 | `GSD_BIN_PATH` | `gsd` | Executable used by the init runner |
 

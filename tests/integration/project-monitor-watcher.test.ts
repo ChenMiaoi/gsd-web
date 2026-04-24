@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { writeFile } from 'node:fs/promises';
 import { TextDecoder } from 'node:util';
 import type { AddressInfo } from 'node:net';
 
@@ -268,6 +269,21 @@ describe('project monitor watcher scheduling', () => {
         && signal.phase === 'attached'
         && signal.projectId === projectId,
     );
+
+    const sqliteArtifactSignalStart = service.runtimeSignals.length;
+    await writeFile(path.join(projectRoot, '.gsd', 'gsd.db-shm'), 'sqlite transient state\n');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(
+      service.runtimeSignals
+        .slice(sqliteArtifactSignalStart)
+        .some(
+          (signal) =>
+            signal.event === 'project_watcher'
+            && signal.phase === 'hint'
+            && signal.projectId === projectId
+            && signal.relativePath === '.gsd/gsd.db-shm',
+        ),
+    ).toBe(false);
 
     const degradedRepoMeta = '{"currentBranch":';
     await writeRepoMeta(projectRoot, degradedRepoMeta);
