@@ -121,6 +121,11 @@ export interface ProjectMarkdownValue {
 
 export interface StateMarkdownValue {
   summary: string;
+  activeMilestoneId: string | null;
+  activeSliceId: string | null;
+  activeTaskId: string | null;
+  phase: string | null;
+  nextAction: string | null;
 }
 
 export interface GsdDbSummaryValue {

@@ -487,15 +487,46 @@ async function resolveProjectDisplayName(
 }
 
 function summarizeStateMarkdown(markdown: string): StateMarkdownValue {
-  const summary = markdown
+  const lines = markdown
     .split(/\r?\n/u)
     .map((line) => line.trim())
-    .filter((line) => line.length > 0)
+    .filter((line) => line.length > 0);
+  const summary = lines
     .slice(0, 3)
     .join(' ');
+  const pickLabelValue = (label: string) => {
+    const pattern = new RegExp(`^\\*\\*${label}:\\*\\*\\s*(.+)$|^${label}:\\s*(.+)$`, 'iu');
+    const line = lines.find((entry) => pattern.test(entry));
+
+    const match = line?.match(pattern);
+
+    return (match?.[1] ?? match?.[2])?.trim() ?? null;
+  };
+  const pickSectionText = (heading: string) => {
+    const index = lines.findIndex((entry) => new RegExp(`^#+\\s+${heading}$`, 'iu').test(entry));
+
+    if (index === -1) {
+      return null;
+    }
+
+    return lines.slice(index + 1).find((entry) => !entry.startsWith('#')) ?? null;
+  };
+  const pickId = (value: string | null, prefix: string) => {
+    if (!value) {
+      return null;
+    }
+
+    return new RegExp(`\\b(${prefix}\\d+)\\b`, 'iu').exec(value)?.[1]?.toUpperCase() ?? null;
+  };
+  const nextAction = pickLabelValue('Next Action') ?? pickSectionText('Next Action');
 
   return {
     summary: trimDetail(summary.length === 0 ? 'STATE.md was present but empty.' : summary),
+    activeMilestoneId: pickId(pickLabelValue('Active Milestone'), 'M'),
+    activeSliceId: pickId(pickLabelValue('Active Slice'), 'S'),
+    activeTaskId: pickId(nextAction, 'T'),
+    phase: pickLabelValue('Phase'),
+    nextAction,
   };
 }
 
@@ -605,6 +636,22 @@ function isCompletedStatus(status: string | null) {
   return status !== null && /^(complete|completed|done|succeeded|success)$/iu.test(status.trim());
 }
 
+function isActiveStatus(status: string | null) {
+  return status !== null && /^(active|running|executing|in_progress|in-progress|current)$/iu.test(status.trim());
+}
+
+function normalizeWorkflowId(value: string | null) {
+  return value?.trim().toUpperCase() ?? null;
+}
+
+function mergeRuntimeStatus(status: string | null, active: boolean) {
+  if (!active || isCompletedStatus(status) || isActiveStatus(status)) {
+    return status;
+  }
+
+  return 'active';
+}
+
 function parseStringList(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean);
@@ -639,11 +686,23 @@ function parseStringList(value: unknown): string[] {
     .filter(Boolean);
 }
 
-function summarizeGsdTask(row: Record<string, unknown>, fallbackId: string): GsdDbTaskSummary {
+function summarizeGsdTask(
+  row: Record<string, unknown>,
+  fallbackId: string,
+  state: StateMarkdownValue | null,
+): GsdDbTaskSummary {
+  const milestoneId = normalizeWorkflowId(pickString(row, ['milestone_id', 'milestoneId', 'milestone', 'parentMilestoneId']));
+  const sliceId = normalizeWorkflowId(pickString(row, ['slice_id', 'sliceId', 'slice', 'parentSliceId']));
+  const taskId = pickString(row, ['id', 'taskId', 'task_id', 'key', 'slug']) ?? fallbackId;
+  const status = pickString(row, ['status', 'state', 'phase']);
+  const active = normalizeWorkflowId(taskId) === normalizeWorkflowId(state?.activeTaskId ?? null)
+    && (state?.activeSliceId === null || sliceId === normalizeWorkflowId(state?.activeSliceId ?? null))
+    && (state?.activeMilestoneId === null || milestoneId === null || milestoneId === normalizeWorkflowId(state?.activeMilestoneId ?? null));
+
   return {
-    id: pickString(row, ['id', 'taskId', 'task_id', 'key', 'slug']) ?? fallbackId,
+    id: taskId,
     title: pickString(row, ['title', 'name', 'summary', 'description']),
-    status: pickString(row, ['status', 'state', 'phase']),
+    status: mergeRuntimeStatus(status, active),
     risk: pickString(row, ['risk', 'priority', 'severity']),
     startedAt: pickWorkflowTimestamp(row, 'started'),
     finishedAt: pickWorkflowTimestamp(row, 'finished'),
@@ -658,6 +717,7 @@ function summarizeGsdMilestones(input: {
   milestones: Array<Record<string, unknown>>;
   slices: Array<Record<string, unknown>>;
   tasks: Array<Record<string, unknown>>;
+  state: StateMarkdownValue | null;
 }): GsdDbMilestoneSummary[] {
   const tasksBySlice = new Map<string, GsdDbTaskSummary[]>();
 
@@ -671,7 +731,7 @@ function summarizeGsdMilestones(input: {
 
     const key = workflowParentKey(milestoneId, sliceId);
     const tasks = tasksBySlice.get(key) ?? [];
-    tasks.push(summarizeGsdTask(row, `T${String(index + 1).padStart(2, '0')}`));
+    tasks.push(summarizeGsdTask(row, `T${String(index + 1).padStart(2, '0')}`, input.state));
     tasksBySlice.set(key, tasks);
   }
 
@@ -689,11 +749,14 @@ function summarizeGsdMilestones(input: {
       ?? tasksBySlice.get(workflowParentKey(null, sliceId))
       ?? [];
     const slices = slicesByMilestone.get(milestoneId) ?? [];
+    const status = pickString(row, ['status', 'state', 'phase']);
+    const active = normalizeWorkflowId(sliceId) === normalizeWorkflowId(input.state?.activeSliceId ?? null)
+      && (input.state?.activeMilestoneId === null || normalizeWorkflowId(milestoneId) === normalizeWorkflowId(input.state?.activeMilestoneId ?? null));
 
     slices.push({
       id: sliceId,
       title: pickString(row, ['title', 'name', 'summary', 'description']),
-      status: pickString(row, ['status', 'state', 'phase']),
+      status: mergeRuntimeStatus(status, active || tasks.some((task) => isActiveStatus(task.status))),
       risk: pickString(row, ['risk', 'priority', 'severity']),
       startedAt: pickWorkflowTimestamp(row, 'started'),
       finishedAt: pickWorkflowTimestamp(row, 'finished'),
@@ -710,11 +773,13 @@ function summarizeGsdMilestones(input: {
     const slices = slicesByMilestone.get(milestoneId) ?? [];
     const taskCount = slices.reduce((total, slice) => total + slice.taskCount, 0);
     const completedTaskCount = slices.reduce((total, slice) => total + slice.completedTaskCount, 0);
+    const status = pickString(row, ['status', 'state', 'phase']);
+    const active = normalizeWorkflowId(milestoneId) === normalizeWorkflowId(input.state?.activeMilestoneId ?? null);
 
     return {
       id: milestoneId,
       title: pickString(row, ['title', 'name', 'summary', 'description']),
-      status: pickString(row, ['status', 'state', 'phase']),
+      status: mergeRuntimeStatus(status, active || slices.some((slice) => isActiveStatus(slice.status))),
       startedAt: pickWorkflowTimestamp(row, 'started'),
       finishedAt: pickWorkflowTimestamp(row, 'finished'),
       sliceCount: slices.length,
@@ -878,7 +943,11 @@ function summarizeGsdMetrics(record: Record<string, unknown>): GsdMetricsSummary
   };
 }
 
-async function readGsdDbSummary(filePath: string, warnOnMissing: boolean): Promise<SourceReadResult<GsdDbSummaryValue>> {
+async function readGsdDbSummary(
+  filePath: string,
+  warnOnMissing: boolean,
+  state: StateMarkdownValue | null,
+): Promise<SourceReadResult<GsdDbSummaryValue>> {
   try {
     await access(filePath, constants.R_OK);
   } catch (error) {
@@ -912,6 +981,35 @@ async function readGsdDbSummary(filePath: string, warnOnMissing: boolean): Promi
 
       const tableNames = tableRows.map((row) => row.name);
       const tableNameSet = new Set(tableNames);
+      const tableColumns = new Map<string, Set<string>>();
+      const getTableColumns = (tableName: string) => {
+        const cached = tableColumns.get(tableName);
+
+        if (cached) {
+          return cached;
+        }
+
+        const columns = new Set(
+          (database.prepare(`PRAGMA table_info(${tableName})`).all() as unknown as Array<{ name: string }>)
+            .map((row) => row.name),
+        );
+        tableColumns.set(tableName, columns);
+
+        return columns;
+      };
+      const orderClauseFor = (tableName: 'milestones' | 'slices' | 'tasks' | 'slice_dependencies') => {
+        const columns = getTableColumns(tableName);
+        const orderedColumns = [
+          'milestone_id',
+          'sequence',
+          tableName === 'slice_dependencies' ? 'slice_id' : null,
+          tableName === 'tasks' ? 'slice_id' : null,
+          'id',
+          'depends_on_slice_id',
+        ].filter((column): column is string => column !== null && columns.has(column));
+
+        return orderedColumns.length > 0 ? ` ORDER BY ${orderedColumns.join(' ASC, ')} ASC` : '';
+      };
       const countIfPresent = (tableName: string) => {
         if (!tableNameSet.has(tableName)) {
           return null;
@@ -928,7 +1026,7 @@ async function readGsdDbSummary(filePath: string, warnOnMissing: boolean): Promi
           return [] as Array<Record<string, unknown>>;
         }
 
-        return database.prepare(`SELECT * FROM ${tableName} LIMIT 80`).all() as unknown as Array<
+        return database.prepare(`SELECT * FROM ${tableName}${orderClauseFor(tableName)} LIMIT 80`).all() as unknown as Array<
           Record<string, unknown>
         >;
       };
@@ -947,6 +1045,7 @@ async function readGsdDbSummary(filePath: string, warnOnMissing: boolean): Promi
             milestones: rowsIfPresent('milestones'),
             slices: rowsIfPresent('slices'),
             tasks: rowsIfPresent('tasks'),
+            state,
           }),
           dependencies: summarizeGsdSliceDependencies({
             slices: rowsIfPresent('slices'),
@@ -1389,7 +1488,11 @@ export async function buildProjectSnapshot(projectRoot: string): Promise<Project
       warnOnMissing: false,
     },
   );
-  const gsdDbResult = await readGsdDbSummary(path.join(gsdDirectoryPath, 'gsd.db'), true);
+  const gsdDbResult = await readGsdDbSummary(
+    path.join(gsdDirectoryPath, 'gsd.db'),
+    true,
+    stateMdResult.source.value ?? null,
+  );
   const displayName = await resolveProjectDisplayName(
     projectRoot,
     projectMdResult.source.value ?? null,

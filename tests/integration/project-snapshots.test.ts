@@ -445,10 +445,60 @@ describe('project registry and snapshot contracts', () => {
     });
     expect(secondSlice).toMatchObject({
       id: 'S01',
-      status: 'pending',
+      status: 'active',
       taskCount: 1,
       completedTaskCount: 0,
       tasks: [expect.objectContaining({ id: 'T01', title: 'Active second task', status: 'active' })],
+    });
+  });
+
+  test('uses STATE.md active slice and next action when database rows are still pending', async () => {
+    const service = await bootService();
+    const projectPath = await createInitializedProject(service.workspace.root, 'state-active-project', {
+      stateMdContent: `# GSD State
+
+**Active Milestone:** M001: Fixture milestone
+**Active Slice:** S01: Fixture setup
+**Phase:** executing
+
+## Next Action
+Resume interrupted work on T01: Completed task in slice S01.
+`,
+    });
+    const database = new DatabaseSync(path.join(projectPath, '.gsd', 'gsd.db'));
+
+    try {
+      database.exec(`
+        UPDATE milestones SET status = 'active' WHERE id = 'M001';
+        UPDATE slices SET status = 'pending';
+        UPDATE tasks SET status = 'pending';
+      `);
+    } finally {
+      database.close();
+    }
+
+    const registerResponse = await postJson(`${service.baseUrl}/api/projects/register`, {
+      path: projectPath,
+    });
+
+    expect(registerResponse.status).toBe(201);
+
+    const mutation = (await registerResponse.json()) as ProjectMutationResponse;
+    const gsdDb = mutation.project.snapshot.sources.gsdDb.value;
+    const stateMd = mutation.project.snapshot.sources.stateMd.value;
+    const milestone = gsdDb?.milestones.find((entry) => entry.id === 'M001');
+    const firstSlice = milestone?.slices[0];
+
+    expect(stateMd).toMatchObject({
+      activeMilestoneId: 'M001',
+      activeSliceId: 'S01',
+      activeTaskId: 'T01',
+      phase: 'executing',
+    });
+    expect(firstSlice).toMatchObject({
+      id: 'S01',
+      status: 'active',
+      tasks: [expect.objectContaining({ id: 'T01', status: 'active' })],
     });
   });
 

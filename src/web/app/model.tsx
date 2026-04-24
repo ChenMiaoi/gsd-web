@@ -532,6 +532,11 @@ export function parseStateMarkdown(value: unknown, label: string) {
 
   return {
     summary: expectString(record.summary, `${label}.summary`),
+    activeMilestoneId: expectNullableString(record.activeMilestoneId ?? null, `${label}.activeMilestoneId`),
+    activeSliceId: expectNullableString(record.activeSliceId ?? null, `${label}.activeSliceId`),
+    activeTaskId: expectNullableString(record.activeTaskId ?? null, `${label}.activeTaskId`),
+    phase: expectNullableString(record.phase ?? null, `${label}.phase`),
+    nextAction: expectNullableString(record.nextAction ?? null, `${label}.nextAction`),
   };
 }
 
@@ -2416,29 +2421,12 @@ export function buildTaskTimelineEntries(
   }
 
   return entries.sort((first, second) => {
-    const firstStatusRank = getTaskTimelineStatusRank(first);
-    const secondStatusRank = getTaskTimelineStatusRank(second);
-
-    if (firstStatusRank !== secondStatusRank) {
-      return firstStatusRank - secondStatusRank;
-    }
-
-    const firstActivityMs = getTaskTimelineActivityTime(first);
-    const secondActivityMs = getTaskTimelineActivityTime(second);
-
-    if (firstActivityMs !== null && secondActivityMs !== null && firstActivityMs !== secondActivityMs) {
-      return secondActivityMs - firstActivityMs;
-    }
-
-    if (firstActivityMs !== null && secondActivityMs === null) {
-      return -1;
-    }
-
-    if (firstActivityMs === null && secondActivityMs !== null) {
-      return 1;
-    }
-
-    return first.order - second.order;
+    return compareWorkflowSequenceOrder(
+      first.order,
+      second.order,
+      first.task.status,
+      second.task.status,
+    );
   });
 }
 
@@ -2601,6 +2589,22 @@ export function getWorkflowStatusRank(status: string | null) {
   }
 
   return 4;
+}
+
+export function compareWorkflowSequenceOrder(
+  firstIndex: number,
+  secondIndex: number,
+  firstStatus: string | null,
+  secondStatus: string | null,
+) {
+  const firstComplete = isWorkflowStatusComplete(firstStatus);
+  const secondComplete = isWorkflowStatusComplete(secondStatus);
+
+  if (firstComplete !== secondComplete) {
+    return firstComplete ? 1 : -1;
+  }
+
+  return firstComplete ? secondIndex - firstIndex : firstIndex - secondIndex;
 }
 
 export function getWorkflowEntityActivityTime(entity: {
@@ -3101,90 +3105,65 @@ export function isMilestoneEffectivelyComplete(milestone: GsdDbMilestoneSummary)
   return milestone.taskCount > 0 && milestone.completedTaskCount >= milestone.taskCount;
 }
 
-export function getSliceOrderRank(slice: GsdDbSliceSummary, activeSliceId: string | null) {
-  if (slice.id === activeSliceId) {
-    return 0;
-  }
-
-  const taskRanks = slice.tasks.map((task) => getWorkflowStatusRank(task.status));
-  const bestTaskRank = taskRanks.length > 0 ? Math.min(...taskRanks) : Number.POSITIVE_INFINITY;
-
-  return Math.min(getWorkflowStatusRank(slice.status), bestTaskRank);
+export function isSliceWorkflowActive(slice: GsdDbSliceSummary, activeSliceId: string | null = null) {
+  return slice.id === activeSliceId || isWorkflowStatusActive(slice.status) || slice.tasks.some((task) => isWorkflowStatusActive(task.status));
 }
 
-export function getMilestoneOrderRank(milestone: GsdDbMilestoneSummary, activeMilestoneId: string | null) {
-  if (milestone.id === activeMilestoneId) {
-    return 0;
-  }
-
-  const sliceRanks = milestone.slices.map((slice) => getSliceOrderRank(slice, null));
-  const bestSliceRank = sliceRanks.length > 0 ? Math.min(...sliceRanks) : Number.POSITIVE_INFINITY;
-
-  return Math.min(getWorkflowStatusRank(milestone.status), bestSliceRank);
+export function isMilestoneWorkflowActive(milestone: GsdDbMilestoneSummary, activeMilestoneId: string | null = null) {
+  return milestone.id === activeMilestoneId
+    || isWorkflowStatusActive(milestone.status)
+    || milestone.slices.some((slice) => isSliceWorkflowActive(slice));
 }
 
 export function orderWorkflowMilestones(
   milestones: GsdDbMilestoneSummary[],
-  activeMilestoneId: string | null,
+  _activeMilestoneId: string | null,
 ) {
   return milestones
     .map((milestone, index) => ({ milestone, index }))
     .sort((first, second) => {
-      const firstRank = getMilestoneOrderRank(first.milestone, activeMilestoneId);
-      const secondRank = getMilestoneOrderRank(second.milestone, activeMilestoneId);
-
-      return firstRank === secondRank
-        ? compareWorkflowActivity(
-          getMilestoneWorkflowActivityTime(first.milestone),
-          getMilestoneWorkflowActivityTime(second.milestone),
-          first.index,
-          second.index,
-        )
-        : firstRank - secondRank;
+      return compareWorkflowSequenceOrder(
+        first.index,
+        second.index,
+        first.milestone.status,
+        second.milestone.status,
+      );
     })
     .map((entry) => entry.milestone);
 }
 
-export function orderWorkflowSlices(slices: GsdDbSliceSummary[], activeSliceId: string | null) {
+export function orderWorkflowSlices(slices: GsdDbSliceSummary[], _activeSliceId: string | null) {
   return slices
     .map((slice, index) => ({ slice, index }))
     .sort((first, second) => {
-      const firstRank = getSliceOrderRank(first.slice, activeSliceId);
-      const secondRank = getSliceOrderRank(second.slice, activeSliceId);
-
-      return firstRank === secondRank
-        ? compareWorkflowActivity(
-          getSliceWorkflowActivityTime(first.slice),
-          getSliceWorkflowActivityTime(second.slice),
-          first.index,
-          second.index,
-        )
-        : firstRank - secondRank;
+      return compareWorkflowSequenceOrder(
+        first.index,
+        second.index,
+        first.slice.status,
+        second.slice.status,
+      );
     })
     .map((entry) => entry.slice);
 }
 
-export function orderWorkflowTasks(tasks: GsdDbTaskSummary[], activeTaskId: string | null) {
+export function orderWorkflowTasks(tasks: GsdDbTaskSummary[], _activeTaskId: string | null) {
   return tasks
     .map((task, index) => ({ task, index }))
     .sort((first, second) => {
-      const firstRank = first.task.id === activeTaskId ? 0 : getWorkflowStatusRank(first.task.status);
-      const secondRank = second.task.id === activeTaskId ? 0 : getWorkflowStatusRank(second.task.status);
-
-      return firstRank === secondRank
-        ? compareWorkflowActivity(
-          getTaskWorkflowActivityTime(first.task),
-          getTaskWorkflowActivityTime(second.task),
-          first.index,
-          second.index,
-        )
-        : firstRank - secondRank;
+      return compareWorkflowSequenceOrder(
+        first.index,
+        second.index,
+        first.task.status,
+        second.task.status,
+      );
     })
     .map((entry) => entry.task);
 }
 
 export function findActiveMilestone(milestones: GsdDbMilestoneSummary[]) {
-  return orderWorkflowMilestones(milestones, null).find((milestone) => !isMilestoneEffectivelyComplete(milestone)) ?? null;
+  return milestones.find((milestone) => isMilestoneWorkflowActive(milestone))
+    ?? orderWorkflowMilestones(milestones, null).find((milestone) => !isMilestoneEffectivelyComplete(milestone))
+    ?? null;
 }
 
 export function findActiveTask(slice: GsdDbSliceSummary | null) {
@@ -3192,7 +3171,9 @@ export function findActiveTask(slice: GsdDbSliceSummary | null) {
     return null;
   }
 
-  return orderWorkflowTasks(slice.tasks, null).find((task) => !isWorkflowStatusComplete(task.status)) ?? null;
+  return slice.tasks.find((task) => isWorkflowStatusActive(task.status))
+    ?? orderWorkflowTasks(slice.tasks, null).find((task) => !isWorkflowStatusComplete(task.status))
+    ?? null;
 }
 
 export function findActiveSlice(milestone: GsdDbMilestoneSummary | null) {
@@ -3200,7 +3181,9 @@ export function findActiveSlice(milestone: GsdDbMilestoneSummary | null) {
     return null;
   }
 
-  return orderWorkflowSlices(milestone.slices, null).find((slice) => !isWorkflowStatusComplete(slice.status)) ?? null;
+  return milestone.slices.find((slice) => isSliceWorkflowActive(slice))
+    ?? orderWorkflowSlices(milestone.slices, null).find((slice) => !isWorkflowStatusComplete(slice.status))
+    ?? null;
 }
 
 export function upsertProject(projects: ProjectRecord[], nextProject: ProjectRecord) {

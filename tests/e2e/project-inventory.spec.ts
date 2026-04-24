@@ -489,14 +489,14 @@ test.describe('hosted dashboard inventory flow', () => {
     await expect(page.getByTestId('init-panel')).toHaveCount(0);
     await expect(page.locator('.milestone-focus__index')).toHaveCount(0);
     await expect(page.getByTestId('milestone-focus-milestone').first()).toContainText('M001');
-    await expect(page.getByTestId('milestone-focus-slice').first()).toContainText('S20');
-    await expect(page.getByTestId('milestone-focus-slice').first()).toContainText('T40');
+    await expect(page.getByTestId('milestone-focus-slice').first()).toContainText('S02');
+    await expect(page.getByTestId('milestone-focus-slice').first()).toContainText('T02');
 
     await page.getByRole('tab', { name: 'Task timeline' }).click();
     await expect(page.getByTestId('timeline-list')).toContainText('M001/S20/T40');
     await expect(page.getByTestId('timeline-list')).toContainText('M001/S21/T41');
-    await expect(page.getByTestId('task-timeline-item').first()).toContainText('M001/S20/T40');
-    await expect(page.getByTestId('task-timeline-item').nth(1)).toContainText('M001/S16/T32');
+    await expect(page.getByTestId('task-timeline-item').first()).toContainText('M001/S02/T02');
+    await expect(page.getByTestId('task-timeline-item').nth(1)).toContainText('M001/S04/T08');
 
     const timelineItemPaths = await page.getByTestId('task-timeline-item').evaluateAll((items) =>
       items.map((item) => item.textContent ?? ''),
