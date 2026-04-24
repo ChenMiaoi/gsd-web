@@ -1,6 +1,6 @@
 {
   "name": "gsd-web",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Local-first web dashboard for inspecting and monitoring GSD workspaces.",
   "keywords": [
     "gsd",

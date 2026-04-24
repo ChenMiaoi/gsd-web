@@ -1125,6 +1125,15 @@ export default function App() {
   const selectedRecentExecutionUnits = (selectedMetrics?.recentUnits ?? []).map(toExecutionUnit);
   const primaryModel = selectedExecutionStats.modelUsage[0]?.model ?? copy.messages.notRecorded;
   const averageUnitDurationMs = averageDuration(selectedExecutionStats.units);
+  const detailRouteProjectId = appRoute.page === 'details' ? appRoute.projectId : null;
+  const detailRoutePending =
+    activeAppPage === 'details'
+    && selectedProject === null
+    && (inventoryLoading || detailLoading || timelineLoading);
+  const detailRouteFallbackMessage =
+    detailError
+    ?? inventoryError
+    ?? (detailRouteProjectId ? copy.errors.projectRouteNotFound(detailRouteProjectId) : copy.empty.detailCopy);
   const routePreviewProject = selectedProject ?? projects.find((project) => project.projectId === selectedProjectId) ?? projects[0] ?? null;
   const routePreviewRow = routePreviewProject
     ? portfolioSummary.rows.find((row) => row.project.projectId === routePreviewProject.projectId) ?? null
@@ -2561,9 +2570,41 @@ export default function App() {
               </div>
             </div>
           ) : (
-            <div className="empty-state" data-testid="detail-empty">
-              <h3>{copy.empty.detailTitle}</h3>
-              <p>{copy.empty.detailCopy}</p>
+            <div
+              className="empty-state"
+              data-testid={detailRoutePending ? 'detail-route-loading' : 'detail-route-fallback'}
+            >
+              <h3>{detailRoutePending ? copy.actions.reloading : copy.empty.detailTitle}</h3>
+              <p>
+                {detailRoutePending
+                  ? detailRouteProjectId
+                    ? `${copy.labels.projectDetail}: ${detailRouteProjectId}`
+                    : copy.empty.detailCopy
+                  : detailRouteFallbackMessage}
+              </p>
+              <div className="register-panel__actions">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  disabled={detailRoutePending}
+                  onClick={() => {
+                    void syncInventory(detailRouteProjectId ?? selectedProjectIdRef.current, {
+                      fallbackToFirstProject: detailRouteProjectId === null,
+                    });
+                  }}
+                >
+                  {detailRoutePending ? copy.actions.reloading : copy.actions.retryInventory}
+                </button>
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={() => {
+                    navigateToRoute({ page: 'overview' });
+                  }}
+                >
+                  {copy.actions.enterOverview}
+                </button>
+              </div>
             </div>
           )}
           </div>

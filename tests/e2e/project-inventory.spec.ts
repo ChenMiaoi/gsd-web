@@ -269,6 +269,24 @@ test.describe('hosted dashboard inventory flow', () => {
     await expect(page.getByTestId('app-topbar-marquee-heading')).not.toContainText('routed-project');
   });
 
+  test('keeps the detail route usable after a browser refresh', async ({ page, harness }) => {
+    const projectPath = await createInitializedProject(harness.workspace.root, 'refresh-route-project');
+    const registration = await registerProject(harness.baseUrl, projectPath);
+
+    await page.goto(`${harness.baseUrl}/lazy/boss`);
+    await page.getByTestId(`overview-project-card-${registration.project.projectId}`).click();
+    await expect(page).toHaveURL(`${harness.baseUrl}/lazy/employee-${registration.project.projectId}`);
+    await expect(page.getByTestId('detail-project-id-value')).toContainText(registration.project.projectId);
+
+    await page.reload();
+
+    await expect(page).toHaveURL(`${harness.baseUrl}/lazy/employee-${registration.project.projectId}`);
+    await expect(page.getByTestId('detail-project-id-value')).toContainText(registration.project.projectId);
+    await expect(page.getByTestId('detail-status')).toContainText('Initialized');
+    await expect(page.getByTestId('detail-route-loading')).toHaveCount(0);
+    await expect(page.getByTestId('detail-route-fallback')).toHaveCount(0);
+  });
+
   test('registers empty and degraded projects, then refreshes live detail', async ({ page, harness }) => {
     const emptyProjectPath = await createEmptyProject(harness.workspace.root, 'empty-project');
     const partialProjectPath = await createInitializedProject(harness.workspace.root, 'partial-project', {
