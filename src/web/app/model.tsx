@@ -170,6 +170,8 @@ export type WorkflowExecutionStats = {
   modelUsage: ModelUsageSummary[];
 };
 
+export type ProjectOverviewProgressSource = 'task' | 'time' | 'fallback';
+
 export type ProjectOverviewRow = {
   project: ProjectRecord;
   label: string;
@@ -183,7 +185,10 @@ export type ProjectOverviewRow = {
   completedTasks: number;
   totalTasks: number;
   remainingTasks: number;
+  taskProgressPercent: number | null;
+  timeProgressPercent: number | null;
   progressPercent: number;
+  progressSource: ProjectOverviewProgressSource;
   warningCount: number;
   unitCount: number;
   metricsAvailable: boolean;
@@ -2588,6 +2593,75 @@ export function getCompletedTaskCount(milestones: GsdDbMilestoneSummary[]) {
   return milestones.reduce((total, milestone) => total + milestone.completedTaskCount, 0);
 }
 
+export function calculateTaskProgressPercent(totalTasks: number, completedTasks: number) {
+  if (!Number.isFinite(totalTasks) || totalTasks <= 0) {
+    return null;
+  }
+
+  const normalizedCompletedTasks = Math.max(0, Math.min(totalTasks, completedTasks));
+
+  return Math.max(0, Math.min(100, Math.round((normalizedCompletedTasks / totalTasks) * 100)));
+}
+
+export function calculateTimeProgressPercent(
+  totalTasks: number,
+  elapsedMs: number | null,
+  estimatedRemainingMs: number | null,
+) {
+  if (!Number.isFinite(totalTasks) || totalTasks <= 0 || estimatedRemainingMs === null || !Number.isFinite(estimatedRemainingMs)) {
+    return null;
+  }
+
+  const normalizedElapsedMs = elapsedMs === null || !Number.isFinite(elapsedMs) ? 0 : Math.max(0, elapsedMs);
+  const normalizedRemainingMs = Math.max(0, estimatedRemainingMs);
+  const totalProjectedMs = normalizedElapsedMs + normalizedRemainingMs;
+
+  if (totalProjectedMs === 0) {
+    return 100;
+  }
+
+  return Math.max(0, Math.min(100, Math.round((normalizedElapsedMs / totalProjectedMs) * 100)));
+}
+
+export function selectOverviewProgressPercent(input: {
+  taskProgressPercent: number | null;
+  timeProgressPercent: number | null;
+  fallbackPercent: number;
+}): { progressPercent: number; progressSource: ProjectOverviewProgressSource } {
+  if (input.taskProgressPercent !== null && input.timeProgressPercent !== null) {
+    if (input.timeProgressPercent < input.taskProgressPercent) {
+      return {
+        progressPercent: input.timeProgressPercent,
+        progressSource: 'time',
+      };
+    }
+
+    return {
+      progressPercent: input.taskProgressPercent,
+      progressSource: 'task',
+    };
+  }
+
+  if (input.taskProgressPercent !== null) {
+    return {
+      progressPercent: input.taskProgressPercent,
+      progressSource: 'task',
+    };
+  }
+
+  if (input.timeProgressPercent !== null) {
+    return {
+      progressPercent: input.timeProgressPercent,
+      progressSource: 'time',
+    };
+  }
+
+  return {
+    progressPercent: Math.max(0, Math.min(100, Math.round(input.fallbackPercent))),
+    progressSource: 'fallback',
+  };
+}
+
 export function getCompletedSliceCount(milestone: GsdDbMilestoneSummary) {
   return milestone.slices.filter((slice) => isWorkflowStatusComplete(slice.status)).length;
 }
@@ -3329,12 +3403,18 @@ export function buildProjectOverviewRow(project: ProjectRecord, nowMs: number, c
   const activeMilestone = findActiveMilestone(milestoneSource);
   const milestones = orderWorkflowMilestones(milestoneSource, activeMilestone?.id ?? null);
   const executionStats = buildWorkflowExecutionStats(milestones, metrics, nowMs, copy);
-  const progressPercent =
-    executionStats.totalTasks === 0
-      ? project.snapshot.status === 'initialized'
-        ? 100
-        : 0
-      : Math.round((executionStats.completedTasks / executionStats.totalTasks) * 100);
+  const taskProgressPercent = calculateTaskProgressPercent(executionStats.totalTasks, executionStats.completedTasks);
+  const timeProgressPercent = calculateTimeProgressPercent(
+    executionStats.totalTasks,
+    executionStats.elapsedMs,
+    executionStats.estimatedRemainingMs,
+  );
+  const fallbackPercent = project.snapshot.status === 'initialized' ? 100 : 0;
+  const { progressPercent, progressSource } = selectOverviewProgressPercent({
+    taskProgressPercent,
+    timeProgressPercent,
+    fallbackPercent,
+  });
 
   return {
     project,
@@ -3349,7 +3429,10 @@ export function buildProjectOverviewRow(project: ProjectRecord, nowMs: number, c
     completedTasks: executionStats.completedTasks,
     totalTasks: executionStats.totalTasks,
     remainingTasks: executionStats.remainingTasks,
+    taskProgressPercent,
+    timeProgressPercent,
     progressPercent,
+    progressSource,
     warningCount: project.snapshot.warnings.length,
     unitCount: metrics?.unitCount ?? 0,
     metricsAvailable: metrics !== null,

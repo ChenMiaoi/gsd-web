@@ -1714,7 +1714,14 @@ export default function App() {
                         </span>
 
                         <span className="overview-project-row__state">
-                          <span className="overview-project-row__meter" aria-hidden="true">
+                          <span
+                            className="overview-project-row__meter"
+                            aria-hidden="true"
+                            data-testid={`overview-project-progress-${row.project.projectId}`}
+                            data-progress-source={row.progressSource}
+                            data-task-progress={row.taskProgressPercent ?? 'na'}
+                            data-time-progress={row.timeProgressPercent ?? 'na'}
+                          >
                             <span style={{ width: `${row.progressPercent}%` }} />
                           </span>
                           <span className="overview-project-row__badges">

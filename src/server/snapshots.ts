@@ -1026,7 +1026,7 @@ async function readGsdDbSummary(
           return [] as Array<Record<string, unknown>>;
         }
 
-        return database.prepare(`SELECT * FROM ${tableName}${orderClauseFor(tableName)} LIMIT 80`).all() as unknown as Array<
+        return database.prepare(`SELECT * FROM ${tableName}${orderClauseFor(tableName)}`).all() as unknown as Array<
           Record<string, unknown>
         >;
       };

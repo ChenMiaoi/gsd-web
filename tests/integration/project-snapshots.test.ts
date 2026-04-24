@@ -452,6 +452,77 @@ describe('project registry and snapshot contracts', () => {
     });
   });
 
+  test('summarizes full gsd task counts beyond the old eighty-row sample window', async () => {
+    const service = await bootService();
+    const projectPath = await createInitializedProject(service.workspace.root, 'full-task-project');
+    const database = new DatabaseSync(path.join(projectPath, '.gsd', 'gsd.db'));
+
+    try {
+      database.exec(`
+        DELETE FROM tasks;
+        DELETE FROM slice_dependencies;
+        DELETE FROM slices;
+        DELETE FROM milestones;
+        INSERT INTO milestones (id, title, status) VALUES ('M001', 'Large milestone', 'active');
+      `);
+
+      const insertSlice = database.prepare(`
+        INSERT INTO slices (id, milestone_id, title, status, risk, depends, sequence)
+        VALUES (?, 'M001', ?, ?, ?, ?, ?)
+      `);
+      const insertTask = database.prepare(`
+        INSERT INTO tasks (id, slice_id, title, status)
+        VALUES (?, ?, ?, ?)
+      `);
+
+      let globalTaskIndex = 0;
+
+      for (let sliceIndex = 1; sliceIndex <= 5; sliceIndex += 1) {
+        const sliceId = `S${String(sliceIndex).padStart(2, '0')}`;
+        insertSlice.run(
+          sliceId,
+          `Large slice ${sliceIndex}`,
+          sliceIndex === 1 ? 'active' : 'pending',
+          sliceIndex === 1 ? 'medium' : 'low',
+          '[]',
+          sliceIndex,
+        );
+
+        for (let taskIndex = 1; taskIndex <= 25; taskIndex += 1) {
+          globalTaskIndex += 1;
+          insertTask.run(
+            `T${String(globalTaskIndex).padStart(3, '0')}`,
+            sliceId,
+            `Large task ${globalTaskIndex}`,
+            globalTaskIndex <= 52 ? 'complete' : 'pending',
+          );
+        }
+      }
+    } finally {
+      database.close();
+    }
+
+    const registerResponse = await postJson(`${service.baseUrl}/api/projects/register`, {
+      path: projectPath,
+    });
+
+    expect(registerResponse.status).toBe(201);
+
+    const mutation = (await registerResponse.json()) as ProjectMutationResponse;
+    const gsdDb = mutation.project.snapshot.sources.gsdDb.value;
+
+    expect(gsdDb?.counts.tasks).toBe(125);
+    expect(gsdDb?.milestones).toHaveLength(1);
+    expect(gsdDb?.milestones[0]).toMatchObject({
+      id: 'M001',
+      taskCount: 125,
+      completedTaskCount: 52,
+      sliceCount: 5,
+    });
+    expect(gsdDb?.milestones[0]?.slices).toHaveLength(5);
+    expect(gsdDb?.milestones[0]?.slices.every((slice) => slice.taskCount === 25)).toBe(true);
+  });
+
   test('keeps tasks scoped to their milestone when slice ids repeat', async () => {
     const service = await bootService();
     const projectPath = await createInitializedProject(service.workspace.root, 'repeated-slice-project', {
