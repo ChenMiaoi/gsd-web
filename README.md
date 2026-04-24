@@ -110,6 +110,15 @@ gsd-web
 | `gsd-web status` | Show pid, URL, data path, and log path |
 | `gsd-web serve` | Run in the foreground |
 
+`start`, `reload`, `restart`, and `serve` accept explicit listen options:
+
+```bash
+gsd-web start --host 0.0.0.0 --port 3000
+gsd-web serve --host 127.0.0.1 --port 3001
+```
+
+Use `--host 0.0.0.0` when the dashboard must be reachable through the machine's network IP instead of only through loopback. Treat that as local-network exposure and rely on your firewall or tunnel controls accordingly.
+
 The daemon pid file is written to `GSD_WEB_HOME` as `gsd-web.pid`. By default, runtime data lives under `~/.gsd-web`.
 
 ## Using The Dashboard
@@ -154,6 +163,7 @@ Example:
 
 ```bash
 PORT=3001 GSD_BIN_PATH=/path/to/gsd gsd-web
+gsd-web start --host 0.0.0.0 --port 3001
 ```
 
 ## Architecture

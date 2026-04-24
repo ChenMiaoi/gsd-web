@@ -21,6 +21,17 @@ export interface StartServerOptions extends CreateAppOptions {
   printBanner?: boolean;
 }
 
+export interface CliListenOptions {
+  host?: string;
+  port?: number;
+}
+
+export interface CliInvocation {
+  command: string;
+  daemonChild: boolean;
+  listenOptions: CliListenOptions;
+}
+
 interface DaemonState {
   pid: number;
   address: string;
@@ -58,13 +69,106 @@ function resolvePort(candidate: number | string | undefined): number {
     return fallbackPort;
   }
 
-  const parsedPort = typeof candidate === 'number' ? candidate : Number.parseInt(candidate, 10);
+  const parsedPort = typeof candidate === 'number' ? candidate : /^\d+$/.test(candidate) ? Number(candidate) : Number.NaN;
 
   if (!Number.isInteger(parsedPort) || parsedPort < 0 || parsedPort > 65_535) {
     throw new Error(`Invalid PORT value: ${candidate}`);
   }
 
   return parsedPort;
+}
+
+function resolveHost(candidate: string): string;
+function resolveHost(candidate: undefined): undefined;
+function resolveHost(candidate: string | undefined): string | undefined;
+function resolveHost(candidate: string | undefined): string | undefined {
+  if (candidate === undefined) {
+    return undefined;
+  }
+
+  const host = candidate.trim();
+
+  if (host.length === 0) {
+    throw new Error('Invalid HOST value: host must not be empty');
+  }
+
+  return host;
+}
+
+function parseCliListenValue(args: string[], index: number, option: string): { value: string; nextIndex: number } {
+  const arg = args[index]!;
+  const inlineValuePrefix = `${option}=`;
+
+  if (arg.startsWith(inlineValuePrefix)) {
+    return {
+      value: arg.slice(inlineValuePrefix.length),
+      nextIndex: index + 1,
+    };
+  }
+
+  const value = args[index + 1];
+
+  if (value === undefined || value.startsWith('--')) {
+    throw new Error(`Missing value for ${option}`);
+  }
+
+  return {
+    value,
+    nextIndex: index + 2,
+  };
+}
+
+export function parseCliInvocation(argv: string[]): CliInvocation {
+  const args = argv.filter((arg) => arg !== DAEMON_CHILD_FLAG);
+  const daemonChild = argv.includes(DAEMON_CHILD_FLAG);
+  const listenOptions: CliListenOptions = {};
+  let command: string | null = null;
+  let index = 0;
+
+  while (index < args.length) {
+    const arg = args[index]!;
+
+    if (arg === '--host' || arg.startsWith('--host=')) {
+      const parsed = parseCliListenValue(args, index, '--host');
+      listenOptions.host = resolveHost(parsed.value);
+      index = parsed.nextIndex;
+      continue;
+    }
+
+    if (arg === '--port' || arg.startsWith('--port=')) {
+      const parsed = parseCliListenValue(args, index, '--port');
+      listenOptions.port = resolvePort(parsed.value);
+      index = parsed.nextIndex;
+      continue;
+    }
+
+    if (arg === '--help' || arg === '-h') {
+      if (command !== null) {
+        throw new Error(`Unexpected argument: ${arg}`);
+      }
+
+      command = 'help';
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--')) {
+      throw new Error(`Unknown option: ${arg}`);
+    }
+
+    if (command !== null) {
+      throw new Error(`Unexpected argument: ${arg}`);
+    }
+
+    command = arg;
+    index += 1;
+  }
+
+  return {
+    command: command ?? 'start',
+    daemonChild,
+    listenOptions,
+  };
 }
 
 function emitStartSignal(
@@ -88,7 +192,7 @@ function printStartBanner(app: GsdWebApp, address: string) {
 }
 
 function printHelp() {
-  console.info(`Usage: gsd-web [command]
+  console.info(`Usage: gsd-web [command] [options]
 
 Commands:
   start       Start gsd-web in the background (default)
@@ -98,6 +202,10 @@ Commands:
   status      Show whether the background process is running
   serve       Run in the foreground
   help        Show this help
+
+Options:
+  --host <host>   HTTP listen host (default: HOST or 127.0.0.1)
+  --port <port>   HTTP listen port (default: PORT or 3000)
 
 Environment:
   HOST, PORT, GSD_WEB_HOME, GSD_WEB_DATABASE_PATH, GSD_WEB_LOG_DIR,
@@ -269,7 +377,7 @@ function installShutdownHandlers(app: GsdWebApp, pidFilePath: string | null) {
 
 export async function startServer(options: StartServerOptions = {}) {
   const app = (await createApp(options)) as GsdWebApp;
-  const host = options.host ?? process.env.HOST ?? '127.0.0.1';
+  const host = options.host ?? resolveHost(process.env.HOST) ?? '127.0.0.1';
   const port = options.port ?? resolvePort(process.env.PORT);
 
   try {
@@ -292,9 +400,21 @@ export async function startServer(options: StartServerOptions = {}) {
   }
 }
 
-async function runForeground(options: { daemonChild?: boolean } = {}) {
+async function runForeground(options: { daemonChild?: boolean } & CliListenOptions = {}) {
   const daemonPaths = options.daemonChild ? getDaemonPaths() : null;
-  const app = await startServer({ printBanner: !options.daemonChild });
+  const startOptions: StartServerOptions = {
+    printBanner: !options.daemonChild,
+  };
+
+  if (options.host !== undefined) {
+    startOptions.host = options.host;
+  }
+
+  if (options.port !== undefined) {
+    startOptions.port = options.port;
+  }
+
+  const app = await startServer(startOptions);
   const address = getListeningAddress(app);
 
   installShutdownHandlers(app, daemonPaths?.pidFilePath ?? null);
@@ -304,7 +424,7 @@ async function runForeground(options: { daemonChild?: boolean } = {}) {
   }
 }
 
-async function startDaemon(): Promise<number> {
+async function startDaemon(options: CliListenOptions = {}): Promise<number> {
   const daemonPaths = getDaemonPaths();
   const existingState = await readDaemonState(daemonPaths.pidFilePath);
 
@@ -319,9 +439,14 @@ async function startDaemon(): Promise<number> {
 
   await mkdir(daemonPaths.runtimeDir, { recursive: true });
 
+  const childEnv = {
+    ...process.env,
+    ...(options.host === undefined ? {} : { HOST: options.host }),
+    ...(options.port === undefined ? {} : { PORT: String(options.port) }),
+  };
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'serve', DAEMON_CHILD_FLAG], {
     detached: true,
-    env: process.env,
+    env: childEnv,
     stdio: 'ignore',
   });
 
@@ -380,14 +505,14 @@ async function stopDaemon(options: { quiet?: boolean } = {}): Promise<number> {
   return 0;
 }
 
-async function reloadDaemon(): Promise<number> {
+async function reloadDaemon(options: CliListenOptions = {}): Promise<number> {
   const stopCode = await stopDaemon({ quiet: true });
 
   if (stopCode !== 0) {
     return stopCode;
   }
 
-  return startDaemon();
+  return startDaemon(options);
 }
 
 async function printStatus(): Promise<number> {
@@ -412,22 +537,22 @@ async function printStatus(): Promise<number> {
 }
 
 async function runCli(argv: string[]): Promise<number> {
-  const args = argv.filter((arg) => arg !== DAEMON_CHILD_FLAG);
-  const command = args[0] ?? 'start';
-  const daemonChild = argv.includes(DAEMON_CHILD_FLAG);
-
   try {
+    const { command, daemonChild, listenOptions } = parseCliInvocation(argv);
+
     switch (command) {
       case 'start':
-        return daemonChild ? (await runForeground({ daemonChild: true }), 0) : startDaemon();
+        return daemonChild
+          ? (await runForeground({ daemonChild: true, ...listenOptions }), 0)
+          : startDaemon(listenOptions);
       case 'serve':
-        await runForeground({ daemonChild });
+        await runForeground({ daemonChild, ...listenOptions });
         return 0;
       case 'stop':
         return stopDaemon();
       case 'reload':
       case 'restart':
-        return reloadDaemon();
+        return reloadDaemon(listenOptions);
       case 'status':
         return printStatus();
       case 'help':

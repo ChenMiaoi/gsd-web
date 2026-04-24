@@ -9,7 +9,7 @@ import { afterEach, describe, expect, test } from 'vitest';
 import type { ProjectEventEnvelope } from '../../src/shared/contracts.js';
 import { createApp, resolveDefaultPaths, type RuntimeSignal } from '../../src/server/app.js';
 import { REGISTRY_SCHEMA_VERSION } from '../../src/server/db.js';
-import { startServer } from '../../src/server/index.js';
+import { parseCliInvocation, startServer } from '../../src/server/index.js';
 import { createTempWorkspace, writeClientShell } from '../helpers/project-fixtures.js';
 
 const cleanupTasks: Array<() => Promise<void>> = [];
@@ -86,6 +86,41 @@ async function readFirstSseEvent(url: string) {
 }
 
 describe('service shell bootstrap', () => {
+  test('parses host and port CLI options for foreground and daemon commands', () => {
+    expect(parseCliInvocation(['--host', '0.0.0.0', '--port', '3001'])).toEqual({
+      command: 'start',
+      daemonChild: false,
+      listenOptions: {
+        host: '0.0.0.0',
+        port: 3001,
+      },
+    });
+
+    expect(parseCliInvocation(['serve', '--host=127.0.0.1', '--port=0', '--daemon-child'])).toEqual({
+      command: 'serve',
+      daemonChild: true,
+      listenOptions: {
+        host: '127.0.0.1',
+        port: 0,
+      },
+    });
+
+    expect(parseCliInvocation(['reload', '--port', '65535'])).toEqual({
+      command: 'reload',
+      daemonChild: false,
+      listenOptions: {
+        port: 65535,
+      },
+    });
+  });
+
+  test('rejects malformed host and port CLI options', () => {
+    expect(() => parseCliInvocation(['--host'])).toThrow(/missing value/i);
+    expect(() => parseCliInvocation(['--host', '   '])).toThrow(/host must not be empty/i);
+    expect(() => parseCliInvocation(['--port', '65536'])).toThrow(/invalid port/i);
+    expect(() => parseCliInvocation(['--bogus'])).toThrow(/unknown option/i);
+  });
+
   test('resolves npm runtime defaults under the user home directory', async () => {
     const workspace = await createTempWorkspace('gsd-web-runtime-');
 
