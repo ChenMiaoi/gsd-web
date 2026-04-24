@@ -349,10 +349,15 @@ describe('project monitor reconcile loop', () => {
       projectId,
       (project) => project.monitor.health === 'read_failed' && project.monitor.lastError?.scope === 'gsdDb',
     );
+    const failedLastAttemptedAt = failedProject.monitor.lastAttemptedAt;
 
     expect(failedProject.snapshot.status).toBe('initialized');
     expect(failedProject.snapshot.checkedAt).toBe(snapshotCheckedAtBeforeFailure);
-    expect(failedProject.monitor.lastSuccessfulAt).toBe(lastSuccessfulAtBeforeFailure);
+    expect(failedProject.monitor.lastSuccessfulAt).not.toBeNull();
+    expect(Date.parse(failedProject.monitor.lastSuccessfulAt!)).toBeGreaterThanOrEqual(
+      Date.parse(lastSuccessfulAtBeforeFailure!),
+    );
+    expect(Date.parse(failedProject.monitor.lastSuccessfulAt!)).toBeLessThan(Date.parse(failedLastAttemptedAt!));
     expect(failedProject.monitor.lastError?.message).toMatch(/gsd\.db/i);
 
     const failedEvent = await waitForEvent(

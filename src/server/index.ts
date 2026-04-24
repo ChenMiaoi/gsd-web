@@ -39,6 +39,8 @@ interface DaemonState {
   runtimeDir: string;
   databasePath: string;
   logFilePath: string | null;
+  logRetentionDays: number | null;
+  logMaxFileSizeBytes: number | null;
 }
 
 interface DaemonPaths {
@@ -189,6 +191,22 @@ function printStartBanner(app: GsdWebApp, address: string) {
   if (paths.activeLogFilePath) {
     console.info(`logs: ${paths.activeLogFilePath}`);
   }
+
+  console.info(formatLogPolicySummary(paths.logPolicy.retentionDays, paths.logPolicy.maxFileSizeBytes));
+}
+
+function formatLogSize(maxFileSizeBytes: number) {
+  const sizeInMiB = maxFileSizeBytes / (1024 * 1024);
+
+  return Number.isInteger(sizeInMiB) ? `${sizeInMiB} MiB` : `${sizeInMiB.toFixed(1)} MiB`;
+}
+
+function formatLogPolicySummary(logRetentionDays: number | null, logMaxFileSizeBytes: number | null) {
+  if (logRetentionDays === null || logMaxFileSizeBytes === null) {
+    return 'log policy: daily rotation, gzip archives, retention unknown, max active file unknown';
+  }
+
+  return `log policy: daily rotation, gzip archives, ${logRetentionDays}-day retention, ${formatLogSize(logMaxFileSizeBytes)} max active file`;
 }
 
 function printHelp() {
@@ -209,7 +227,8 @@ Options:
 
 Environment:
   HOST, PORT, GSD_WEB_HOME, GSD_WEB_DATABASE_PATH, GSD_WEB_LOG_DIR,
-  GSD_WEB_LOG_FILE, GSD_WEB_CLIENT_DIST_DIR, GSD_BIN_PATH`);
+  GSD_WEB_LOG_FILE, GSD_WEB_LOG_RETENTION_DAYS, GSD_WEB_LOG_MAX_SIZE_MB,
+  GSD_WEB_CLIENT_DIST_DIR, GSD_BIN_PATH`);
 }
 
 function getDaemonPaths(): DaemonPaths {
@@ -252,6 +271,9 @@ async function readDaemonState(pidFilePath: string): Promise<DaemonState | null>
       return null;
     }
 
+    const logRetentionDays = parsed.logRetentionDays;
+    const logMaxFileSizeBytes = parsed.logMaxFileSizeBytes;
+
     return {
       pid: pid!,
       address: typeof parsed.address === 'string' ? parsed.address : 'unknown',
@@ -259,6 +281,9 @@ async function readDaemonState(pidFilePath: string): Promise<DaemonState | null>
       runtimeDir: typeof parsed.runtimeDir === 'string' ? parsed.runtimeDir : path.dirname(pidFilePath),
       databasePath: typeof parsed.databasePath === 'string' ? parsed.databasePath : 'unknown',
       logFilePath: typeof parsed.logFilePath === 'string' ? parsed.logFilePath : null,
+      logRetentionDays: typeof logRetentionDays === 'number' && Number.isInteger(logRetentionDays) ? logRetentionDays : null,
+      logMaxFileSizeBytes:
+        typeof logMaxFileSizeBytes === 'number' && Number.isInteger(logMaxFileSizeBytes) ? logMaxFileSizeBytes : null,
     };
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -336,6 +361,8 @@ async function writeDaemonState(app: GsdWebApp, address: string, pidFilePath: st
     runtimeDir: paths.runtimeDir,
     databasePath: paths.databasePath,
     logFilePath: paths.activeLogFilePath,
+    logRetentionDays: paths.logPolicy.retentionDays,
+    logMaxFileSizeBytes: paths.logPolicy.maxFileSizeBytes,
   };
 
   await mkdir(path.dirname(pidFilePath), { recursive: true });
@@ -467,6 +494,8 @@ async function startDaemon(options: CliListenOptions = {}): Promise<number> {
     console.info(`logs: ${state.logFilePath}`);
   }
 
+  console.info(formatLogPolicySummary(state.logRetentionDays, state.logMaxFileSizeBytes));
+
   return 0;
 }
 
@@ -533,10 +562,12 @@ async function printStatus(): Promise<number> {
     console.info(`logs: ${state.logFilePath}`);
   }
 
+  console.info(formatLogPolicySummary(state.logRetentionDays, state.logMaxFileSizeBytes));
+
   return 0;
 }
 
-async function runCli(argv: string[]): Promise<number> {
+export async function runCli(argv: string[]): Promise<number> {
   try {
     const { command, daemonChild, listenOptions } = parseCliInvocation(argv);
 

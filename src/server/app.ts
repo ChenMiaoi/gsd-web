@@ -6,8 +6,18 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { SERVICE_NAME, type HealthResponse, type ProjectEventEnvelope } from '../shared/contracts.js';
+import {
+  SERVICE_NAME,
+  type HealthResponse,
+  type LogPolicySummary,
+  type ProjectEventEnvelope,
+} from '../shared/contracts.js';
 import { REGISTRY_SCHEMA_VERSION, RegistryDatabase } from './db.js';
+import {
+  DEFAULT_LOG_MAX_FILE_SIZE_BYTES,
+  DEFAULT_LOG_RETENTION_DAYS,
+  RotatingLogStream,
+} from './log-rotation.js';
 import {
   DEFAULT_MONITOR_INTERVAL_MS,
   ProjectMonitorManager,
@@ -65,6 +75,8 @@ export interface CreateAppOptions {
   logDir?: string;
   logFilePath?: string;
   logger?: boolean;
+  logRetentionDays?: number;
+  logMaxFileSizeBytes?: number;
   logSink?: (signal: RuntimeSignal) => void;
   snapshotTimeoutMs?: number;
   monitorIntervalMs?: number;
@@ -85,6 +97,7 @@ export interface ResolvedRuntimePaths {
 export type GsdWebApp = FastifyInstance & {
   gsdWebPaths: ResolvedRuntimePaths & {
     activeLogFilePath: string | null;
+    logPolicy: LogPolicySummary;
   };
 };
 
@@ -120,6 +133,20 @@ function resolveOptionalEnvInteger(env: NodeJS.ProcessEnv, name: string): number
 
   if (!Number.isInteger(parsed) || parsed < 0) {
     throw new Error(`${name} must be a non-negative integer`);
+  }
+
+  return parsed;
+}
+
+function resolveOptionalEnvPositiveInteger(env: NodeJS.ProcessEnv, name: string): number | undefined {
+  const parsed = resolveOptionalEnvInteger(env, name);
+
+  if (parsed === undefined) {
+    return undefined;
+  }
+
+  if (parsed <= 0) {
+    throw new Error(`${name} must be a positive integer`);
   }
 
   return parsed;
@@ -255,11 +282,26 @@ function emitProjectEvent(
   emitSignal(app, logSink, signal, 'Broadcasted project event');
 }
 
+function buildLogPolicySummary(
+  enabled: boolean,
+  retentionDays: number,
+  maxFileSizeBytes: number,
+): LogPolicySummary {
+  return {
+    enabled,
+    rotateDaily: true,
+    compression: 'gzip',
+    retentionDays,
+    maxFileSizeBytes,
+  };
+}
+
 function buildHealthResponse(
   runtimeDir: string,
   databasePath: string,
   clientDistDir: string,
   logFilePath: string | null,
+  logPolicy: LogPolicySummary,
   projectTotal: number,
 ): HealthResponse {
   return {
@@ -269,6 +311,7 @@ function buildHealthResponse(
     runtime: {
       directory: runtimeDir,
       logFile: logFilePath,
+      logPolicy,
     },
     database: {
       connected: true,
@@ -333,6 +376,17 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
     : path.join(logDir, 'gsd-web.log');
   const logFilePath = resolveConfiguredPath('GSD web log file', options.logFilePath ?? defaultLogFilePath);
   const activeLogFilePath = options.logger === false ? null : logFilePath;
+  const logRetentionDays =
+    options.logRetentionDays
+    ?? resolveOptionalEnvInteger(process.env, 'GSD_WEB_LOG_RETENTION_DAYS')
+    ?? DEFAULT_LOG_RETENTION_DAYS;
+  const logMaxFileSizeBytes =
+    options.logMaxFileSizeBytes
+    ?? (
+      resolveOptionalEnvPositiveInteger(process.env, 'GSD_WEB_LOG_MAX_SIZE_MB')
+      ?? (DEFAULT_LOG_MAX_FILE_SIZE_BYTES / (1024 * 1024))
+    ) * 1024 * 1024;
+  const logPolicy = buildLogPolicySummary(activeLogFilePath !== null, logRetentionDays, logMaxFileSizeBytes);
   const indexHtmlPath = path.join(clientDistDir, 'index.html');
 
   await assertReadableFile(
@@ -340,17 +394,27 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
     `Client build directory is missing its shell index.html: ${indexHtmlPath}`,
   );
   await mkdir(path.dirname(databasePath), { recursive: true });
+  const logStream = activeLogFilePath === null
+    ? null
+    : new RotatingLogStream({
+        filePath: activeLogFilePath,
+        retentionDays: logRetentionDays,
+        maxFileSizeBytes: logMaxFileSizeBytes,
+      });
   if (activeLogFilePath !== null) {
     await mkdir(path.dirname(activeLogFilePath), { recursive: true });
+    await logStream!.initialize();
   }
 
+  const loggerOptions = options.logger === false
+    ? false
+    : {
+        level: process.env.GSD_WEB_LOG_LEVEL?.trim() || process.env.LOG_LEVEL?.trim() || 'info',
+        stream: logStream!,
+      };
+
   const app = Fastify({
-    logger: options.logger === false
-      ? false
-      : {
-          level: process.env.GSD_WEB_LOG_LEVEL?.trim() || process.env.LOG_LEVEL?.trim() || 'info',
-          file: activeLogFilePath ?? path.join(logDir, 'gsd-web.log'),
-        },
+    logger: loggerOptions,
     disableRequestLogging: !(resolveOptionalEnvBoolean(process.env, 'GSD_WEB_REQUEST_LOGS') ?? false),
     forceCloseConnections: true,
   }) as unknown as GsdWebApp;
@@ -363,6 +427,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
     logDir,
     logFilePath,
     activeLogFilePath,
+    logPolicy,
   };
   let registry: RegistryDatabase | undefined;
   let eventHub: EventHub | undefined;
@@ -455,6 +520,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
       await monitorManagerInstance.stop();
       eventHubInstance.close();
       registryInstance.close();
+      await logStream?.close();
     });
 
     await app.register(fastifyStatic, {
@@ -463,7 +529,14 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
     });
 
     app.get('/api/health', async () =>
-      buildHealthResponse(runtimeDir, databasePath, clientDistDir, activeLogFilePath, registryInstance.getProjectCount()),
+      buildHealthResponse(
+        runtimeDir,
+        databasePath,
+        clientDistDir,
+        activeLogFilePath,
+        logPolicy,
+        registryInstance.getProjectCount(),
+      ),
     );
     emitSignal(
       app,

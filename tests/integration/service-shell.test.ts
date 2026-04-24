@@ -1,15 +1,15 @@
 import path from 'node:path';
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { TextDecoder } from 'node:util';
 import type { AddressInfo } from 'node:net';
 
 import type { FastifyInstance } from 'fastify';
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 
 import type { ProjectEventEnvelope } from '../../src/shared/contracts.js';
 import { createApp, resolveDefaultPaths, type RuntimeSignal } from '../../src/server/app.js';
 import { REGISTRY_SCHEMA_VERSION } from '../../src/server/db.js';
-import { parseCliInvocation, startServer } from '../../src/server/index.js';
+import { parseCliInvocation, runCli, startServer } from '../../src/server/index.js';
 import { createTempWorkspace, writeClientShell } from '../helpers/project-fixtures.js';
 
 const cleanupTasks: Array<() => Promise<void>> = [];
@@ -186,6 +186,13 @@ describe('service shell bootstrap', () => {
 
     expect(paths.databasePath).toBe(path.join(runtimeDir, 'data', 'gsd-web.sqlite'));
     expect(paths.activeLogFilePath).toBe(path.join(runtimeDir, 'logs', 'gsd-web.log'));
+    expect(paths.logPolicy).toEqual({
+      enabled: true,
+      rotateDaily: true,
+      compression: 'gzip',
+      retentionDays: 7,
+      maxFileSizeBytes: 20 * 1024 * 1024,
+    });
     expect(await readFile(paths.databasePath)).toBeInstanceOf(Buffer);
 
     await app.close();
@@ -230,6 +237,13 @@ describe('service shell bootstrap', () => {
       runtime: {
         directory: expect.stringMatching(/\.gsd-web$/),
         logFile: null,
+        logPolicy: {
+          enabled: false,
+          rotateDaily: true,
+          compression: 'gzip',
+          retentionDays: 7,
+          maxFileSizeBytes: 20 * 1024 * 1024,
+        },
       },
       database: {
         connected: true,
@@ -327,5 +341,51 @@ describe('service shell bootstrap', () => {
         expect.objectContaining({ method: 'GET', route: '/*' }),
       ]),
     );
+  });
+
+  test('prints log policy in CLI status output when daemon metadata is present', async () => {
+    const workspace = await createTempWorkspace('gsd-web-status-');
+    const runtimeDir = path.join(workspace.root, '.gsd-web');
+    const pidFilePath = path.join(runtimeDir, 'gsd-web.pid');
+    const previousHome = process.env.GSD_WEB_HOME;
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+
+    cleanupTasks.push(workspace.cleanup);
+
+    try {
+      process.env.GSD_WEB_HOME = runtimeDir;
+      await mkdir(runtimeDir, { recursive: true });
+      await writeFile(
+        pidFilePath,
+        `${JSON.stringify({
+          pid: process.pid,
+          address: 'http://127.0.0.1:3000',
+          startedAt: '2026-04-24T12:00:00.000Z',
+          runtimeDir,
+          databasePath: path.join(runtimeDir, 'data', 'gsd-web.sqlite'),
+          logFilePath: path.join(runtimeDir, 'logs', 'gsd-web.log'),
+          logRetentionDays: 7,
+          logMaxFileSizeBytes: 20 * 1024 * 1024,
+        }, null, 2)}\n`,
+        'utf8',
+      );
+
+      expect(await runCli(['status'])).toBe(0);
+      expect(infoSpy.mock.calls).toEqual(
+        expect.arrayContaining([
+          [expect.stringContaining('gsd-web is running')],
+          [expect.stringContaining(`logs: ${path.join(runtimeDir, 'logs', 'gsd-web.log')}`)],
+          [expect.stringContaining('log policy: daily rotation, gzip archives, 7-day retention, 20 MiB max active file')],
+        ]),
+      );
+    } finally {
+      infoSpy.mockRestore();
+
+      if (previousHome === undefined) {
+        delete process.env.GSD_WEB_HOME;
+      } else {
+        process.env.GSD_WEB_HOME = previousHome;
+      }
+    }
   });
 });

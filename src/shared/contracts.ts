@@ -364,6 +364,14 @@ export interface FilesystemDirectoryResponse {
   truncated: boolean;
 }
 
+export interface LogPolicySummary {
+  enabled: boolean;
+  rotateDaily: true;
+  compression: 'gzip';
+  retentionDays: number;
+  maxFileSizeBytes: number;
+}
+
 export interface HealthResponse {
   service: typeof SERVICE_NAME;
   status: 'ok';
@@ -371,6 +379,7 @@ export interface HealthResponse {
   runtime: {
     directory: string;
     logFile: string | null;
+    logPolicy: LogPolicySummary;
   };
   database: {
     connected: true;

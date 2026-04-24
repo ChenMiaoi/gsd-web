@@ -154,6 +154,8 @@ The `/lazy` base path is intentional: the dashboard is for avoiding manual statu
 | `GSD_WEB_LOG_DIR` | `~/.gsd-web/logs` | Log directory |
 | `GSD_WEB_LOG_FILE` | `~/.gsd-web/logs/gsd-web.log` | JSONL service log |
 | `GSD_WEB_LOG_LEVEL` | `info` | Service log level |
+| `GSD_WEB_LOG_RETENTION_DAYS` | `7` | Delete rotated archives older than this many days |
+| `GSD_WEB_LOG_MAX_SIZE_MB` | `20` | Rotate the active log once it grows past this size |
 | `GSD_WEB_REQUEST_LOGS` | `false` | Enable HTTP request access logs |
 | `GSD_WEB_MONITOR_INTERVAL_MS` | `10000` | Periodic project monitor backstop interval |
 | `GSD_WEB_CLIENT_DIST_DIR` | packaged browser build | Static frontend directory |
@@ -165,6 +167,8 @@ Example:
 PORT=3001 GSD_BIN_PATH=/path/to/gsd gsd-web
 gsd-web start --host 0.0.0.0 --port 3001
 ```
+
+Service logs stay in the configured active file and rotate automatically when the local day changes or the file exceeds the configured size. Rotated archives are gzip-compressed and named like `gsd-web-YYYY-MM-DD.log.gz`, with `-1`, `-2`, and so on added when multiple archives are produced on the same day. The effective log policy is visible in `gsd-web status` and `GET /api/health`.
 
 ## Architecture
 
