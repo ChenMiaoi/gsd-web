@@ -13,6 +13,8 @@ import type {
 } from '../../src/shared/contracts.js';
 import { startServer } from '../../src/server/index.js';
 import type { RuntimeSignal } from '../../src/server/app.js';
+import type { RegistryDatabase } from '../../src/server/db.js';
+import { EventHub } from '../../src/server/routes/events.js';
 import {
   applyProjectMutationsBurst,
   createInitializedProject,
@@ -235,6 +237,35 @@ async function waitForRuntimeSignal(
 }
 
 describe('project monitor watcher scheduling', () => {
+  test('isolates failed SSE subscribers from later project event broadcasts', () => {
+    const eventHub = new EventHub({} as RegistryDatabase);
+    const delivered: string[] = [];
+    const event: ProjectEventEnvelope = {
+      id: 'evt_1',
+      sequence: 1,
+      type: 'service.ready',
+      emittedAt: new Date(0).toISOString(),
+      projectId: null,
+      payload: {
+        service: 'gsd-web',
+        projects: {
+          total: 0,
+        },
+      },
+    };
+
+    eventHub.subscribe(() => {
+      throw new Error('client stream is already closed');
+    });
+    eventHub.subscribe((nextEvent) => {
+      delivered.push(nextEvent.id);
+    });
+
+    expect(() => eventHub.broadcast(event)).not.toThrow();
+    expect(() => eventHub.broadcast({ ...event, id: 'evt_2', sequence: 2 })).not.toThrow();
+    expect(delivered).toEqual(['evt_1', 'evt_2']);
+  });
+
   test('reconciles watcher hints quickly, coalesces bursts, and replays sparse watcher events after reconnect', async () => {
     const service = await bootService({ monitorIntervalMs: 10_000 });
     const events = await openEventStream(`${service.baseUrl}/api/events`);

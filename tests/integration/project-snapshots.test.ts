@@ -672,6 +672,7 @@ Resume interrupted work on T01: Completed task in slice S01.
     });
     expect(duplicateResponse.status).toBe(409);
     expect(await duplicateResponse.json()).toMatchObject({
+      error: 'Conflict',
       code: 'duplicate_path',
       statusCode: 409,
     });
@@ -695,6 +696,7 @@ Resume interrupted work on T01: Completed task in slice S01.
     const unknownRefreshResponse = await postJson(`${service.baseUrl}/api/projects/does-not-exist/refresh`);
     expect(unknownRefreshResponse.status).toBe(404);
     expect(await unknownRefreshResponse.json()).toMatchObject({
+      error: 'Not Found',
       code: 'project_not_found',
       statusCode: 404,
     });

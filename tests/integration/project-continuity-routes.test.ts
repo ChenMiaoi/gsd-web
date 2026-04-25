@@ -293,6 +293,7 @@ describe('project continuity routes', () => {
 
     expect(duplicateRelinkResponse.status).toBe(409);
     expect(await duplicateRelinkResponse.json()).toMatchObject({
+      error: 'Conflict',
       code: 'duplicate_path',
       statusCode: 409,
     });

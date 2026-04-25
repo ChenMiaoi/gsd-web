@@ -443,6 +443,7 @@ describe('project init routes and SSE contract', () => {
     );
     expect(ineligibleInitResponse.status).toBe(409);
     expect(await ineligibleInitResponse.json()).toMatchObject({
+      error: 'Conflict',
       code: 'project_ineligible',
       statusCode: 409,
     });
@@ -458,6 +459,7 @@ describe('project init routes and SSE contract', () => {
     const secondInitResponse = await postJson(`${service.baseUrl}/api/projects/${project.project.projectId}/init`);
     expect(secondInitResponse.status).toBe(409);
     expect(await secondInitResponse.json()).toMatchObject({
+      error: 'Conflict',
       code: 'init_job_active',
       statusCode: 409,
     });

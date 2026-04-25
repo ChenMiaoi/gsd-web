@@ -65,9 +65,26 @@ class DirectoryBrowserError extends Error {
   }
 }
 
+function getHttpErrorTitle(statusCode: number) {
+  switch (statusCode) {
+    case 400:
+      return 'Bad Request';
+    case 403:
+      return 'Forbidden';
+    case 404:
+      return 'Not Found';
+    case 409:
+      return 'Conflict';
+    case 504:
+      return 'Gateway Timeout';
+    default:
+      return statusCode >= 500 ? 'Internal Server Error' : 'Bad Request';
+  }
+}
+
 function sendError(reply: FastifyReply, statusCode: number, message: string, code?: string) {
   return reply.code(statusCode).send({
-    error: statusCode >= 500 ? 'Internal Server Error' : 'Bad Request',
+    error: getHttpErrorTitle(statusCode),
     message,
     statusCode,
     code,

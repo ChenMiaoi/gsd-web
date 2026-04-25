@@ -42,7 +42,11 @@ export class EventHub {
 
   broadcast(event: ProjectEventEnvelope) {
     for (const subscriber of this.subscribers) {
-      subscriber(event);
+      try {
+        subscriber(event);
+      } catch {
+        this.subscribers.delete(subscriber);
+      }
     }
   }
 
@@ -107,18 +111,38 @@ export async function registerEventsRoute(
       reply.raw.write(serializeSseEvent(event));
     }
 
-    const unsubscribe = options.eventHub.subscribe((event) => {
-      reply.raw.write(serializeSseEvent(event));
-    });
-
-    const heartbeat = setInterval(() => {
-      reply.raw.write(`: keepalive ${Date.now()}\n\n`);
-    }, HEARTBEAT_INTERVAL_MS);
+    let closed = false;
 
     const cleanup = () => {
+      if (closed) {
+        return;
+      }
+
+      closed = true;
       clearInterval(heartbeat);
       unsubscribe();
     };
+
+    const writeSseChunk = (chunk: string) => {
+      if (closed || reply.raw.destroyed || reply.raw.writableEnded) {
+        cleanup();
+        return;
+      }
+
+      try {
+        reply.raw.write(chunk);
+      } catch {
+        cleanup();
+      }
+    };
+
+    const unsubscribe = options.eventHub.subscribe((event) => {
+      writeSseChunk(serializeSseEvent(event));
+    });
+
+    const heartbeat = setInterval(() => {
+      writeSseChunk(`: keepalive ${Date.now()}\n\n`);
+    }, HEARTBEAT_INTERVAL_MS);
 
     const socket = reply.raw.socket as Socket | null;
     socket?.on('close', cleanup);
