@@ -8,6 +8,7 @@ import {
   buildSlackCommandResponse,
   buildSlackMessage,
   buildSlackStatusMessage,
+  hasAnyRunningProject,
   parseSlackCommandPayload,
   resolveSlackNotifierConfig,
   shouldSendImmediateStatusReport,
@@ -237,6 +238,53 @@ describe('Slack notifier', () => {
     expect(JSON.stringify(message.blocks)).toContain('Current project');
     expect(JSON.stringify(message.blocks)).toContain('ETA');
     expect(JSON.stringify(message.blocks)).toContain('https://gsd.example.test/lazy/employee-prj_test');
+  });
+
+  test('skips recurring Slack status delivery when no project is running', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response('ok', { status: 200 }));
+    const notifier = new SlackNotifier(
+      {
+        webhookUrl: 'https://hooks.slack.com/services/test',
+        eventTypes: ['project.refreshed'],
+        timeoutMs: 1_000,
+        statusReportEnabled: true,
+      },
+      { fetchImpl },
+    );
+
+    const project = createProjectRecord();
+
+    await expect(notifier.sendStatus([project], 1_777_132_800_000)).resolves.toBe(false);
+    expect(hasAnyRunningProject([project])).toBe(false);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  test('sends recurring Slack status delivery while a project is running', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response('ok', { status: 200 }));
+    const notifier = new SlackNotifier(
+      {
+        webhookUrl: 'https://hooks.slack.com/services/test',
+        eventTypes: ['project.refreshed'],
+        timeoutMs: 1_000,
+        statusReportEnabled: true,
+      },
+      { fetchImpl },
+    );
+    const project = createProjectRecord();
+
+    project.snapshot.sources.autoLock = {
+      state: 'ok',
+      value: {
+        status: 'running',
+        pid: 4242,
+        startedAt: '2026-04-26T01:00:00.000Z',
+        updatedAt: '2026-04-26T01:01:00.000Z',
+      },
+    };
+
+    await expect(notifier.sendStatus([project], 1_777_132_800_000)).resolves.toBe(true);
+    expect(hasAnyRunningProject([project])).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   test('detects project events that should trigger immediate status reports', () => {

@@ -30,6 +30,7 @@ import { registerSlackRoutes } from './routes/slack.js';
 import {
   DEFAULT_SLACK_EVENT_TYPES,
   SlackNotifier,
+  hasAnyRunningProject,
   resolveSlackCommandConfig,
   resolveSlackNotifierConfig,
   shouldSendImmediateStatusReport,
@@ -150,8 +151,14 @@ class SlackStatusReporter {
   }
 
   private send(_reason: 'startup' | 'interval' | 'change', now: number = Date.now()) {
+    const projects = this.registry.listProjects();
+
+    if (!hasAnyRunningProject(projects)) {
+      return;
+    }
+
     this.lastSentAt = now;
-    void this.notifier.sendStatus(this.registry.listProjects(), now);
+    void this.notifier.sendStatus(projects, now);
   }
 }
 

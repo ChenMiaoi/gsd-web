@@ -7,6 +7,7 @@ import type {
   ProjectEventType,
   ProjectRecord,
 } from '../shared/contracts.js';
+import { isProjectInitJobTerminalStage } from '../shared/contracts.js';
 
 export const DEFAULT_SLACK_EVENT_TYPES: readonly ProjectEventType[] = [
   'project.registered',
@@ -588,6 +589,22 @@ function isWorkflowActive(status: string | null | undefined) {
   return /^(active|running|executing|in_progress|in-progress|current)$/iu.test(status?.trim() ?? '');
 }
 
+export function hasRunningProject(project: ProjectRecord) {
+  if (project.latestInitJob !== null && !isProjectInitJobTerminalStage(project.latestInitJob.stage)) {
+    return true;
+  }
+
+  if (isWorkflowActive(project.snapshot.sources.autoLock.value?.status)) {
+    return true;
+  }
+
+  return summarizeMilestones(project.snapshot.sources.gsdDb.value?.milestones ?? []).activeLabel !== null;
+}
+
+export function hasAnyRunningProject(projects: ProjectRecord[]) {
+  return projects.some((project) => hasRunningProject(project));
+}
+
 function summarizeMilestones(milestones: GsdDbMilestoneSummary[]) {
   let totalTasks = 0;
   let completedTasks = 0;
@@ -1060,7 +1077,12 @@ export class SlackNotifier {
   }
 
   async sendStatus(projects: ProjectRecord[], nowMs: number = Date.now()) {
+    if (!hasAnyRunningProject(projects)) {
+      return false;
+    }
+
     await this.postMessage(buildSlackStatusMessage(projects, this.config.publicBaseUrl, nowMs));
+    return true;
   }
 
   private async postMessage(message: SlackMessage) {
