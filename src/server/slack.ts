@@ -1,7 +1,10 @@
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
 import type {
   ProjectEventEnvelope,
   ProjectEventPayload,
   ProjectEventType,
+  ProjectRecord,
 } from '../shared/contracts.js';
 
 export const DEFAULT_SLACK_EVENT_TYPES: readonly ProjectEventType[] = [
@@ -20,6 +23,7 @@ export interface SlackNotifierConfig {
   webhookUrl?: string;
   botToken?: string;
   channelId?: string;
+  signingSecret?: string;
   publicBaseUrl?: string;
   eventTypes: readonly ProjectEventType[];
   timeoutMs: number;
@@ -44,8 +48,38 @@ export interface SlackNotifierFileConfig {
   webhookUrl?: string;
   botToken?: string;
   channelId?: string;
+  signingSecret?: string;
   events?: readonly ProjectEventType[];
   timeoutMs?: number;
+}
+
+export interface SlackCommandConfig {
+  signingSecret: string;
+  publicBaseUrl?: string;
+}
+
+export interface SlackCommandPayload {
+  command: string;
+  text: string;
+  userId: string | null;
+  channelId: string | null;
+  responseUrl: string | null;
+}
+
+export interface SlackCommandResponse {
+  response_type: 'ephemeral' | 'in_channel';
+  text: string;
+  blocks?: Array<{
+    type: 'section' | 'context';
+    text?: {
+      type: 'mrkdwn';
+      text: string;
+    };
+    elements?: Array<{
+      type: 'mrkdwn';
+      text: string;
+    }>;
+  }>;
 }
 
 export class SlackNotificationError extends Error {
@@ -130,6 +164,8 @@ export function resolveSlackNotifierConfig(
   const envWebhookUrl = readTrimmedEnv(env, 'GSD_WEB_SLACK_WEBHOOK_URL');
   const envBotToken = readTrimmedEnv(env, 'GSD_WEB_SLACK_BOT_TOKEN');
   const envChannelId = readTrimmedEnv(env, 'GSD_WEB_SLACK_CHANNEL_ID');
+  const signingSecret =
+    readTrimmedEnv(env, 'GSD_WEB_SLACK_SIGNING_SECRET') ?? normalizeOptionalConfigString(fileConfig?.signingSecret);
   const hasEnvDeliveryConfig = envWebhookUrl !== undefined || envBotToken !== undefined || envChannelId !== undefined;
 
   if (fileConfig?.enabled === false && !hasEnvDeliveryConfig) {
@@ -148,16 +184,13 @@ export function resolveSlackNotifierConfig(
   }
 
   if (webhookUrl === undefined && botToken === undefined && channelId === undefined) {
-    if (fileConfig?.enabled === true) {
-      throw new Error('Slack config is enabled but no webhookUrl or bot token/channel pair is configured.');
-    }
-
     return null;
   }
 
   if (webhookUrl !== undefined) {
     return {
       webhookUrl,
+      ...(signingSecret === undefined ? {} : { signingSecret }),
       ...(publicBaseUrl === undefined ? {} : { publicBaseUrl }),
       eventTypes,
       timeoutMs,
@@ -171,9 +204,29 @@ export function resolveSlackNotifierConfig(
   return {
     botToken,
     channelId,
+    ...(signingSecret === undefined ? {} : { signingSecret }),
     ...(publicBaseUrl === undefined ? {} : { publicBaseUrl }),
     eventTypes,
     timeoutMs,
+  };
+}
+
+export function resolveSlackCommandConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  fileConfig: SlackNotifierFileConfig | null = null,
+  publicBaseUrlFromFile?: string,
+): SlackCommandConfig | null {
+  const signingSecret =
+    readTrimmedEnv(env, 'GSD_WEB_SLACK_SIGNING_SECRET') ?? normalizeOptionalConfigString(fileConfig?.signingSecret);
+  const publicBaseUrl = readTrimmedEnv(env, 'GSD_WEB_PUBLIC_URL') ?? normalizeOptionalConfigString(publicBaseUrlFromFile);
+
+  if (signingSecret === undefined) {
+    return null;
+  }
+
+  return {
+    signingSecret,
+    ...(publicBaseUrl === undefined ? {} : { publicBaseUrl }),
   };
 }
 
@@ -243,6 +296,12 @@ function buildProjectUrl(publicBaseUrl: string | undefined, event: ProjectEventE
   return `${baseUrl}/lazy/employee-${encodeURIComponent(projectId)}`;
 }
 
+function buildProjectDetailUrl(publicBaseUrl: string | undefined, projectId: string) {
+  const baseUrl = normalizeBaseUrl(publicBaseUrl);
+
+  return baseUrl ? `${baseUrl}/lazy/employee-${encodeURIComponent(projectId)}` : null;
+}
+
 function buildFieldLines(event: ProjectEventEnvelope) {
   const payload = asRecord(event.payload);
   const lines = [
@@ -300,6 +359,188 @@ export function buildSlackMessage(event: ProjectEventEnvelope, publicBaseUrl?: s
         },
       },
     ],
+  };
+}
+
+export function parseSlackCommandPayload(rawBody: string): SlackCommandPayload {
+  const form = new URLSearchParams(rawBody);
+
+  return {
+    command: form.get('command') ?? '',
+    text: form.get('text')?.trim() ?? '',
+    userId: form.get('user_id'),
+    channelId: form.get('channel_id'),
+    responseUrl: form.get('response_url'),
+  };
+}
+
+export function verifySlackRequest(input: {
+  signingSecret: string;
+  rawBody: string;
+  timestamp: string | undefined;
+  signature: string | undefined;
+  nowMs?: number;
+}) {
+  if (!input.timestamp || !/^\d+$/u.test(input.timestamp) || !input.signature) {
+    return false;
+  }
+
+  const nowSeconds = Math.floor((input.nowMs ?? Date.now()) / 1000);
+  const requestSeconds = Number.parseInt(input.timestamp, 10);
+
+  if (Math.abs(nowSeconds - requestSeconds) > 60 * 5) {
+    return false;
+  }
+
+  const baseString = `v0:${input.timestamp}:${input.rawBody}`;
+  const expected = `v0=${createHmac('sha256', input.signingSecret).update(baseString).digest('hex')}`;
+  const expectedBuffer = Buffer.from(expected, 'utf8');
+  const actualBuffer = Buffer.from(input.signature, 'utf8');
+
+  return expectedBuffer.length === actualBuffer.length && timingSafeEqual(expectedBuffer, actualBuffer);
+}
+
+function projectDisplayName(project: ProjectRecord) {
+  return (
+    project.snapshot.identityHints.displayName
+    ?? project.snapshot.sources.repoMeta.value?.projectName
+    ?? project.snapshot.sources.projectMd.value?.title
+    ?? project.canonicalPath.split(/[\\/]/u).filter(Boolean).at(-1)
+    ?? project.projectId
+  );
+}
+
+function summarizeProjectLine(project: ProjectRecord, publicBaseUrl?: string) {
+  const name = projectDisplayName(project);
+  const detailUrl = buildProjectDetailUrl(publicBaseUrl, project.projectId);
+  const label = detailUrl ? `<${detailUrl}|${name}>` : name;
+  const initStage = project.latestInitJob ? `, init ${project.latestInitJob.stage}` : '';
+
+  return `• ${label}: ${project.snapshot.status}, monitor ${project.monitor.health}, ${project.snapshot.warnings.length} warnings${initStage}`;
+}
+
+function formatProjectsSummary(projects: ProjectRecord[], publicBaseUrl?: string) {
+  if (projects.length === 0) {
+    return 'No projects are registered in gsd-web yet.';
+  }
+
+  const initialized = projects.filter((project) => project.snapshot.status === 'initialized').length;
+  const degraded = projects.filter((project) => project.snapshot.status === 'degraded').length;
+  const uninitialized = projects.filter((project) => project.snapshot.status === 'uninitialized').length;
+  const unhealthy = projects.filter((project) => project.monitor.health !== 'healthy').length;
+  const lines = projects
+    .slice(0, 8)
+    .map((project) => summarizeProjectLine(project, publicBaseUrl));
+
+  if (projects.length > lines.length) {
+    lines.push(`• ...and ${projects.length - lines.length} more`);
+  }
+
+  return [
+    `GSD projects: ${projects.length} total (${initialized} initialized, ${degraded} degraded, ${uninitialized} uninitialized).`,
+    `Monitor attention: ${unhealthy}.`,
+    '',
+    ...lines,
+  ].join('\n');
+}
+
+function normalizeQuery(value: string) {
+  return value.trim().toLowerCase();
+}
+
+function findProject(projects: ProjectRecord[], query: string) {
+  const normalizedQuery = normalizeQuery(query);
+
+  if (normalizedQuery.length === 0) {
+    return null;
+  }
+
+  return projects.find((project) => {
+    const candidates = [
+      project.projectId,
+      projectDisplayName(project),
+      project.canonicalPath,
+      project.registeredPath,
+      project.canonicalPath.split(/[\\/]/u).filter(Boolean).at(-1) ?? '',
+    ];
+
+    return candidates.some((candidate) => normalizeQuery(candidate).includes(normalizedQuery));
+  }) ?? null;
+}
+
+function formatProjectDetail(project: ProjectRecord, publicBaseUrl?: string) {
+  const name = projectDisplayName(project);
+  const detailUrl = buildProjectDetailUrl(publicBaseUrl, project.projectId);
+  const title = detailUrl ? `<${detailUrl}|${name}>` : name;
+  const timeline = project.latestInitJob
+    ? `Init: ${project.latestInitJob.stage} (${project.latestInitJob.updatedAt})`
+    : 'Init: no job';
+  const monitorError = project.monitor.lastError ? `Monitor error: ${project.monitor.lastError.message}` : null;
+  const warningLines = project.snapshot.warnings.slice(0, 5).map((warning) => `• ${warning.source}: ${warning.message}`);
+
+  return [
+    `*${title}*`,
+    `Project: ${project.projectId}`,
+    `Snapshot: ${project.snapshot.status}`,
+    `Monitor: ${project.monitor.health}`,
+    `Warnings: ${project.snapshot.warnings.length}`,
+    `Path: ${project.canonicalPath}`,
+    timeline,
+    ...(monitorError ? [monitorError] : []),
+    ...(warningLines.length > 0 ? ['', '*Warnings*', ...warningLines] : []),
+  ].join('\n');
+}
+
+export function buildSlackCommandResponse(
+  payload: SlackCommandPayload,
+  projects: ProjectRecord[],
+  publicBaseUrl?: string,
+): SlackCommandResponse {
+  const [action = 'status', ...args] = payload.text.split(/\s+/u).filter(Boolean);
+  const query = args.join(' ');
+
+  if (action === 'help') {
+    return {
+      response_type: 'ephemeral',
+      text: 'gsd-web Slack commands',
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: [
+              '*gsd-web commands*',
+              '`/gsd` or `/gsd status` - show project summary',
+              '`/gsd projects` - list registered projects',
+              '`/gsd project <id|name|path>` - show one project',
+            ].join('\n'),
+          },
+        },
+      ],
+    };
+  }
+
+  if (action === 'project' || (action === 'status' && query.length > 0)) {
+    const project = findProject(projects, action === 'project' ? query : query);
+
+    return {
+      response_type: 'ephemeral',
+      text: project
+        ? formatProjectDetail(project, publicBaseUrl)
+        : `No registered project matched "${query}".`,
+    };
+  }
+
+  if (action === 'status' || action === 'projects') {
+    return {
+      response_type: 'ephemeral',
+      text: formatProjectsSummary(projects, publicBaseUrl),
+    };
+  }
+
+  return {
+    response_type: 'ephemeral',
+    text: `Unknown gsd-web command: ${action}\nTry /gsd help.`,
   };
 }
 

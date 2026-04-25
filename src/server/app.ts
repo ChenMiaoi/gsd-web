@@ -26,9 +26,11 @@ import {
 import { ProjectReconciler, type ProjectReconcileSignal } from './project-reconcile.js';
 import { EventHub, registerEventsRoute } from './routes/events.js';
 import { registerProjectRoutes, type ProjectInitRunner } from './routes/projects.js';
+import { registerSlackRoutes } from './routes/slack.js';
 import {
   DEFAULT_SLACK_EVENT_TYPES,
   SlackNotifier,
+  resolveSlackCommandConfig,
   resolveSlackNotifierConfig,
   type SlackNotifierFileConfig,
   type SlackNotifierConfig,
@@ -257,6 +259,7 @@ function createDefaultConfigFileContent() {
         webhookUrl: '',
         botToken: '',
         channelId: '',
+        signingSecret: '',
         events: DEFAULT_SLACK_EVENT_TYPES,
         timeoutMs: 5000,
       },
@@ -312,7 +315,7 @@ function parseRuntimeConfig(rawConfig: string): GsdWebConfig {
       slack.enabled = enabled;
     }
 
-    for (const key of ['webhookUrl', 'botToken', 'channelId'] as const) {
+    for (const key of ['webhookUrl', 'botToken', 'channelId', 'signingSecret'] as const) {
       const value = parseOptionalConfigString(slackRecord, key);
 
       if (value !== undefined) {
@@ -573,6 +576,13 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
     disableRequestLogging: !(resolveOptionalEnvBoolean(process.env, 'GSD_WEB_REQUEST_LOGS') ?? false),
     forceCloseConnections: true,
   }) as unknown as GsdWebApp;
+  app.addContentTypeParser(
+    'application/x-www-form-urlencoded',
+    { parseAs: 'string', bodyLimit: 16 * 1024 },
+    (_request, body, done) => {
+      done(null, body);
+    },
+  );
   app.gsdWebPaths = {
     ...defaults,
     runtimeDir,
@@ -727,6 +737,24 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
     });
 
     for (const route of projectRoutes) {
+      emitSignal(
+        app,
+        options.logSink,
+        {
+          event: 'route_registration',
+          method: route.method,
+          route: route.route,
+        },
+        'Registered route',
+      );
+    }
+
+    const slackRoutes = await registerSlackRoutes(app, {
+      registry: registryInstance,
+      commandConfig: resolveSlackCommandConfig(process.env, runtimeConfig.slack ?? null, runtimeConfig.publicUrl),
+    });
+
+    for (const route of slackRoutes) {
       emitSignal(
         app,
         options.logSink,

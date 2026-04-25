@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { createHmac } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { TextDecoder } from 'node:util';
 import type { AddressInfo } from 'node:net';
@@ -10,7 +11,7 @@ import type { ProjectEventEnvelope } from '../../src/shared/contracts.js';
 import { createApp, resolveDefaultPaths, type RuntimeSignal } from '../../src/server/app.js';
 import { REGISTRY_SCHEMA_VERSION } from '../../src/server/db.js';
 import { parseCliInvocation, runCli, startServer } from '../../src/server/index.js';
-import { createTempWorkspace, writeClientShell } from '../helpers/project-fixtures.js';
+import { createEmptyProject, createTempWorkspace, writeClientShell } from '../helpers/project-fixtures.js';
 
 const cleanupTasks: Array<() => Promise<void>> = [];
 
@@ -346,10 +347,86 @@ describe('service shell bootstrap', () => {
         expect.objectContaining({ method: 'DELETE', route: '/api/projects/:id' }),
         expect.objectContaining({ method: 'POST', route: '/api/projects/:id/refresh' }),
         expect.objectContaining({ method: 'POST', route: '/api/projects/:id/init' }),
+        expect.objectContaining({ method: 'POST', route: '/api/slack/commands' }),
         expect.objectContaining({ method: 'GET', route: '/api/events' }),
         expect.objectContaining({ method: 'GET', route: '/*' }),
       ]),
     );
+  });
+
+  test('answers signed Slack slash command status requests', async () => {
+    const workspace = await createTempWorkspace('gsd-web-slack-command-');
+    const clientDistDir = await writeClientShell(workspace.root);
+    const databasePath = path.join(workspace.root, 'data', 'gsd-web.sqlite');
+    const projectRoot = await createEmptyProject(workspace.root, 'slack-visible-project');
+    const signingSecret = 'test-signing-secret';
+
+    cleanupTasks.push(workspace.cleanup);
+
+    const app = await startServer({
+      host: '127.0.0.1',
+      port: 0,
+      databasePath,
+      clientDistDir,
+      logger: false,
+      config: {
+        publicUrl: 'https://gsd.example.test',
+        slack: {
+          enabled: true,
+          signingSecret,
+        },
+      },
+    });
+
+    cleanupTasks.push(async () => {
+      await app.close();
+    });
+
+    const baseUrl = getBaseUrl(app);
+    const registerResponse = await fetch(`${baseUrl}/api/projects/register`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ path: projectRoot }),
+    });
+    expect(registerResponse.status).toBe(201);
+
+    const rawBody = new URLSearchParams({
+      command: '/gsd',
+      text: 'project slack-visible',
+      user_id: 'U123',
+      channel_id: 'C123',
+    }).toString();
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const signature = `v0=${createHmac('sha256', signingSecret).update(`v0:${timestamp}:${rawBody}`).digest('hex')}`;
+    const commandResponse = await fetch(`${baseUrl}/api/slack/commands`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        'x-slack-request-timestamp': timestamp,
+        'x-slack-signature': signature,
+      },
+      body: rawBody,
+    });
+
+    expect(commandResponse.status).toBe(200);
+    expect(await commandResponse.json()).toMatchObject({
+      response_type: 'ephemeral',
+      text: expect.stringContaining('slack-visible-project'),
+    });
+
+    const unsignedResponse = await fetch(`${baseUrl}/api/slack/commands`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: rawBody,
+    });
+    expect(unsignedResponse.status).toBe(401);
+
+    await app.close();
+    cleanupTasks.pop();
   });
 
   test('prints log policy in CLI status output when daemon metadata is present', async () => {

@@ -1,10 +1,15 @@
+import { createHmac } from 'node:crypto';
+
 import { describe, expect, test, vi } from 'vitest';
 
-import type { ProjectEventEnvelope, ProjectSnapshotEventPayload } from '../../src/shared/contracts.js';
+import type { ProjectEventEnvelope, ProjectRecord, ProjectSnapshotEventPayload } from '../../src/shared/contracts.js';
 import {
   SlackNotifier,
+  buildSlackCommandResponse,
   buildSlackMessage,
+  parseSlackCommandPayload,
   resolveSlackNotifierConfig,
+  verifySlackRequest,
   type SlackNotificationSignal,
 } from '../../src/server/slack.js';
 
@@ -46,6 +51,55 @@ function createProjectEvent(
       },
     },
     ...overrides,
+  };
+}
+
+function createProjectRecord(): ProjectRecord {
+  const event = createProjectEvent();
+
+  return {
+    projectId: 'prj_test',
+    registeredPath: '/workspace/demo-project',
+    canonicalPath: '/workspace/demo-project',
+    createdAt: '2026-04-26T01:00:00.000Z',
+    updatedAt: '2026-04-26T01:00:00.000Z',
+    lastEventId: 'evt_1',
+    snapshot: {
+      status: 'initialized',
+      checkedAt: event.payload.checkedAt,
+      directory: {
+        isEmpty: false,
+        sampleEntries: ['.gsd'],
+        sampleTruncated: false,
+      },
+      identityHints: {
+        gsdId: 'gsd-demo',
+        repoFingerprint: null,
+        displayName: 'demo-project',
+        displayNameSource: 'directory',
+      },
+      sources: {
+        directory: { state: 'ok', value: { isEmpty: false, sampleEntries: ['.gsd'], sampleTruncated: false } },
+        gsdDirectory: { state: 'ok', value: { present: true } },
+        gsdId: { state: 'ok', value: { gsdId: 'gsd-demo' } },
+        projectMd: { state: 'missing' },
+        repoMeta: { state: 'missing' },
+        autoLock: { state: 'missing' },
+        stateMd: { state: 'missing' },
+        metricsJson: { state: 'missing' },
+        gsdDb: { state: 'missing' },
+      },
+      warnings: [],
+    },
+    monitor: event.payload.monitor,
+    dataLocation: {
+      projectRoot: '/workspace/demo-project',
+      gsdRootPath: '/workspace/demo-project/.gsd',
+      gsdDbPath: '/workspace/demo-project/.gsd/gsd.db',
+      statePath: '/workspace/demo-project/.gsd/STATE.md',
+      persistenceScope: 'project',
+    },
+    latestInitJob: null,
   };
 }
 
@@ -119,7 +173,57 @@ describe('Slack notifier', () => {
       eventTypes: ['project.init.updated'],
     });
 
-    expect(() => resolveSlackNotifierConfig({}, { enabled: true })).toThrow(/enabled but no webhookUrl/i);
+    expect(resolveSlackNotifierConfig({}, { enabled: true, signingSecret: 'secret' })).toBeNull();
+  });
+
+  test('verifies and parses Slack slash command requests', () => {
+    const timestamp = '1777132800';
+    const rawBody = 'command=%2Fgsd&text=project%20demo&user_id=U123&channel_id=C123';
+    const signature = `v0=${createHmac('sha256', 'secret').update(`v0:${timestamp}:${rawBody}`).digest('hex')}`;
+
+    expect(
+      verifySlackRequest({
+        signingSecret: 'secret',
+        rawBody,
+        timestamp,
+        signature,
+        nowMs: 1_777_132_800_000,
+      }),
+    ).toBe(true);
+    expect(
+      verifySlackRequest({
+        signingSecret: 'wrong',
+        rawBody,
+        timestamp,
+        signature,
+        nowMs: 1_777_132_800_000,
+      }),
+    ).toBe(false);
+    expect(parseSlackCommandPayload(rawBody)).toMatchObject({
+      command: '/gsd',
+      text: 'project demo',
+      userId: 'U123',
+      channelId: 'C123',
+    });
+  });
+
+  test('builds Slack slash command status and project responses', () => {
+    const project = createProjectRecord();
+    const status = buildSlackCommandResponse(
+      { command: '/gsd', text: 'status', userId: 'U123', channelId: 'C123', responseUrl: null },
+      [project],
+      'https://gsd.example.test',
+    );
+    const detail = buildSlackCommandResponse(
+      { command: '/gsd', text: 'project demo', userId: 'U123', channelId: 'C123', responseUrl: null },
+      [project],
+      'https://gsd.example.test',
+    );
+
+    expect(status.text).toContain('GSD projects: 1 total');
+    expect(status.text).toContain('demo-project');
+    expect(detail.text).toContain('prj_test');
+    expect(detail.text).toContain('https://gsd.example.test/lazy/employee-prj_test');
   });
 
   test('builds Slack messages with project detail links when a public URL is configured', () => {

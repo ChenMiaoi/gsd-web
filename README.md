@@ -164,6 +164,7 @@ The `/lazy` base path is intentional: the dashboard is for avoiding manual statu
 | `GSD_WEB_SLACK_WEBHOOK_URL` | unset | Slack Incoming Webhook URL for project event notifications |
 | `GSD_WEB_SLACK_BOT_TOKEN` | unset | Slack bot token used with `chat.postMessage` |
 | `GSD_WEB_SLACK_CHANNEL_ID` | unset | Slack channel ID for bot-token notifications |
+| `GSD_WEB_SLACK_SIGNING_SECRET` | unset | Slack signing secret for slash command verification |
 | `GSD_WEB_SLACK_EVENTS` | project events | Comma-separated event types to notify |
 | `GSD_WEB_SLACK_TIMEOUT_MS` | `5000` | Slack notification request timeout |
 | `GSD_BIN_PATH` | `gsd` | Executable used by the init runner |
@@ -185,6 +186,7 @@ Slack notifications are disabled by default. To send GSD project events to Slack
   "slack": {
     "enabled": true,
     "webhookUrl": "https://hooks.slack.com/services/...",
+    "signingSecret": "your-slack-signing-secret",
     "events": ["project.monitor.updated", "project.init.updated"],
     "timeoutMs": 5000
   }
@@ -199,12 +201,29 @@ For bot-token delivery instead of an Incoming Webhook, use:
   "slack": {
     "enabled": true,
     "botToken": "xoxb-...",
-    "channelId": "C0123456789"
+    "channelId": "C0123456789",
+    "signingSecret": "your-slack-signing-secret"
   }
 }
 ```
 
 The bot-token path uses Slack `chat.postMessage`; the app needs the `chat:write` scope and the bot must be invited to the target channel.
+
+To query gsd-web from Slack, create a Slash Command in the Slack app, set its request URL to:
+
+```text
+https://your-tunnel.example.com/api/slack/commands
+```
+
+Then set `slack.signingSecret` in `~/.gsd-web/config.json`. Supported command text:
+
+```text
+/gsd
+/gsd status
+/gsd projects
+/gsd project <project id, name, or path>
+/gsd help
+```
 
 You can also configure an Incoming Webhook with environment variables:
 
