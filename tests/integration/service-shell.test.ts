@@ -10,7 +10,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 import type { ProjectEventEnvelope } from '../../src/shared/contracts.js';
 import { createApp, resolveDefaultPaths, type RuntimeSignal } from '../../src/server/app.js';
 import { REGISTRY_SCHEMA_VERSION } from '../../src/server/db.js';
-import { parseCliInvocation, runCli, startServer } from '../../src/server/index.js';
+import { buildCompletionScript, parseCliInvocation, runCli, startServer } from '../../src/server/index.js';
 import { createEmptyProject, createTempWorkspace, writeClientShell } from '../helpers/project-fixtures.js';
 
 const cleanupTasks: Array<() => Promise<void>> = [];
@@ -113,6 +113,13 @@ describe('service shell bootstrap', () => {
         port: 65535,
       },
     });
+
+    expect(parseCliInvocation(['completion', 'zsh'])).toEqual({
+      command: 'completion',
+      daemonChild: false,
+      listenOptions: {},
+      completionShell: 'zsh',
+    });
   });
 
   test('rejects malformed host and port CLI options', () => {
@@ -120,6 +127,20 @@ describe('service shell bootstrap', () => {
     expect(() => parseCliInvocation(['--host', '   '])).toThrow(/host must not be empty/i);
     expect(() => parseCliInvocation(['--port', '65536'])).toThrow(/invalid port/i);
     expect(() => parseCliInvocation(['--bogus'])).toThrow(/unknown option/i);
+    expect(() => parseCliInvocation(['completion', 'powershell'])).toThrow(/unsupported completion shell/i);
+  });
+
+  test('prints shell completion scripts from the CLI', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+
+    try {
+      expect(buildCompletionScript('bash')).toContain('complete -F _gsd_web_completion gsd-web');
+      expect(await runCli(['completion', 'fish'])).toBe(0);
+      expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining('complete -c gsd-web'));
+      expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining('completion'));
+    } finally {
+      infoSpy.mockRestore();
+    }
   });
 
   test('resolves npm runtime defaults under the user home directory', async () => {

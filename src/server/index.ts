@@ -26,10 +26,13 @@ export interface CliListenOptions {
   port?: number;
 }
 
+export type CompletionShell = 'bash' | 'zsh' | 'fish';
+
 export interface CliInvocation {
   command: string;
   daemonChild: boolean;
   listenOptions: CliListenOptions;
+  completionShell?: CompletionShell;
 }
 
 interface DaemonState {
@@ -51,6 +54,9 @@ interface DaemonPaths {
 const DAEMON_CHILD_FLAG = '--daemon-child';
 const STOP_TIMEOUT_MS = 8_000;
 const START_TIMEOUT_MS = 8_000;
+const CLI_COMMANDS = ['start', 'stop', 'reload', 'restart', 'status', 'serve', 'completion', 'help'] as const;
+const CLI_OPTIONS = ['--host', '--port', '--help', '-h'] as const;
+const COMPLETION_SHELLS = ['bash', 'zsh', 'fish'] as const;
 
 function isEntrypoint() {
   if (process.argv[1] === undefined) {
@@ -97,6 +103,14 @@ function resolveHost(candidate: string | undefined): string | undefined {
   return host;
 }
 
+function parseCompletionShell(candidate: string): CompletionShell {
+  if ((COMPLETION_SHELLS as readonly string[]).includes(candidate)) {
+    return candidate as CompletionShell;
+  }
+
+  throw new Error(`Unsupported completion shell: ${candidate}`);
+}
+
 function parseCliListenValue(args: string[], index: number, option: string): { value: string; nextIndex: number } {
   const arg = args[index]!;
   const inlineValuePrefix = `${option}=`;
@@ -125,6 +139,7 @@ export function parseCliInvocation(argv: string[]): CliInvocation {
   const daemonChild = argv.includes(DAEMON_CHILD_FLAG);
   const listenOptions: CliListenOptions = {};
   let command: string | null = null;
+  let completionShell: CompletionShell | null = null;
   let index = 0;
 
   while (index < args.length) {
@@ -159,6 +174,12 @@ export function parseCliInvocation(argv: string[]): CliInvocation {
     }
 
     if (command !== null) {
+      if (command === 'completion' && completionShell === null) {
+        completionShell = parseCompletionShell(arg);
+        index += 1;
+        continue;
+      }
+
       throw new Error(`Unexpected argument: ${arg}`);
     }
 
@@ -170,6 +191,7 @@ export function parseCliInvocation(argv: string[]): CliInvocation {
     command: command ?? 'start',
     daemonChild,
     listenOptions,
+    ...(completionShell === null ? {} : { completionShell }),
   };
 }
 
@@ -219,6 +241,7 @@ Commands:
   restart     Alias for reload
   status      Show whether the background process is running
   serve       Run in the foreground
+  completion  Generate a shell completion script
   help        Show this help
 
 Options:
@@ -234,6 +257,118 @@ Environment:
   GSD_WEB_SLACK_EVENTS, GSD_WEB_SLACK_STATUS_REPORT,
   GSD_WEB_SLACK_STATUS_INTERVAL_MS, GSD_WEB_SLACK_STATUS_IMMEDIATE_MIN_INTERVAL_MS,
   GSD_WEB_SLACK_TIMEOUT_MS, GSD_BIN_PATH`);
+}
+
+function buildBashCompletionScript() {
+  const commands = CLI_COMMANDS.join(' ');
+  const options = CLI_OPTIONS.join(' ');
+  const shells = COMPLETION_SHELLS.join(' ');
+
+  return `# bash completion for gsd-web
+_gsd_web_completion() {
+  local cur prev
+  COMPREPLY=()
+  cur="\${COMP_WORDS[COMP_CWORD]}"
+  prev="\${COMP_WORDS[COMP_CWORD-1]}"
+
+  case "$prev" in
+    --host|--port)
+      return 0
+      ;;
+  esac
+
+  if [[ "\${COMP_WORDS[1]}" == "completion" && "$COMP_CWORD" -eq 2 ]]; then
+    COMPREPLY=( $(compgen -W "${shells}" -- "$cur") )
+    return 0
+  fi
+
+  if [[ "$cur" == -* ]]; then
+    COMPREPLY=( $(compgen -W "${options}" -- "$cur") )
+    return 0
+  fi
+
+  if [[ "$COMP_CWORD" -le 1 ]]; then
+    COMPREPLY=( $(compgen -W "${commands} ${options}" -- "$cur") )
+  fi
+}
+
+complete -F _gsd_web_completion gsd-web`;
+}
+
+function buildZshCompletionScript() {
+  return `#compdef gsd-web
+
+_gsd_web() {
+  local -a commands shells
+  commands=(
+    'start:Start gsd-web in the background'
+    'stop:Stop the background gsd-web process'
+    'reload:Restart the background gsd-web process'
+    'restart:Alias for reload'
+    'status:Show whether the background process is running'
+    'serve:Run in the foreground'
+    'completion:Generate a shell completion script'
+    'help:Show help'
+  )
+  shells=('bash:Bash' 'zsh:Zsh' 'fish:Fish')
+
+  _arguments \\
+    '--host[HTTP listen host]:host:' \\
+    '--port[HTTP listen port]:port:' \\
+    '(-h --help)'{-h,--help}'[Show help]' \\
+    '1:command:->command' \\
+    '2::shell:->shell'
+
+  case "$state" in
+    command)
+      _describe 'command' commands
+      ;;
+    shell)
+      if [[ "$words[2]" == "completion" ]]; then
+        _describe 'shell' shells
+      fi
+      ;;
+  esac
+}
+
+_gsd_web "$@"`;
+}
+
+function buildFishCompletionScript() {
+  return `# fish completion for gsd-web
+complete -c gsd-web -f
+complete -c gsd-web -n '__fish_use_subcommand' -a 'start' -d 'Start gsd-web in the background'
+complete -c gsd-web -n '__fish_use_subcommand' -a 'stop' -d 'Stop the background gsd-web process'
+complete -c gsd-web -n '__fish_use_subcommand' -a 'reload' -d 'Restart the background gsd-web process'
+complete -c gsd-web -n '__fish_use_subcommand' -a 'restart' -d 'Alias for reload'
+complete -c gsd-web -n '__fish_use_subcommand' -a 'status' -d 'Show whether the background process is running'
+complete -c gsd-web -n '__fish_use_subcommand' -a 'serve' -d 'Run in the foreground'
+complete -c gsd-web -n '__fish_use_subcommand' -a 'completion' -d 'Generate a shell completion script'
+complete -c gsd-web -n '__fish_use_subcommand' -a 'help' -d 'Show help'
+complete -c gsd-web -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
+complete -c gsd-web -l host -d 'HTTP listen host' -r
+complete -c gsd-web -l port -d 'HTTP listen port' -r
+complete -c gsd-web -s h -l help -d 'Show help'`;
+}
+
+export function buildCompletionScript(shell: CompletionShell) {
+  switch (shell) {
+    case 'bash':
+      return buildBashCompletionScript();
+    case 'zsh':
+      return buildZshCompletionScript();
+    case 'fish':
+      return buildFishCompletionScript();
+  }
+}
+
+function printCompletionUsage() {
+  console.info(`Usage: gsd-web completion <shell>
+
+Shells:
+  bash
+  zsh
+  fish`);
 }
 
 function getDaemonPaths(): DaemonPaths {
@@ -574,7 +709,7 @@ async function printStatus(): Promise<number> {
 
 export async function runCli(argv: string[]): Promise<number> {
   try {
-    const { command, daemonChild, listenOptions } = parseCliInvocation(argv);
+    const { command, daemonChild, listenOptions, completionShell } = parseCliInvocation(argv);
 
     switch (command) {
       case 'start':
@@ -591,6 +726,14 @@ export async function runCli(argv: string[]): Promise<number> {
         return reloadDaemon(listenOptions);
       case 'status':
         return printStatus();
+      case 'completion':
+        if (completionShell === undefined) {
+          printCompletionUsage();
+          return 1;
+        }
+
+        console.info(buildCompletionScript(completionShell));
+        return 0;
       case 'help':
       case '--help':
       case '-h':

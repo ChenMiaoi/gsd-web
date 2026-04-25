@@ -41,6 +41,7 @@
     "dist/server/shared",
     "dist/web",
     "docs/assets",
+    "scripts/install-completions.mjs",
     "LICENSE",
     "README.md"
   ],
@@ -53,6 +54,7 @@
     "build:web": "vite build",
     "build:server": "tsc --project tsconfig.json",
     "pack:check": "node scripts/check-npm-package.mjs",
+    "postinstall": "node scripts/install-completions.mjs",
     "prepack": "npm run build",
     "prepublishOnly": "npm run build && npm run pack:check",
     "verify:publish": "npm run build && npm run pack:check",

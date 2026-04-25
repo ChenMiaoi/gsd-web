@@ -20,6 +20,7 @@ const requiredFiles = [
   'dist/server/server/index.d.ts',
   'dist/server/shared/contracts.js',
   'dist/web/index.html',
+  'scripts/install-completions.mjs',
   'docs/assets/gsd-web-detail-01.png',
   'docs/assets/gsd-web-detail-02.png',
   'docs/assets/gsd-web-overview-01.png',

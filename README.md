@@ -109,6 +109,7 @@ gsd-web
 | `gsd-web restart` | Alias for `reload` |
 | `gsd-web status` | Show pid, URL, data path, and log path |
 | `gsd-web serve` | Run in the foreground |
+| `gsd-web completion <bash\|zsh\|fish>` | Print a shell completion script |
 
 `start`, `reload`, `restart`, and `serve` accept explicit listen options:
 
@@ -118,6 +119,16 @@ gsd-web serve --host 127.0.0.1 --port 3001
 ```
 
 Use `--host 0.0.0.0` when the dashboard must be reachable through the machine's network IP instead of only through loopback. Treat that as local-network exposure and rely on your firewall or tunnel controls accordingly.
+
+Global npm installs automatically add user-level shell completion files for bash, zsh, and fish. If you need to reinstall or inspect the scripts manually, use:
+
+```bash
+gsd-web completion bash > ~/.local/share/bash-completion/completions/gsd-web
+gsd-web completion zsh > "${fpath[1]}/_gsd-web"
+gsd-web completion fish > ~/.config/fish/completions/gsd-web.fish
+```
+
+Set `GSD_WEB_SKIP_COMPLETION_INSTALL=1` to skip completion installation during npm install.
 
 The daemon pid file is written to `GSD_WEB_HOME` as `gsd-web.pid`. By default, runtime data lives under `~/.gsd-web`.
 
