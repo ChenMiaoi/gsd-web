@@ -32,6 +32,7 @@ import {
   SlackNotifier,
   resolveSlackCommandConfig,
   resolveSlackNotifierConfig,
+  shouldSendImmediateStatusReport,
   type SlackNotifierFileConfig,
   type SlackNotifierConfig,
   type SlackNotificationSignal,
@@ -106,11 +107,13 @@ export interface GsdWebConfig {
 
 class SlackStatusReporter {
   private intervalId: NodeJS.Timeout | null = null;
+  private lastSentAt = 0;
 
   constructor(
     private readonly registry: RegistryDatabase,
     private readonly notifier: SlackNotifier,
     private readonly intervalMs: number,
+    private readonly immediateMinIntervalMs: number,
   ) {}
 
   start() {
@@ -119,10 +122,24 @@ class SlackStatusReporter {
     }
 
     this.intervalId = setInterval(() => {
-      void this.notifier.sendStatus(this.registry.listProjects());
+      this.send('interval');
     }, this.intervalMs);
     this.intervalId.unref?.();
-    void this.notifier.sendStatus(this.registry.listProjects());
+    this.send('startup');
+  }
+
+  sendIfChanged(event: ProjectEventEnvelope) {
+    if (!shouldSendImmediateStatusReport(event)) {
+      return;
+    }
+
+    const now = Date.now();
+
+    if (now - this.lastSentAt < this.immediateMinIntervalMs) {
+      return;
+    }
+
+    this.send('change', now);
   }
 
   stop() {
@@ -130,6 +147,11 @@ class SlackStatusReporter {
       clearInterval(this.intervalId);
       this.intervalId = null;
     }
+  }
+
+  private send(_reason: 'startup' | 'interval' | 'change', now: number = Date.now()) {
+    this.lastSentAt = now;
+    void this.notifier.sendStatus(this.registry.listProjects(), now);
   }
 }
 
@@ -290,7 +312,8 @@ function createDefaultConfigFileContent() {
         channelId: '',
         signingSecret: '',
         statusReportEnabled: false,
-        statusIntervalMs: 30000,
+        statusIntervalMs: 60000,
+        statusImmediateMinIntervalMs: 5000,
         events: DEFAULT_SLACK_EVENT_TYPES,
         timeoutMs: 5000,
       },
@@ -397,6 +420,18 @@ function parseRuntimeConfig(rawConfig: string): GsdWebConfig {
       }
 
       slack.statusIntervalMs = slackRecord.statusIntervalMs;
+    }
+
+    if (slackRecord.statusImmediateMinIntervalMs !== undefined) {
+      if (
+        typeof slackRecord.statusImmediateMinIntervalMs !== 'number'
+        || !Number.isInteger(slackRecord.statusImmediateMinIntervalMs)
+        || slackRecord.statusImmediateMinIntervalMs < 0
+      ) {
+        throw new Error('config.json slack.statusImmediateMinIntervalMs must be a non-negative integer.');
+      }
+
+      slack.statusImmediateMinIntervalMs = slackRecord.statusImmediateMinIntervalMs;
     }
 
     config.slack = slack;
@@ -716,8 +751,16 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
       });
 
       if (slackConfig.statusReportEnabled) {
-        slackStatusReporter = new SlackStatusReporter(registryInstance, slackNotifier, slackConfig.statusIntervalMs ?? 30_000);
+        slackStatusReporter = new SlackStatusReporter(
+          registryInstance,
+          slackNotifier,
+          slackConfig.statusIntervalMs ?? 60_000,
+          slackConfig.statusImmediateMinIntervalMs ?? 5_000,
+        );
         slackStatusReporter.start();
+        eventHubInstance.subscribe((event) => {
+          slackStatusReporter?.sendIfChanged(event);
+        });
       }
     }
     eventHubInstance.subscribe((event) => {

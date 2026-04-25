@@ -19,7 +19,8 @@ export const DEFAULT_SLACK_EVENT_TYPES: readonly ProjectEventType[] = [
 
 const SLACK_POST_MESSAGE_URL = 'https://slack.com/api/chat.postMessage';
 const DEFAULT_SLACK_TIMEOUT_MS = 5_000;
-const DEFAULT_SLACK_STATUS_INTERVAL_MS = 30_000;
+const DEFAULT_SLACK_STATUS_INTERVAL_MS = 60_000;
+const DEFAULT_SLACK_STATUS_IMMEDIATE_MIN_INTERVAL_MS = 5_000;
 
 export type SlackBlock =
   | {
@@ -67,6 +68,7 @@ export interface SlackNotifierConfig {
   timeoutMs: number;
   statusReportEnabled?: boolean;
   statusIntervalMs?: number;
+  statusImmediateMinIntervalMs?: number;
 }
 
 export interface SlackNotificationSignal {
@@ -93,6 +95,7 @@ export interface SlackNotifierFileConfig {
   timeoutMs?: number;
   statusReportEnabled?: boolean;
   statusIntervalMs?: number;
+  statusImmediateMinIntervalMs?: number;
 }
 
 export interface SlackCommandConfig {
@@ -202,6 +205,26 @@ function resolveSlackStatusIntervalMs(env: NodeJS.ProcessEnv, fileValue?: number
   return parsed;
 }
 
+function resolveSlackStatusImmediateMinIntervalMs(env: NodeJS.ProcessEnv, fileValue?: number) {
+  const rawValue = readTrimmedEnv(env, 'GSD_WEB_SLACK_STATUS_IMMEDIATE_MIN_INTERVAL_MS');
+
+  if (rawValue === undefined) {
+    if (fileValue !== undefined && (!Number.isInteger(fileValue) || fileValue < 0)) {
+      throw new Error('Slack statusImmediateMinIntervalMs must be a non-negative integer.');
+    }
+
+    return fileValue ?? DEFAULT_SLACK_STATUS_IMMEDIATE_MIN_INTERVAL_MS;
+  }
+
+  const parsed = Number.parseInt(rawValue, 10);
+
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error('GSD_WEB_SLACK_STATUS_IMMEDIATE_MIN_INTERVAL_MS must be a non-negative integer.');
+  }
+
+  return parsed;
+}
+
 function resolveOptionalEnvBoolean(env: NodeJS.ProcessEnv, name: string) {
   const value = readTrimmedEnv(env, name)?.toLowerCase();
 
@@ -253,6 +276,10 @@ export function resolveSlackNotifierConfig(
     ?? fileConfig?.statusReportEnabled
     ?? false;
   const statusIntervalMs = resolveSlackStatusIntervalMs(env, fileConfig?.statusIntervalMs);
+  const statusImmediateMinIntervalMs = resolveSlackStatusImmediateMinIntervalMs(
+    env,
+    fileConfig?.statusImmediateMinIntervalMs,
+  );
 
   if (fileConfig?.enabled === false && webhookUrl === undefined && botToken === undefined && channelId === undefined) {
     return null;
@@ -271,6 +298,7 @@ export function resolveSlackNotifierConfig(
       timeoutMs,
       statusReportEnabled,
       statusIntervalMs,
+      statusImmediateMinIntervalMs,
     };
   }
 
@@ -287,7 +315,44 @@ export function resolveSlackNotifierConfig(
     timeoutMs,
     statusReportEnabled,
     statusIntervalMs,
+    statusImmediateMinIntervalMs,
   };
+}
+
+function payloadRecord(event: ProjectEventEnvelope) {
+  return asRecord(event.payload);
+}
+
+export function shouldSendImmediateStatusReport(event: ProjectEventEnvelope) {
+  const payload = payloadRecord(event);
+
+  switch (event.type) {
+    case 'project.registered':
+    case 'project.deleted':
+    case 'project.relinked':
+      return true;
+    case 'project.refreshed':
+      return payload.changed === true || Number(payload.warningCount ?? 0) > 0;
+    case 'project.monitor.updated': {
+      const monitor = payload.monitor && typeof payload.monitor === 'object'
+        ? payload.monitor as { health?: unknown }
+        : null;
+      const previousHealth = typeof payload.previousHealth === 'string' ? payload.previousHealth : null;
+      const nextHealth = typeof monitor?.health === 'string' ? monitor.health : null;
+
+      return previousHealth !== nextHealth || nextHealth !== 'healthy';
+    }
+    case 'project.init.updated': {
+      const job = payload.job && typeof payload.job === 'object'
+        ? payload.job as { stage?: unknown }
+        : null;
+      const stage = typeof job?.stage === 'string' ? job.stage : null;
+
+      return stage === 'succeeded' || stage === 'failed' || stage === 'timed_out' || stage === 'cancelled';
+    }
+    default:
+      return false;
+  }
 }
 
 export function resolveSlackCommandConfig(

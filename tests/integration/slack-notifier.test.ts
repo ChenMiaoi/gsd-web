@@ -10,6 +10,7 @@ import {
   buildSlackStatusMessage,
   parseSlackCommandPayload,
   resolveSlackNotifierConfig,
+  shouldSendImmediateStatusReport,
   verifySlackRequest,
   type SlackNotificationSignal,
 } from '../../src/server/slack.js';
@@ -236,6 +237,36 @@ describe('Slack notifier', () => {
     expect(JSON.stringify(message.blocks)).toContain('Current project');
     expect(JSON.stringify(message.blocks)).toContain('ETA');
     expect(JSON.stringify(message.blocks)).toContain('https://gsd.example.test/lazy/employee-prj_test');
+  });
+
+  test('detects project events that should trigger immediate status reports', () => {
+    expect(shouldSendImmediateStatusReport(createProjectEvent())).toBe(true);
+    expect(shouldSendImmediateStatusReport(createProjectEvent({
+      payload: {
+        ...createProjectEvent().payload,
+        changed: false,
+        warningCount: 0,
+      },
+    }))).toBe(false);
+    expect(shouldSendImmediateStatusReport({
+      ...createProjectEvent(),
+      type: 'project.monitor.updated',
+      payload: {
+        projectId: 'prj_test',
+        canonicalPath: '/workspace/demo-project',
+        snapshotStatus: 'initialized',
+        warningCount: 0,
+        trigger: 'watcher',
+        previousHealth: 'healthy',
+        monitor: {
+          health: 'degraded',
+          lastAttemptedAt: '2026-04-26T01:00:00.000Z',
+          lastSuccessfulAt: '2026-04-26T01:00:00.000Z',
+          lastTrigger: 'watcher',
+          lastError: null,
+        },
+      },
+    })).toBe(true);
   });
 
   test('builds Slack messages with project detail links when a public URL is configured', () => {
