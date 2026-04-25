@@ -134,6 +134,7 @@ describe('service shell bootstrap', () => {
     expect(paths.runtimeDir).toBe(path.join(workspace.root, '.gsd-web'));
     expect(paths.databasePath).toBe(path.join(workspace.root, '.gsd-web', 'data', 'gsd-web.sqlite'));
     expect(paths.logFilePath).toBe(path.join(workspace.root, '.gsd-web', 'logs', 'gsd-web.log'));
+    expect(paths.configFilePath).toBe(path.join(workspace.root, '.gsd-web', 'config.json'));
     expect(paths.clientDistDir).toMatch(/dist[/\\]web$/);
   });
 
@@ -186,6 +187,7 @@ describe('service shell bootstrap', () => {
 
     expect(paths.databasePath).toBe(path.join(runtimeDir, 'data', 'gsd-web.sqlite'));
     expect(paths.activeLogFilePath).toBe(path.join(runtimeDir, 'logs', 'gsd-web.log'));
+    expect(paths.configFilePath).toBe(path.join(runtimeDir, 'config.json'));
     expect(paths.logPolicy).toEqual({
       enabled: true,
       rotateDaily: true,
@@ -194,6 +196,13 @@ describe('service shell bootstrap', () => {
       maxFileSizeBytes: 20 * 1024 * 1024,
     });
     expect(await readFile(paths.databasePath)).toBeInstanceOf(Buffer);
+    expect(JSON.parse(await readFile(paths.configFilePath, 'utf8'))).toMatchObject({
+      publicUrl: '',
+      slack: {
+        enabled: false,
+        events: expect.arrayContaining(['project.refreshed', 'project.init.updated']),
+      },
+    });
 
     await app.close();
     cleanupTasks.pop();

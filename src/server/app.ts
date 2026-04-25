@@ -1,7 +1,7 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyStatic from '@fastify/static';
 import { existsSync } from 'node:fs';
-import { access, constants, mkdir, readFile } from 'node:fs/promises';
+import { access, constants, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,6 +26,14 @@ import {
 import { ProjectReconciler, type ProjectReconcileSignal } from './project-reconcile.js';
 import { EventHub, registerEventsRoute } from './routes/events.js';
 import { registerProjectRoutes, type ProjectInitRunner } from './routes/projects.js';
+import {
+  DEFAULT_SLACK_EVENT_TYPES,
+  SlackNotifier,
+  resolveSlackNotifierConfig,
+  type SlackNotifierFileConfig,
+  type SlackNotifierConfig,
+  type SlackNotificationSignal,
+} from './slack.js';
 
 export type RuntimeSignal =
   | {
@@ -34,6 +42,7 @@ export type RuntimeSignal =
       databasePath: string;
       clientDistDir: string;
       logFilePath: string | null;
+      configFilePath: string;
     }
   | {
       event: 'database_open';
@@ -61,6 +70,7 @@ export type RuntimeSignal =
     }
   | ProjectMonitorSignal
   | ProjectReconcileSignal
+  | SlackNotificationSignal
   | {
       event: 'service_start';
       address: string;
@@ -82,6 +92,14 @@ export interface CreateAppOptions {
   monitorIntervalMs?: number;
   watchersEnabled?: boolean;
   initRunner?: ProjectInitRunner;
+  slack?: false | SlackNotifierConfig;
+  config?: false | GsdWebConfig;
+  configFilePath?: string;
+}
+
+export interface GsdWebConfig {
+  publicUrl?: string;
+  slack?: SlackNotifierFileConfig;
 }
 
 export interface ResolvedRuntimePaths {
@@ -92,6 +110,7 @@ export interface ResolvedRuntimePaths {
   clientDistDir: string;
   logDir: string;
   logFilePath: string;
+  configFilePath: string;
 }
 
 export type GsdWebApp = FastifyInstance & {
@@ -225,7 +244,132 @@ export function resolveDefaultPaths(
     clientDistDir: resolveOptionalEnvPath(env, 'GSD_WEB_CLIENT_DIST_DIR') ?? path.join(packageRoot, 'dist', 'web'),
     logDir,
     logFilePath: resolveOptionalEnvPath(env, 'GSD_WEB_LOG_FILE') ?? path.join(logDir, 'gsd-web.log'),
+    configFilePath: resolveOptionalEnvPath(env, 'GSD_WEB_CONFIG_PATH') ?? path.join(runtimeDir, 'config.json'),
   };
+}
+
+function createDefaultConfigFileContent() {
+  return `${JSON.stringify(
+    {
+      publicUrl: '',
+      slack: {
+        enabled: false,
+        webhookUrl: '',
+        botToken: '',
+        channelId: '',
+        events: DEFAULT_SLACK_EVENT_TYPES,
+        timeoutMs: 5000,
+      },
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+function parseOptionalConfigString(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  if (typeof value !== 'string') {
+    throw new Error(`config.json ${key} must be a string.`);
+  }
+
+  return value;
+}
+
+function parseRuntimeConfig(rawConfig: string): GsdWebConfig {
+  const parsed = JSON.parse(rawConfig) as unknown;
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('config.json must contain a JSON object.');
+  }
+
+  const record = parsed as Record<string, unknown>;
+  const config: GsdWebConfig = {};
+  const publicUrl = parseOptionalConfigString(record, 'publicUrl');
+
+  if (publicUrl !== undefined) {
+    config.publicUrl = publicUrl;
+  }
+
+  if (record.slack !== undefined && record.slack !== null) {
+    if (typeof record.slack !== 'object' || Array.isArray(record.slack)) {
+      throw new Error('config.json slack must be an object.');
+    }
+
+    const slackRecord = record.slack as Record<string, unknown>;
+    const slack: SlackNotifierFileConfig = {};
+    const enabled = slackRecord.enabled;
+
+    if (enabled !== undefined) {
+      if (typeof enabled !== 'boolean') {
+        throw new Error('config.json slack.enabled must be a boolean.');
+      }
+
+      slack.enabled = enabled;
+    }
+
+    for (const key of ['webhookUrl', 'botToken', 'channelId'] as const) {
+      const value = parseOptionalConfigString(slackRecord, key);
+
+      if (value !== undefined) {
+        slack[key] = value;
+      }
+    }
+
+    if (slackRecord.events !== undefined) {
+      if (
+        !Array.isArray(slackRecord.events)
+        || slackRecord.events.some((eventType) => typeof eventType !== 'string')
+      ) {
+        throw new Error('config.json slack.events must be an array of event type strings.');
+      }
+
+      slack.events = slackRecord.events as NonNullable<SlackNotifierFileConfig['events']>;
+    }
+
+    if (slackRecord.timeoutMs !== undefined) {
+      if (
+        typeof slackRecord.timeoutMs !== 'number'
+        || !Number.isInteger(slackRecord.timeoutMs)
+        || slackRecord.timeoutMs <= 0
+      ) {
+        throw new Error('config.json slack.timeoutMs must be a positive integer.');
+      }
+
+      slack.timeoutMs = slackRecord.timeoutMs;
+    }
+
+    config.slack = slack;
+  }
+
+  return config;
+}
+
+async function readRuntimeConfig(configFilePath: string, options: { createIfMissing: boolean }): Promise<GsdWebConfig> {
+  try {
+    return parseRuntimeConfig(await readFile(configFilePath, 'utf8'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error;
+    }
+
+    if (!options.createIfMissing) {
+      return {};
+    }
+
+    await mkdir(path.dirname(configFilePath), { recursive: true });
+    await writeFile(configFilePath, createDefaultConfigFileContent(), { flag: 'wx' }).catch((writeError) => {
+      if ((writeError as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw writeError;
+      }
+    });
+
+    return {};
+  }
 }
 
 function emitSignal(
@@ -375,6 +519,17 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
     ? defaults.logFilePath
     : path.join(logDir, 'gsd-web.log');
   const logFilePath = resolveConfiguredPath('GSD web log file', options.logFilePath ?? defaultLogFilePath);
+  const configFilePath = resolveConfiguredPath(
+    'GSD web config file',
+    options.configFilePath ?? (options.runtimeDir === undefined ? defaults.configFilePath : path.join(runtimeDir, 'config.json')),
+  );
+  const shouldCreateMissingConfig =
+    options.configFilePath !== undefined
+    || options.runtimeDir !== undefined
+    || options.databasePath === undefined;
+  const runtimeConfig = options.config === false
+    ? {}
+    : options.config ?? await readRuntimeConfig(configFilePath, { createIfMissing: shouldCreateMissingConfig });
   const activeLogFilePath = options.logger === false ? null : logFilePath;
   const logRetentionDays =
     options.logRetentionDays
@@ -426,6 +581,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
     clientDistDir,
     logDir,
     logFilePath,
+    configFilePath,
     activeLogFilePath,
     logPolicy,
   };
@@ -443,6 +599,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
         databasePath,
         clientDistDir,
         logFilePath: activeLogFilePath,
+        configFilePath,
       },
       'Resolved gsd-web runtime paths',
     );
@@ -482,6 +639,18 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
     eventHubInstance.subscribe((event) => {
       emitProjectEvent(app, options.logSink, event);
     });
+    const slackConfig = options.slack === false
+      ? null
+      : options.slack ?? resolveSlackNotifierConfig(process.env, runtimeConfig.slack ?? null, runtimeConfig.publicUrl);
+    if (slackConfig) {
+      const slackNotifier = new SlackNotifier(slackConfig, {
+        ...(options.logSink === undefined ? {} : { signalSink: options.logSink }),
+      });
+
+      eventHubInstance.subscribe((event) => {
+        void slackNotifier.notify(event);
+      });
+    }
     eventHubInstance.subscribe((event) => {
       const payloadProjectId =
         event.payload && typeof event.payload === 'object' && 'projectId' in event.payload

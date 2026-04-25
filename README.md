@@ -159,6 +159,13 @@ The `/lazy` base path is intentional: the dashboard is for avoiding manual statu
 | `GSD_WEB_REQUEST_LOGS` | `false` | Enable HTTP request access logs |
 | `GSD_WEB_MONITOR_INTERVAL_MS` | `10000` | Periodic project monitor backstop interval |
 | `GSD_WEB_CLIENT_DIST_DIR` | packaged browser build | Static frontend directory |
+| `GSD_WEB_CONFIG_PATH` | `~/.gsd-web/config.json` | JSON config file path |
+| `GSD_WEB_PUBLIC_URL` | unset | Public or tunnel URL used in Slack project detail links |
+| `GSD_WEB_SLACK_WEBHOOK_URL` | unset | Slack Incoming Webhook URL for project event notifications |
+| `GSD_WEB_SLACK_BOT_TOKEN` | unset | Slack bot token used with `chat.postMessage` |
+| `GSD_WEB_SLACK_CHANNEL_ID` | unset | Slack channel ID for bot-token notifications |
+| `GSD_WEB_SLACK_EVENTS` | project events | Comma-separated event types to notify |
+| `GSD_WEB_SLACK_TIMEOUT_MS` | `5000` | Slack notification request timeout |
 | `GSD_BIN_PATH` | `gsd` | Executable used by the init runner |
 
 Example:
@@ -166,6 +173,60 @@ Example:
 ```bash
 PORT=3001 GSD_BIN_PATH=/path/to/gsd gsd-web
 gsd-web start --host 0.0.0.0 --port 3001
+```
+
+On first start, `gsd-web` creates a local config file at `~/.gsd-web/config.json` unless `GSD_WEB_HOME` or `GSD_WEB_CONFIG_PATH` points elsewhere. Environment variables override values from this file.
+
+Slack notifications are disabled by default. To send GSD project events to Slack, edit `~/.gsd-web/config.json`:
+
+```json
+{
+  "publicUrl": "https://your-tunnel.example.com",
+  "slack": {
+    "enabled": true,
+    "webhookUrl": "https://hooks.slack.com/services/...",
+    "events": ["project.monitor.updated", "project.init.updated"],
+    "timeoutMs": 5000
+  }
+}
+```
+
+For bot-token delivery instead of an Incoming Webhook, use:
+
+```json
+{
+  "publicUrl": "https://your-tunnel.example.com",
+  "slack": {
+    "enabled": true,
+    "botToken": "xoxb-...",
+    "channelId": "C0123456789"
+  }
+}
+```
+
+The bot-token path uses Slack `chat.postMessage`; the app needs the `chat:write` scope and the bot must be invited to the target channel.
+
+You can also configure an Incoming Webhook with environment variables:
+
+```bash
+GSD_WEB_SLACK_WEBHOOK_URL='https://hooks.slack.com/services/...' \
+GSD_WEB_PUBLIC_URL='https://your-tunnel.example.com' \
+gsd-web serve
+```
+
+Or configure a Slack app bot token:
+
+```bash
+GSD_WEB_SLACK_BOT_TOKEN='xoxb-...' \
+GSD_WEB_SLACK_CHANNEL_ID='C0123456789' \
+GSD_WEB_PUBLIC_URL='https://your-tunnel.example.com' \
+gsd-web serve
+```
+
+By default, Slack receives project lifecycle, refresh, monitor, relink, delete, and init updates. Use `GSD_WEB_SLACK_EVENTS` to narrow the stream, for example:
+
+```bash
+GSD_WEB_SLACK_EVENTS='project.monitor.updated,project.init.updated' gsd-web serve
 ```
 
 Service logs stay in the configured active file and rotate automatically when the local day changes or the file exceeds the configured size. Rotated archives are gzip-compressed and named like `gsd-web-YYYY-MM-DD.log.gz`, with `-1`, `-2`, and so on added when multiple archives are produced on the same day. The effective log policy is visible in `gsd-web status` and `GET /api/health`.
