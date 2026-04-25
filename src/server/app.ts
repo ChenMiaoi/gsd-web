@@ -104,6 +104,35 @@ export interface GsdWebConfig {
   slack?: SlackNotifierFileConfig;
 }
 
+class SlackStatusReporter {
+  private intervalId: NodeJS.Timeout | null = null;
+
+  constructor(
+    private readonly registry: RegistryDatabase,
+    private readonly notifier: SlackNotifier,
+    private readonly intervalMs: number,
+  ) {}
+
+  start() {
+    if (this.intervalId !== null) {
+      return;
+    }
+
+    this.intervalId = setInterval(() => {
+      void this.notifier.sendStatus(this.registry.listProjects());
+    }, this.intervalMs);
+    this.intervalId.unref?.();
+    void this.notifier.sendStatus(this.registry.listProjects());
+  }
+
+  stop() {
+    if (this.intervalId !== null) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+    }
+  }
+}
+
 export interface ResolvedRuntimePaths {
   packageRoot: string;
   runtimeDir: string;
@@ -260,6 +289,8 @@ function createDefaultConfigFileContent() {
         botToken: '',
         channelId: '',
         signingSecret: '',
+        statusReportEnabled: false,
+        statusIntervalMs: 30000,
         events: DEFAULT_SLACK_EVENT_TYPES,
         timeoutMs: 5000,
       },
@@ -344,6 +375,28 @@ function parseRuntimeConfig(rawConfig: string): GsdWebConfig {
       }
 
       slack.timeoutMs = slackRecord.timeoutMs;
+    }
+
+    const statusReportEnabled = slackRecord.statusReportEnabled;
+
+    if (statusReportEnabled !== undefined) {
+      if (typeof statusReportEnabled !== 'boolean') {
+        throw new Error('config.json slack.statusReportEnabled must be a boolean.');
+      }
+
+      slack.statusReportEnabled = statusReportEnabled;
+    }
+
+    if (slackRecord.statusIntervalMs !== undefined) {
+      if (
+        typeof slackRecord.statusIntervalMs !== 'number'
+        || !Number.isInteger(slackRecord.statusIntervalMs)
+        || slackRecord.statusIntervalMs <= 0
+      ) {
+        throw new Error('config.json slack.statusIntervalMs must be a positive integer.');
+      }
+
+      slack.statusIntervalMs = slackRecord.statusIntervalMs;
     }
 
     config.slack = slack;
@@ -598,6 +651,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
   let registry: RegistryDatabase | undefined;
   let eventHub: EventHub | undefined;
   let monitorManager: ProjectMonitorManager | undefined;
+  let slackStatusReporter: SlackStatusReporter | undefined;
 
   try {
     emitSignal(
@@ -660,6 +714,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
       eventHubInstance.subscribe((event) => {
         void slackNotifier.notify(event);
       });
+
+      if (slackConfig.statusReportEnabled) {
+        slackStatusReporter = new SlackStatusReporter(registryInstance, slackNotifier, slackConfig.statusIntervalMs ?? 30_000);
+        slackStatusReporter.start();
+      }
     }
     eventHubInstance.subscribe((event) => {
       const payloadProjectId =
@@ -696,6 +755,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
     });
 
     app.addHook('onClose', async () => {
+      slackStatusReporter?.stop();
       await monitorManagerInstance.stop();
       eventHubInstance.close();
       registryInstance.close();
@@ -847,6 +907,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
 
     return app;
   } catch (error) {
+    slackStatusReporter?.stop();
     await monitorManager?.stop().catch(() => undefined);
     eventHub?.close();
     registry?.close();

@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
 import type {
+  GsdDbMilestoneSummary,
   ProjectEventEnvelope,
   ProjectEventPayload,
   ProjectEventType,
@@ -18,6 +19,43 @@ export const DEFAULT_SLACK_EVENT_TYPES: readonly ProjectEventType[] = [
 
 const SLACK_POST_MESSAGE_URL = 'https://slack.com/api/chat.postMessage';
 const DEFAULT_SLACK_TIMEOUT_MS = 5_000;
+const DEFAULT_SLACK_STATUS_INTERVAL_MS = 30_000;
+
+export type SlackBlock =
+  | {
+      type: 'header';
+      text: {
+        type: 'plain_text';
+        text: string;
+        emoji?: boolean;
+      };
+    }
+  | {
+      type: 'section';
+      text?: {
+        type: 'mrkdwn';
+        text: string;
+      };
+      fields?: Array<{
+        type: 'mrkdwn';
+        text: string;
+      }>;
+    }
+  | {
+      type: 'context';
+      elements: Array<{
+        type: 'mrkdwn';
+        text: string;
+      }>;
+    }
+  | {
+      type: 'divider';
+    };
+
+export interface SlackMessage {
+  text: string;
+  blocks: SlackBlock[];
+}
 
 export interface SlackNotifierConfig {
   webhookUrl?: string;
@@ -27,6 +65,8 @@ export interface SlackNotifierConfig {
   publicBaseUrl?: string;
   eventTypes: readonly ProjectEventType[];
   timeoutMs: number;
+  statusReportEnabled?: boolean;
+  statusIntervalMs?: number;
 }
 
 export interface SlackNotificationSignal {
@@ -51,6 +91,8 @@ export interface SlackNotifierFileConfig {
   signingSecret?: string;
   events?: readonly ProjectEventType[];
   timeoutMs?: number;
+  statusReportEnabled?: boolean;
+  statusIntervalMs?: number;
 }
 
 export interface SlackCommandConfig {
@@ -69,17 +111,7 @@ export interface SlackCommandPayload {
 export interface SlackCommandResponse {
   response_type: 'ephemeral' | 'in_channel';
   text: string;
-  blocks?: Array<{
-    type: 'section' | 'context';
-    text?: {
-      type: 'mrkdwn';
-      text: string;
-    };
-    elements?: Array<{
-      type: 'mrkdwn';
-      text: string;
-    }>;
-  }>;
+  blocks?: SlackBlock[];
 }
 
 export class SlackNotificationError extends Error {
@@ -150,6 +182,44 @@ function resolveSlackTimeoutMs(env: NodeJS.ProcessEnv, fileValue?: number) {
   return parsed;
 }
 
+function resolveSlackStatusIntervalMs(env: NodeJS.ProcessEnv, fileValue?: number) {
+  const rawValue = readTrimmedEnv(env, 'GSD_WEB_SLACK_STATUS_INTERVAL_MS');
+
+  if (rawValue === undefined) {
+    if (fileValue !== undefined && (!Number.isInteger(fileValue) || fileValue <= 0)) {
+      throw new Error('Slack statusIntervalMs must be a positive integer.');
+    }
+
+    return fileValue ?? DEFAULT_SLACK_STATUS_INTERVAL_MS;
+  }
+
+  const parsed = Number.parseInt(rawValue, 10);
+
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error('GSD_WEB_SLACK_STATUS_INTERVAL_MS must be a positive integer.');
+  }
+
+  return parsed;
+}
+
+function resolveOptionalEnvBoolean(env: NodeJS.ProcessEnv, name: string) {
+  const value = readTrimmedEnv(env, name)?.toLowerCase();
+
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (['1', 'true', 'yes', 'on'].includes(value)) {
+    return true;
+  }
+
+  if (['0', 'false', 'no', 'off'].includes(value)) {
+    return false;
+  }
+
+  throw new Error(`${name} must be a boolean value.`);
+}
+
 function normalizeOptionalConfigString(value: string | undefined) {
   const trimmed = value?.trim();
 
@@ -178,6 +248,11 @@ export function resolveSlackNotifierConfig(
   const publicBaseUrl = readTrimmedEnv(env, 'GSD_WEB_PUBLIC_URL') ?? normalizeOptionalConfigString(publicBaseUrlFromFile);
   const eventTypes = parseSlackEventTypes(readTrimmedEnv(env, 'GSD_WEB_SLACK_EVENTS'), fileConfig?.events);
   const timeoutMs = resolveSlackTimeoutMs(env, fileConfig?.timeoutMs);
+  const statusReportEnabled =
+    resolveOptionalEnvBoolean(env, 'GSD_WEB_SLACK_STATUS_REPORT')
+    ?? fileConfig?.statusReportEnabled
+    ?? false;
+  const statusIntervalMs = resolveSlackStatusIntervalMs(env, fileConfig?.statusIntervalMs);
 
   if (fileConfig?.enabled === false && webhookUrl === undefined && botToken === undefined && channelId === undefined) {
     return null;
@@ -194,6 +269,8 @@ export function resolveSlackNotifierConfig(
       ...(publicBaseUrl === undefined ? {} : { publicBaseUrl }),
       eventTypes,
       timeoutMs,
+      statusReportEnabled,
+      statusIntervalMs,
     };
   }
 
@@ -208,6 +285,8 @@ export function resolveSlackNotifierConfig(
     ...(publicBaseUrl === undefined ? {} : { publicBaseUrl }),
     eventTypes,
     timeoutMs,
+    statusReportEnabled,
+    statusIntervalMs,
   };
 }
 
@@ -359,7 +438,316 @@ export function buildSlackMessage(event: ProjectEventEnvelope, publicBaseUrl?: s
         },
       },
     ],
+  } satisfies SlackMessage;
+}
+
+function formatUsd(value: number) {
+  if (!Number.isFinite(value)) {
+    return '$0.00';
+  }
+
+  return `$${value.toFixed(value >= 10 ? 2 : 4).replace(/0+$/u, '').replace(/\.$/u, '')}`;
+}
+
+function formatCompactInteger(value: number) {
+  return Number.isFinite(value) ? Math.round(value).toLocaleString('en-US') : '0';
+}
+
+function formatDuration(ms: number | null) {
+  if (ms === null || !Number.isFinite(ms) || ms < 0) {
+    return 'unknown';
+  }
+
+  if (ms < 60_000) {
+    return '<1m';
+  }
+
+  const minutes = Math.round(ms / 60_000);
+
+  if (minutes < 60) {
+    return `${minutes}m`;
+  }
+
+  const hours = Math.round(minutes / 60);
+
+  if (hours < 48) {
+    return `${hours}h`;
+  }
+
+  return `${Math.round(hours / 24)}d`;
+}
+
+function formatEta(ms: number | null, nowMs: number) {
+  if (ms === null) {
+    return 'unknown';
+  }
+
+  if (ms <= 0) {
+    return 'done';
+  }
+
+  return `${new Date(nowMs + ms).toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })} (${formatDuration(ms)})`;
+}
+
+function normalizeWorkflowTimestamp(value: string | number | null) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value);
+
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+
+    const parsedDate = Date.parse(value);
+
+    return Number.isFinite(parsedDate) ? parsedDate : null;
+  }
+
+  return null;
+}
+
+function isWorkflowComplete(status: string | null | undefined) {
+  return /^(done|completed|complete|succeeded|success|finished|closed)$/iu.test(status?.trim() ?? '');
+}
+
+function isWorkflowActive(status: string | null | undefined) {
+  return /^(active|running|executing|in_progress|in-progress|current)$/iu.test(status?.trim() ?? '');
+}
+
+function summarizeMilestones(milestones: GsdDbMilestoneSummary[]) {
+  let totalTasks = 0;
+  let completedTasks = 0;
+  let activeLabel: string | null = null;
+  const completedDurations: number[] = [];
+
+  for (const milestone of milestones) {
+    for (const slice of milestone.slices) {
+      const sliceActive = isWorkflowActive(slice.status);
+
+      for (const task of slice.tasks) {
+        totalTasks += 1;
+
+        if (isWorkflowComplete(task.status)) {
+          completedTasks += 1;
+        }
+
+        const startedAt = normalizeWorkflowTimestamp(task.startedAt);
+        const finishedAt = normalizeWorkflowTimestamp(task.finishedAt);
+
+        if (startedAt !== null && finishedAt !== null && finishedAt >= startedAt) {
+          completedDurations.push(finishedAt - startedAt);
+        }
+
+        if (!activeLabel && (isWorkflowActive(task.status) || sliceActive || isWorkflowActive(milestone.status))) {
+          activeLabel = `${milestone.id}/${slice.id}/${task.id}`;
+        }
+      }
+
+      if (!activeLabel && sliceActive) {
+        activeLabel = `${milestone.id}/${slice.id}`;
+      }
+    }
+
+    if (!activeLabel && isWorkflowActive(milestone.status)) {
+      activeLabel = milestone.id;
+    }
+  }
+
+  const averageCompletedDurationMs = completedDurations.length > 0
+    ? completedDurations.reduce((total, value) => total + value, 0) / completedDurations.length
+    : null;
+
+  return {
+    totalTasks,
+    completedTasks,
+    remainingTasks: Math.max(0, totalTasks - completedTasks),
+    activeLabel,
+    averageCompletedDurationMs,
   };
+}
+
+function buildProgressBar(percent: number) {
+  const normalized = Math.max(0, Math.min(100, Math.round(percent)));
+  const filled = Math.round(normalized / 10);
+
+  return `${'█'.repeat(filled)}${'░'.repeat(10 - filled)} ${normalized}%`;
+}
+
+function summarizeProjectStatus(project: ProjectRecord, nowMs: number) {
+  const milestones = project.snapshot.sources.gsdDb.value?.milestones ?? [];
+  const workflow = summarizeMilestones(milestones);
+  const metrics = project.snapshot.sources.metricsJson.value ?? null;
+  const progressPercent = workflow.totalTasks > 0
+    ? (workflow.completedTasks / workflow.totalTasks) * 100
+    : project.snapshot.status === 'initialized'
+      ? 100
+      : 0;
+  const estimatedRemainingMs =
+    workflow.remainingTasks === 0
+      ? 0
+      : workflow.averageCompletedDurationMs === null
+        ? null
+        : workflow.averageCompletedDurationMs * workflow.remainingTasks;
+
+  return {
+    label: projectDisplayName(project),
+    progressPercent,
+    progressBar: buildProgressBar(progressPercent),
+    completedTasks: workflow.completedTasks,
+    totalTasks: workflow.totalTasks,
+    remainingTasks: workflow.remainingTasks,
+    currentStage: workflow.activeLabel ?? project.latestInitJob?.stage ?? project.snapshot.status,
+    health: project.monitor.health,
+    snapshotStatus: project.snapshot.status,
+    warningCount: project.snapshot.warnings.length,
+    cost: metrics?.totals.cost ?? 0,
+    totalTokens: metrics?.totals.totalTokens ?? 0,
+    estimatedRemainingMs,
+    eta: formatEta(estimatedRemainingMs, nowMs),
+  };
+}
+
+function pickCurrentProject(projects: ProjectRecord[], nowMs: number) {
+  const ranked = projects
+    .map((project) => ({ project, summary: summarizeProjectStatus(project, nowMs) }))
+    .sort((first, second) => {
+      const healthRank = (summary: ReturnType<typeof summarizeProjectStatus>) =>
+        summary.health === 'healthy' ? 2 : summary.health === 'stale' ? 1 : 0;
+      const firstActive = first.summary.remainingTasks > 0 || first.project.latestInitJob !== null ? 0 : 1;
+      const secondActive = second.summary.remainingTasks > 0 || second.project.latestInitJob !== null ? 0 : 1;
+
+      return (
+        firstActive - secondActive
+        || healthRank(first.summary) - healthRank(second.summary)
+        || second.summary.warningCount - first.summary.warningCount
+        || second.summary.cost - first.summary.cost
+        || first.summary.label.localeCompare(second.summary.label)
+      );
+    });
+
+  return ranked[0] ?? null;
+}
+
+export function buildSlackStatusMessage(projects: ProjectRecord[], publicBaseUrl?: string, nowMs: number = Date.now()) {
+  const current = pickCurrentProject(projects, nowMs);
+  const totalCost = projects.reduce((total, project) => total + (project.snapshot.sources.metricsJson.value?.totals.cost ?? 0), 0);
+  const totalTokens = projects.reduce(
+    (total, project) => total + (project.snapshot.sources.metricsJson.value?.totals.totalTokens ?? 0),
+    0,
+  );
+  const unhealthyCount = projects.filter((project) => project.monitor.health !== 'healthy').length;
+  const warningCount = projects.reduce((total, project) => total + project.snapshot.warnings.length, 0);
+
+  if (!current) {
+    return {
+      text: 'GSD status: no projects registered.',
+      blocks: [
+        {
+          type: 'header',
+          text: {
+            type: 'plain_text',
+            text: 'GSD Status',
+            emoji: true,
+          },
+        },
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: 'No projects are registered in gsd-web yet.',
+          },
+        },
+      ],
+    } satisfies SlackMessage;
+  }
+
+  const project = current.project;
+  const summary = current.summary;
+  const detailUrl = buildProjectDetailUrl(publicBaseUrl, project.projectId);
+  const title = detailUrl ? `<${detailUrl}|${summary.label}>` : summary.label;
+  const topProjects = projects
+    .map((candidate) => ({ project: candidate, summary: summarizeProjectStatus(candidate, nowMs) }))
+    .sort((first, second) => second.summary.cost - first.summary.cost || first.summary.label.localeCompare(second.summary.label))
+    .slice(0, 4)
+    .map(({ summary: row }) => `• *${row.label}* ${Math.round(row.progressPercent)}% · ${row.health} · ${formatUsd(row.cost)}`);
+
+  return {
+    text: `GSD status: ${summary.label} ${Math.round(summary.progressPercent)}%, ${summary.health}, ${formatUsd(summary.cost)}, ETA ${summary.eta}`,
+    blocks: [
+      {
+        type: 'header',
+        text: {
+          type: 'plain_text',
+          text: 'GSD Status',
+          emoji: true,
+        },
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `*Current project:* ${title}\n${summary.progressBar}`,
+        },
+      },
+      {
+        type: 'section',
+        fields: [
+          { type: 'mrkdwn', text: `*Health*\n${summary.health}` },
+          { type: 'mrkdwn', text: `*Snapshot*\n${summary.snapshotStatus}` },
+          { type: 'mrkdwn', text: `*Current*\n${summary.currentStage}` },
+          { type: 'mrkdwn', text: `*Tasks*\n${summary.completedTasks}/${summary.totalTasks || 'unknown'}` },
+          { type: 'mrkdwn', text: `*Cost*\n${formatUsd(summary.cost)}` },
+          { type: 'mrkdwn', text: `*ETA*\n${summary.eta}` },
+        ],
+      },
+      {
+        type: 'section',
+        fields: [
+          { type: 'mrkdwn', text: `*Portfolio*\n${projects.length} projects` },
+          { type: 'mrkdwn', text: `*Attention*\n${unhealthyCount} unhealthy, ${warningCount} warnings` },
+          { type: 'mrkdwn', text: `*Total cost*\n${formatUsd(totalCost)}` },
+          { type: 'mrkdwn', text: `*Tokens*\n${formatCompactInteger(totalTokens)}` },
+        ],
+      },
+      ...(topProjects.length > 0
+        ? [
+            { type: 'divider' as const },
+            {
+              type: 'section' as const,
+              text: {
+                type: 'mrkdwn' as const,
+                text: `*Projects*\n${topProjects.join('\n')}`,
+              },
+            },
+          ]
+        : []),
+      {
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: `Updated ${new Date(nowMs).toLocaleString('en-US', {
+              month: 'short',
+              day: 'numeric',
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit',
+              hour12: false,
+            })}`,
+          },
+        ],
+      },
+    ],
+  } satisfies SlackMessage;
 }
 
 export function parseSlackCommandPayload(rawBody: string): SlackCommandPayload {
@@ -606,7 +994,11 @@ export class SlackNotifier {
     }
   }
 
-  private async postMessage(message: ReturnType<typeof buildSlackMessage>) {
+  async sendStatus(projects: ProjectRecord[], nowMs: number = Date.now()) {
+    await this.postMessage(buildSlackStatusMessage(projects, this.config.publicBaseUrl, nowMs));
+  }
+
+  private async postMessage(message: SlackMessage) {
     if (this.config.webhookUrl) {
       const response = await fetchWithTimeout(
         this.fetchImpl,

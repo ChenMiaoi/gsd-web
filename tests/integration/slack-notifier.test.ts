@@ -7,6 +7,7 @@ import {
   SlackNotifier,
   buildSlackCommandResponse,
   buildSlackMessage,
+  buildSlackStatusMessage,
   parseSlackCommandPayload,
   resolveSlackNotifierConfig,
   verifySlackRequest,
@@ -224,6 +225,17 @@ describe('Slack notifier', () => {
     expect(status.text).toContain('demo-project');
     expect(detail.text).toContain('prj_test');
     expect(detail.text).toContain('https://gsd.example.test/lazy/employee-prj_test');
+  });
+
+  test('builds a formatted recurring Slack status report', () => {
+    const project = createProjectRecord();
+    const message = buildSlackStatusMessage([project], 'https://gsd.example.test', 1_777_132_800_000);
+
+    expect(message.text).toContain('GSD status: demo-project');
+    expect(message.text).toContain('healthy');
+    expect(JSON.stringify(message.blocks)).toContain('Current project');
+    expect(JSON.stringify(message.blocks)).toContain('ETA');
+    expect(JSON.stringify(message.blocks)).toContain('https://gsd.example.test/lazy/employee-prj_test');
   });
 
   test('builds Slack messages with project detail links when a public URL is configured', () => {

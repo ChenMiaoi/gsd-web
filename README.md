@@ -166,6 +166,8 @@ The `/lazy` base path is intentional: the dashboard is for avoiding manual statu
 | `GSD_WEB_SLACK_CHANNEL_ID` | unset | Slack channel ID for bot-token notifications |
 | `GSD_WEB_SLACK_SIGNING_SECRET` | unset | Slack signing secret for slash command verification |
 | `GSD_WEB_SLACK_EVENTS` | project events | Comma-separated event types to notify |
+| `GSD_WEB_SLACK_STATUS_REPORT` | `false` | Send recurring Slack project status reports |
+| `GSD_WEB_SLACK_STATUS_INTERVAL_MS` | `30000` | Recurring Slack status report interval |
 | `GSD_WEB_SLACK_TIMEOUT_MS` | `5000` | Slack notification request timeout |
 | `GSD_BIN_PATH` | `gsd` | Executable used by the init runner |
 
@@ -187,6 +189,8 @@ Slack notifications are disabled by default. To send GSD project events to Slack
     "enabled": true,
     "webhookUrl": "https://hooks.slack.com/services/...",
     "signingSecret": "your-slack-signing-secret",
+    "statusReportEnabled": true,
+    "statusIntervalMs": 30000,
     "events": ["project.monitor.updated", "project.init.updated"],
     "timeoutMs": 5000
   }
@@ -247,6 +251,8 @@ By default, Slack receives project lifecycle, refresh, monitor, relink, delete, 
 ```bash
 GSD_WEB_SLACK_EVENTS='project.monitor.updated,project.init.updated' gsd-web serve
 ```
+
+Set `slack.statusReportEnabled` to `true` to send a recurring project status report. The report includes the current project, progress, health, cost, warnings, token count, and estimated finish time. The default interval is 30 seconds.
 
 Service logs stay in the configured active file and rotate automatically when the local day changes or the file exceeds the configured size. Rotated archives are gzip-compressed and named like `gsd-web-YYYY-MM-DD.log.gz`, with `-1`, `-2`, and so on added when multiple archives are produced on the same day. The effective log policy is visible in `gsd-web status` and `GET /api/health`.
 
