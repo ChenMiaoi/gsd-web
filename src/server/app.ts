@@ -1,7 +1,7 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyStatic from '@fastify/static';
 import { existsSync } from 'node:fs';
-import { access, constants, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, constants, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,7 +30,10 @@ import { registerSlackRoutes } from './routes/slack.js';
 import {
   DEFAULT_SLACK_EVENT_TYPES,
   SlackNotifier,
+  buildGsdWebMetricsSnapshot,
+  buildSlackCommandResponse,
   hasAnyRunningProject,
+  parseSlackPolledCommand,
   resolveSlackCommandConfig,
   resolveSlackNotifierConfig,
   shouldSendImmediateStatusReport,
@@ -47,6 +50,7 @@ export type RuntimeSignal =
       clientDistDir: string;
       logFilePath: string | null;
       configFilePath: string;
+      metricsFilePath: string;
     }
   | {
       event: 'database_open';
@@ -162,6 +166,118 @@ class SlackStatusReporter {
   }
 }
 
+class SlackCommandPoller {
+  private intervalId: NodeJS.Timeout | null = null;
+  private lastSeenTs = `${Date.now() / 1000}`;
+  private polling = false;
+
+  constructor(
+    private readonly registry: RegistryDatabase,
+    private readonly notifier: SlackNotifier,
+    private readonly intervalMs: number,
+    private readonly prefix: string,
+    private readonly publicBaseUrl?: string,
+  ) {}
+
+  start() {
+    if (this.intervalId !== null) {
+      return;
+    }
+
+    this.intervalId = setInterval(() => {
+      void this.poll();
+    }, this.intervalMs);
+    this.intervalId.unref?.();
+  }
+
+  stop() {
+    if (this.intervalId !== null) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+    }
+  }
+
+  private async poll() {
+    if (this.polling) {
+      return;
+    }
+
+    this.polling = true;
+
+    try {
+      const messages = await this.notifier.fetchCommandMessages(this.lastSeenTs);
+
+      for (const message of messages) {
+        this.lastSeenTs = Number(message.ts) > Number(this.lastSeenTs) ? message.ts : this.lastSeenTs;
+
+        const payload = parseSlackPolledCommand(message.text, this.prefix);
+
+        if (!payload) {
+          continue;
+        }
+
+        await this.notifier.replyToCommand(
+          buildSlackCommandResponse(
+            {
+              ...payload,
+              userId: message.userId,
+            },
+            this.registry.listProjects(),
+            this.publicBaseUrl,
+          ),
+          message.ts,
+        );
+      }
+    } catch {
+      // Polling is best-effort; delivery failures are already observable through SlackNotifier paths.
+    } finally {
+      this.polling = false;
+    }
+  }
+}
+
+class GsdWebMetricsWriter {
+  private writing = false;
+  private pending = false;
+
+  constructor(
+    private readonly registry: RegistryDatabase,
+    private readonly metricsFilePath: string,
+    private readonly publicBaseUrl?: string,
+  ) {}
+
+  requestWrite() {
+    if (this.writing) {
+      this.pending = true;
+      return;
+    }
+
+    void this.write();
+  }
+
+  private async write() {
+    this.writing = true;
+
+    try {
+      const snapshot = buildGsdWebMetricsSnapshot(this.registry.listProjects(), this.publicBaseUrl);
+      const tempPath = `${this.metricsFilePath}.tmp`;
+
+      await mkdir(path.dirname(this.metricsFilePath), { recursive: true });
+      await writeFile(tempPath, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8');
+      await rename(tempPath, this.metricsFilePath);
+    } catch {
+      // Metrics persistence is diagnostic; request handling should not fail if the file cannot be written.
+    } finally {
+      this.writing = false;
+
+      if (this.pending) {
+        this.pending = false;
+        void this.write();
+      }
+    }
+  }
+}
+
 export interface ResolvedRuntimePaths {
   packageRoot: string;
   runtimeDir: string;
@@ -171,6 +287,7 @@ export interface ResolvedRuntimePaths {
   logDir: string;
   logFilePath: string;
   configFilePath: string;
+  metricsFilePath: string;
 }
 
 export type GsdWebApp = FastifyInstance & {
@@ -305,6 +422,7 @@ export function resolveDefaultPaths(
     logDir,
     logFilePath: resolveOptionalEnvPath(env, 'GSD_WEB_LOG_FILE') ?? path.join(logDir, 'gsd-web.log'),
     configFilePath: resolveOptionalEnvPath(env, 'GSD_WEB_CONFIG_PATH') ?? path.join(runtimeDir, 'config.json'),
+    metricsFilePath: path.join(runtimeDir, 'metrics.json'),
   };
 }
 
@@ -321,6 +439,9 @@ function createDefaultConfigFileContent() {
         statusReportEnabled: false,
         statusIntervalMs: 60000,
         statusImmediateMinIntervalMs: 5000,
+        commandPollingEnabled: false,
+        commandPollIntervalMs: 5000,
+        commandPrefix: 'gsd',
         events: DEFAULT_SLACK_EVENT_TYPES,
         timeoutMs: 5000,
       },
@@ -417,6 +538,16 @@ function parseRuntimeConfig(rawConfig: string): GsdWebConfig {
       slack.statusReportEnabled = statusReportEnabled;
     }
 
+    const commandPollingEnabled = slackRecord.commandPollingEnabled;
+
+    if (commandPollingEnabled !== undefined) {
+      if (typeof commandPollingEnabled !== 'boolean') {
+        throw new Error('config.json slack.commandPollingEnabled must be a boolean.');
+      }
+
+      slack.commandPollingEnabled = commandPollingEnabled;
+    }
+
     if (slackRecord.statusIntervalMs !== undefined) {
       if (
         typeof slackRecord.statusIntervalMs !== 'number'
@@ -439,6 +570,24 @@ function parseRuntimeConfig(rawConfig: string): GsdWebConfig {
       }
 
       slack.statusImmediateMinIntervalMs = slackRecord.statusImmediateMinIntervalMs;
+    }
+
+    if (slackRecord.commandPollIntervalMs !== undefined) {
+      if (
+        typeof slackRecord.commandPollIntervalMs !== 'number'
+        || !Number.isInteger(slackRecord.commandPollIntervalMs)
+        || slackRecord.commandPollIntervalMs <= 0
+      ) {
+        throw new Error('config.json slack.commandPollIntervalMs must be a positive integer.');
+      }
+
+      slack.commandPollIntervalMs = slackRecord.commandPollIntervalMs;
+    }
+
+    const commandPrefix = parseOptionalConfigString(slackRecord, 'commandPrefix');
+
+    if (commandPrefix !== undefined) {
+      slack.commandPrefix = commandPrefix;
     }
 
     config.slack = slack;
@@ -621,6 +770,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
     'GSD web config file',
     options.configFilePath ?? (options.runtimeDir === undefined ? defaults.configFilePath : path.join(runtimeDir, 'config.json')),
   );
+  const metricsFilePath = path.join(runtimeDir, 'metrics.json');
   const shouldCreateMissingConfig =
     options.configFilePath !== undefined
     || options.runtimeDir !== undefined
@@ -687,6 +837,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
     logDir,
     logFilePath,
     configFilePath,
+    metricsFilePath,
     activeLogFilePath,
     logPolicy,
   };
@@ -694,6 +845,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
   let eventHub: EventHub | undefined;
   let monitorManager: ProjectMonitorManager | undefined;
   let slackStatusReporter: SlackStatusReporter | undefined;
+  let slackCommandPoller: SlackCommandPoller | undefined;
+  let metricsWriter: GsdWebMetricsWriter | undefined;
 
   try {
     emitSignal(
@@ -706,6 +859,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
         clientDistDir,
         logFilePath: activeLogFilePath,
         configFilePath,
+        metricsFilePath,
       },
       'Resolved gsd-web runtime paths',
     );
@@ -729,6 +883,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
     registry = registryInstance;
     eventHub = eventHubInstance;
     monitorManager = monitorManagerInstance;
+    metricsWriter = new GsdWebMetricsWriter(registryInstance, metricsFilePath, runtimeConfig.publicUrl);
+    metricsWriter.requestWrite();
     const indexHtml = await readFile(indexHtmlPath, 'utf8');
 
     emitSignal(
@@ -744,6 +900,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
 
     eventHubInstance.subscribe((event) => {
       emitProjectEvent(app, options.logSink, event);
+      metricsWriter?.requestWrite();
     });
     const slackConfig = options.slack === false
       ? null
@@ -768,6 +925,17 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
         eventHubInstance.subscribe((event) => {
           slackStatusReporter?.sendIfChanged(event);
         });
+      }
+
+      if (slackConfig.commandPollingEnabled && slackConfig.botToken && slackConfig.channelId) {
+        slackCommandPoller = new SlackCommandPoller(
+          registryInstance,
+          slackNotifier,
+          slackConfig.commandPollIntervalMs ?? 5_000,
+          slackConfig.commandPrefix ?? 'gsd',
+          slackConfig.publicBaseUrl,
+        );
+        slackCommandPoller.start();
       }
     }
     eventHubInstance.subscribe((event) => {
@@ -806,6 +974,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
 
     app.addHook('onClose', async () => {
       slackStatusReporter?.stop();
+      slackCommandPoller?.stop();
       await monitorManagerInstance.stop();
       eventHubInstance.close();
       registryInstance.close();
@@ -958,6 +1127,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<GsdWebA
     return app;
   } catch (error) {
     slackStatusReporter?.stop();
+    slackCommandPoller?.stop();
     await monitorManager?.stop().catch(() => undefined);
     eventHub?.close();
     registry?.close();

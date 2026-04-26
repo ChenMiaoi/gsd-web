@@ -86,6 +86,22 @@ async function readFirstSseEvent(url: string) {
   }
 }
 
+async function readJsonFileEventually(filePath: string) {
+  const deadline = Date.now() + 2_000;
+  let lastError: unknown;
+
+  while (Date.now() < deadline) {
+    try {
+      return JSON.parse(await readFile(filePath, 'utf8')) as unknown;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(`Timed out reading ${filePath}`);
+}
+
 describe('service shell bootstrap', () => {
   test('parses host and port CLI options for foreground and daemon commands', () => {
     expect(parseCliInvocation(['--host', '0.0.0.0', '--port', '3001'])).toEqual({
@@ -210,6 +226,7 @@ describe('service shell bootstrap', () => {
     expect(paths.databasePath).toBe(path.join(runtimeDir, 'data', 'gsd-web.sqlite'));
     expect(paths.activeLogFilePath).toBe(path.join(runtimeDir, 'logs', 'gsd-web.log'));
     expect(paths.configFilePath).toBe(path.join(runtimeDir, 'config.json'));
+    expect(paths.metricsFilePath).toBe(path.join(runtimeDir, 'metrics.json'));
     expect(paths.logPolicy).toEqual({
       enabled: true,
       rotateDaily: true,
@@ -224,6 +241,12 @@ describe('service shell bootstrap', () => {
         enabled: false,
         events: expect.arrayContaining(['project.refreshed', 'project.init.updated']),
       },
+    });
+    expect(await readJsonFileEventually(paths.metricsFilePath)).toMatchObject({
+      portfolio: {
+        projectCount: 0,
+      },
+      projects: [],
     });
 
     await app.close();

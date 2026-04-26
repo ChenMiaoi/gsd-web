@@ -180,6 +180,9 @@ The `/lazy` base path is intentional: the dashboard is for avoiding manual statu
 | `GSD_WEB_SLACK_STATUS_REPORT` | `false` | Send recurring Slack project status reports |
 | `GSD_WEB_SLACK_STATUS_INTERVAL_MS` | `60000` | Recurring Slack status report interval |
 | `GSD_WEB_SLACK_STATUS_IMMEDIATE_MIN_INTERVAL_MS` | `5000` | Minimum gap between change-triggered status reports |
+| `GSD_WEB_SLACK_COMMAND_POLLING` | `false` | Poll the Slack channel for prefixed bot-token commands |
+| `GSD_WEB_SLACK_COMMAND_POLL_INTERVAL_MS` | `5000` | Bot-token command polling interval |
+| `GSD_WEB_SLACK_COMMAND_PREFIX` | `gsd` | Text prefix for polled Slack commands |
 | `GSD_WEB_SLACK_TIMEOUT_MS` | `5000` | Slack notification request timeout |
 | `GSD_BIN_PATH` | `gsd` | Executable used by the init runner |
 
@@ -210,6 +213,8 @@ Slack notifications are disabled by default. To send GSD project events to Slack
 }
 ```
 
+gsd-web also maintains a local `~/.gsd-web/metrics.json` file with the same per-project summary model used by Slack status messages and commands: project health, progress, active stage, task counts, cost, tokens, estimated finish, warnings, paths, and Slack thread keys. This file is refreshed on startup and project events.
+
 For bot-token delivery instead of an Incoming Webhook, use:
 
 ```json
@@ -219,12 +224,24 @@ For bot-token delivery instead of an Incoming Webhook, use:
     "enabled": true,
     "botToken": "xoxb-...",
     "channelId": "C0123456789",
-    "signingSecret": "your-slack-signing-secret"
+    "signingSecret": "your-slack-signing-secret",
+    "commandPollingEnabled": true,
+    "commandPrefix": "gsd"
   }
 }
 ```
 
 The bot-token path uses Slack `chat.postMessage`; the app needs the `chat:write` scope and the bot must be invited to the target channel.
+
+If you cannot expose a public slash-command URL, enable `commandPollingEnabled` on the bot-token path. gsd-web will poll the configured channel with `conversations.history` and reply in-thread to messages that start with the configured prefix. The Slack app needs a history scope for the channel type you use, such as `channels:history` for public channels or `groups:history` for private channels. Supported polled command text:
+
+```text
+gsd
+gsd status
+gsd projects
+gsd project <project id, name, or path>
+gsd help
+```
 
 To query gsd-web from Slack, create a Slash Command in the Slack app, set its request URL to:
 

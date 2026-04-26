@@ -5,11 +5,13 @@ import { describe, expect, test, vi } from 'vitest';
 import type { ProjectEventEnvelope, ProjectRecord, ProjectSnapshotEventPayload } from '../../src/shared/contracts.js';
 import {
   SlackNotifier,
+  buildGsdWebMetricsSnapshot,
   buildSlackCommandResponse,
   buildSlackMessage,
   buildSlackStatusMessage,
   hasAnyRunningProject,
   parseSlackCommandPayload,
+  parseSlackPolledCommand,
   resolveSlackNotifierConfig,
   shouldSendImmediateStatusReport,
   verifySlackRequest,
@@ -122,12 +124,18 @@ describe('Slack notifier', () => {
         GSD_WEB_SLACK_CHANNEL_ID: 'C123',
         GSD_WEB_SLACK_EVENTS: 'project.init.updated,project.monitor.updated',
         GSD_WEB_SLACK_TIMEOUT_MS: '2500',
+        GSD_WEB_SLACK_COMMAND_POLLING: 'true',
+        GSD_WEB_SLACK_COMMAND_POLL_INTERVAL_MS: '3000',
+        GSD_WEB_SLACK_COMMAND_PREFIX: 'g',
       }),
     ).toMatchObject({
       botToken: 'xoxb-token',
       channelId: 'C123',
       eventTypes: ['project.init.updated', 'project.monitor.updated'],
       timeoutMs: 2500,
+      commandPollingEnabled: true,
+      commandPollIntervalMs: 3000,
+      commandPrefix: 'g',
     });
   });
 
@@ -208,6 +216,11 @@ describe('Slack notifier', () => {
       userId: 'U123',
       channelId: 'C123',
     });
+    expect(parseSlackPolledCommand('gsd project demo', 'gsd')).toMatchObject({
+      command: 'gsd',
+      text: 'project demo',
+    });
+    expect(parseSlackPolledCommand('hello gsd status', 'gsd')).toBeNull();
   });
 
   test('builds Slack slash command status and project responses', () => {
@@ -225,19 +238,136 @@ describe('Slack notifier', () => {
 
     expect(status.text).toContain('GSD projects: 1 total');
     expect(status.text).toContain('demo-project');
+    expect(status.blocks).toBeDefined();
     expect(detail.text).toContain('prj_test');
     expect(detail.text).toContain('https://gsd.example.test/lazy/employee-prj_test');
+    expect(detail.blocks).toBeDefined();
   });
 
   test('builds a formatted recurring Slack status report', () => {
     const project = createProjectRecord();
     const message = buildSlackStatusMessage([project], 'https://gsd.example.test', 1_777_132_800_000);
+    const metrics = buildGsdWebMetricsSnapshot([project], 'https://gsd.example.test', 1_777_132_800_000);
 
     expect(message.text).toContain('GSD status: demo-project');
     expect(message.text).toContain('healthy');
+    expect(metrics.projects[0]).toMatchObject({
+      projectId: 'prj_test',
+      label: 'demo-project',
+      progressPercent: 100,
+      threadKey: 'project:prj_test',
+    });
     expect(JSON.stringify(message.blocks)).toContain('Current project');
+    expect(JSON.stringify(message.blocks)).toContain('Estimated finish');
     expect(JSON.stringify(message.blocks)).toContain('ETA');
     expect(JSON.stringify(message.blocks)).toContain('https://gsd.example.test/lazy/employee-prj_test');
+    expect(message.blocks.some((block) => block.type === 'section' && 'fields' in block)).toBe(false);
+  });
+
+  test('aligns Slack status progress and ETA with metrics-backed gsd-web overview data', () => {
+    const nowMs = 1_777_132_800_000;
+    const project = createProjectRecord();
+
+    project.snapshot.sources.gsdDb = {
+      state: 'ok',
+      value: {
+        tables: ['milestones', 'slices', 'tasks'],
+        counts: {
+          milestones: 1,
+          slices: 1,
+          tasks: 2,
+          sliceDependencies: 0,
+          projects: null,
+        },
+        dependencies: [],
+        milestones: [
+          {
+            id: 'M001',
+            title: 'Metrics-backed milestone',
+            status: 'active',
+            startedAt: nowMs - 600_000,
+            finishedAt: null,
+            sliceCount: 1,
+            taskCount: 2,
+            completedTaskCount: 1,
+            slices: [
+              {
+                id: 'S001',
+                title: 'Metrics-backed slice',
+                status: 'active',
+                risk: null,
+                startedAt: nowMs - 600_000,
+                finishedAt: null,
+                taskCount: 2,
+                completedTaskCount: 1,
+                tasks: [
+                  {
+                    id: 'T001',
+                    title: 'Completed task',
+                    status: 'done',
+                    risk: null,
+                    startedAt: nowMs - 600_000,
+                    finishedAt: nowMs,
+                  },
+                  {
+                    id: 'T002',
+                    title: 'Active task',
+                    status: 'active',
+                    risk: null,
+                    startedAt: nowMs,
+                    finishedAt: null,
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    };
+    project.snapshot.sources.metricsJson = {
+      state: 'ok',
+      value: {
+        version: 1,
+        projectStartedAt: nowMs - 60_000,
+        unitCount: 1,
+        totals: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          totalTokens: 100,
+          cost: 1,
+          toolCalls: 0,
+          assistantMessages: 0,
+          userMessages: 0,
+          apiRequests: 1,
+          promptCharCount: 0,
+          baselineCharCount: 0,
+        },
+        units: [
+          {
+            type: 'task',
+            id: 'session-1',
+            model: 'test-model',
+            startedAt: nowMs - 60_000,
+            finishedAt: nowMs,
+            totalTokens: 100,
+            cost: 1,
+            toolCalls: 0,
+            apiRequests: 1,
+          },
+        ],
+        recentUnits: [],
+      },
+    };
+
+    const message = buildSlackStatusMessage([project], 'https://gsd.example.test', nowMs);
+    const blocks = JSON.stringify(message.blocks);
+
+    expect(blocks).toContain('Progress 9%');
+    expect(blocks).toContain('Estimated finish');
+    expect(blocks).toContain('(10m)');
+    expect(message.threadKey).toBe('slice:prj_test:M001/S001');
   });
 
   test('skips recurring Slack status delivery when no project is running', async () => {
@@ -324,6 +454,8 @@ describe('Slack notifier', () => {
     expect(message.text).toContain('Snapshot: initialized');
     expect(message.text).toContain('Monitor: healthy');
     expect(JSON.stringify(message.blocks)).toContain('https://gsd.example.test/lazy/employee-prj_test');
+    expect(message.attachments?.[0]?.color).toBe('#2e90fa');
+    expect(message.threadKey).toBe('project:prj_test');
   });
 
   test('posts selected project events through an incoming webhook', async () => {
@@ -349,6 +481,11 @@ describe('Slack notifier', () => {
     expect(fetchImpl.mock.calls[0]?.[0]).toBe('https://hooks.slack.com/services/test');
     expect(JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body))).toMatchObject({
       text: expect.stringContaining('Refreshed demo-project'),
+      attachments: [
+        expect.objectContaining({
+          color: '#2e90fa',
+        }),
+      ],
     });
     expect(signals).toEqual(
       expect.arrayContaining([
@@ -391,6 +528,103 @@ describe('Slack notifier', () => {
     expect(JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body))).toMatchObject({
       channel: 'C123',
       text: expect.stringContaining('Refreshed demo-project'),
+      attachments: [
+        expect.objectContaining({
+          color: '#2e90fa',
+        }),
+      ],
+    });
+  });
+
+  test('threads repeated bot-token notifications by project', async () => {
+    const fetchImpl = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, ts: '1777132800.000100' }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, ts: '1777132801.000200' }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      }));
+    const notifier = new SlackNotifier(
+      {
+        botToken: 'xoxb-token',
+        channelId: 'C123',
+        eventTypes: ['project.refreshed'],
+        timeoutMs: 1_000,
+      },
+      { fetchImpl },
+    );
+
+    await notifier.notify(createProjectEvent());
+    await notifier.notify(createProjectEvent({ id: 'evt_2', sequence: 2 }));
+
+    expect(JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body))).not.toHaveProperty('thread_ts');
+    expect(JSON.parse(String(fetchImpl.mock.calls[1]?.[1]?.body))).toMatchObject({
+      thread_ts: '1777132800.000100',
+    });
+  });
+
+  test('polls bot-token command messages and replies in the command thread', async () => {
+    const fetchImpl = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ok: true,
+        messages: [
+          {
+            ts: '1777132801.000200',
+            text: 'not a command',
+            user: 'U123',
+          },
+          {
+            ts: '1777132800.000100',
+            text: 'gsd status',
+            user: 'U123',
+          },
+          {
+            ts: '1777132799.000100',
+            text: 'gsd status',
+            bot_id: 'B123',
+          },
+        ],
+      }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, ts: '1777132802.000300' }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      }));
+    const notifier = new SlackNotifier(
+      {
+        botToken: 'xoxb-token',
+        channelId: 'C123',
+        eventTypes: ['project.refreshed'],
+        timeoutMs: 1_000,
+      },
+      { fetchImpl },
+    );
+
+    const messages = await notifier.fetchCommandMessages('1777132800.000000');
+    const command = parseSlackPolledCommand(messages[0]!.text, 'gsd');
+
+    expect(fetchImpl.mock.calls[0]?.[0]).toContain('https://slack.com/api/conversations.history');
+    expect(messages.map((message) => message.ts)).toEqual(['1777132800.000100', '1777132801.000200']);
+    expect(command?.text).toBe('status');
+
+    await notifier.replyToCommand(buildSlackCommandResponse(command!, [createProjectRecord()], 'https://gsd.example.test'), messages[0]!.ts);
+
+    expect(JSON.parse(String(fetchImpl.mock.calls[1]?.[1]?.body))).toMatchObject({
+      channel: 'C123',
+      thread_ts: '1777132800.000100',
+      text: expect.stringContaining('GSD projects: 1 total'),
     });
   });
 
